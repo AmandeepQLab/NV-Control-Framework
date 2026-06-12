@@ -1,26 +1,13 @@
 __pycache__/
 *.pyc
-*.pyo
-
-.vscode/
-.idea/
-
 .venv/
 venv/
 
-*.log
-
-build/
-dist/
-
-.env
-
 *.mat
-*.h5
-*.hdf5
 *.tif
 *.tiff
+*.h5
 
-CameraData/
 Data/
 Results/
+CameraData/
