@@ -1,0 +1,128 @@
+{
+	"debugMode": false,
+	"showEvents": false,
+	"setupNumber": "2",
+	"niDaq": {
+		"dummy": true,
+		"deviceName": "dev1"
+	},
+    "pulseGenerator":{
+        "type": "pulseStreamer",
+        "dummy": false,
+        "channelNames": ["greenLaser", "MW", "detector", "detector2", "flipMF"],
+		"channelValues": [1,      2,      5, 6,      3],
+	"analogchannelNames" : ["aomPower"],
+	"analogchannelValues" : [1],
+        "ipAddress":"132.64.56.138",
+        "trigger": "Software"
+	},
+	"spcm": {
+		"classname": "Camera",
+        "type": "Andor",
+		"address": "",
+		"Switch": {
+			"classname": "pulseStreamer",
+			"switchChannel": 5,
+			"switchChannelName": "detector"
+		}
+	}, "classname": "Camera",
+        "type": "EventCamera",
+		"address": "",
+		"Switch": {
+			"classname": "pulseStreamer",
+			"switchChannel": 6,
+			"switchChannelName": "detector2"
+		}
+,
+	"stages": [{
+		"type" : "MCS2",
+		"default": true,
+		"niDaqChannel" : "-1",
+		"address" : "network:132.64.56.209"
+	}],
+	"lasers": [{
+		"nickname": "Green Laser",
+        "directControl" : null,
+        "aomControl" : {
+            "classname" : "pulseStreamer",
+            "channel" : "ao1",
+            "minVal" : 0,
+            "maxVal" : 1
+            },
+   	    "switch": {
+            "classname":"pulseStreamer",
+            "switchChannel":1,
+            "switchChannelName":"greenLaser",
+            "onDelay":0.5,
+            "offDelay":0.5
+		}
+	}],
+   "frequencyGenerators":[
+      {
+        "type": "srs",
+        "address": "132.64.56.186",
+        "port": 5025,
+        "serialNumber": "SN-NA",
+        "minFrequency": 0,
+        "maxFrequency": 6.075e3,
+        "minAmplitude": -100,
+        "maxAmplitude": 10,
+        "default": true
+      }
+   ],
+	"detector": {
+		"classname": "pulseStreamer",
+		"detectorChannel": 0,
+		"detectorChannelName": "detector"
+	},
+	"microwave": {
+		"MW": {
+			"classname": "pulseStreamer",
+			"switchChannel": 2,
+			"switchChannelName": "MW",
+			"onDelay": 0.104,
+			"offDelay": 0.104
+		}
+	},
+        "Helmholtz": {
+        "flip_direction": {
+            "available": false,
+            "type": "pulse_generator",
+            "switch": {
+                "classname": "pulseStreamer",
+                "switchChannel": 3,
+                "switchChannelName": "flipMF",
+                "onDelay": 0,
+                "offDelay": 0
+            }
+        },
+        "X": {
+            "type": "E3632A",
+            "name": "X",
+            "address": "COM13",
+            "range": "P15V",
+            "max_current": 5,
+            "magnetic_field_ratio": 5.383,
+            "magnetic_field_offset": 0.006
+        },
+        "Y": {
+            "type": "E3631A",
+            "name": "Y",
+            "address": "COM12",
+            "channel": "P6V",
+            "max_current": 5,
+            "magnetic_field_ratio": 6.600,
+            "magnetic_field_offset": -0.027
+        },
+        "Z": {
+            "type": "E3632A",
+            "name": "Z",
+            "address": "COM11",
+            "range": "P15V",
+            "max_current": 5,
+            "magnetic_field_ratio": 8.165,
+            "magnetic_field_offset": 0.304
+        }
+    }
+
+}
