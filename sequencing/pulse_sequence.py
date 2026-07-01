@@ -9,6 +9,10 @@ class DigitalPulse:
     duration_ns: int
     state: int = 1
 
+    @property
+    def end_ns(self):
+        return self.start_ns + self.duration_ns
+
 
 class PulseSequence:
     def add_pulse(self, channel, start_ns, duration_ns, state=1):
