@@ -1,14 +1,14 @@
 import sys
-import pyqtgraph as pg
+import pyqtgraph as pg # type: ignore
 
-from PyQt6.QtWidgets import (
+from PyQt6.QtWidgets import ( # type: ignore
     QApplication, QMainWindow, QWidget,
     QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel,
     QDoubleSpinBox, QSpinBox,
     QGroupBox, QMessageBox
 )
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import QTimer # type: ignore
 
 from config.config_manager import ConfigManager
 from hardware.hardware_manager import HardwareManager

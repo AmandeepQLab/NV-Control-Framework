@@ -1,5 +1,5 @@
-from PyQt6.QtCore import QObject, QTimer, pyqtSignal
-import numpy as np
+from PyQt6.QtCore import QObject, QTimer, pyqtSignal # type: ignore
+import numpy as np # type: ignore
 
 from experiments.odmr_experiment import ODMRExperiment
 

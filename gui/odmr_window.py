@@ -1,8 +1,10 @@
-import numpy as np
+import config
+from experiments.odmr_experiment import ODMRExperiment
+import numpy as np # type: ignore
 import time
 
-from PyQt6.QtWidgets import QMainWindow, QMessageBox
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtWidgets import QMainWindow, QMessageBox # type: ignore
+from PyQt6.QtCore import QThread, pyqtSignal # type: ignore
 
 from gui.panels.odmr_panel import ODMRPanel
 from gui.odmr_worker import ODMRWorker
@@ -63,10 +65,28 @@ class ODMRWindow(QMainWindow):
     def show_pulse_sequence(self):
 
         config = self.panel.get_config()
+
         config["exposure_s"] = self.exposure_getter()
 
+        from experiments.odmr_experiment import ODMRExperiment
+
+        experiment = ODMRExperiment(
+            self.hardware,
+            config
+        )
+
+        repeats = config.get(
+            "repeats",
+            1
+        )
+
+        sequence = experiment.build_repeated_off_on_sequence(
+            repeats
+        )
+
         self.sequence_window = PulseSequenceWindow(
-            config,
+            sequence=sequence,
+            channel_map=self.hardware["channels"],
             parent=self
         )
 
