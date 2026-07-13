@@ -9,10 +9,11 @@ from PyQt6.QtWidgets import ( # type: ignore
     QGroupBox, QMessageBox
 )
 from PyQt6.QtCore import QTimer # type: ignore
-
+from gui.magnet_window import MagnetControlWindow
 from config.config_manager import ConfigManager
 from hardware.hardware_manager import HardwareManager
 from gui.odmr_window import ODMRWindow
+from gui.zero_field_window import ZeroFieldWindow
 
 
 class MainWindow(QMainWindow):
@@ -21,7 +22,7 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("NV Control")
-        self.resize(1400, 800)
+        self.resize(1600, 800)
 
         # =====================================================
         # LOAD CONFIG
@@ -62,27 +63,40 @@ class MainWindow(QMainWindow):
         # =====================================================
 
         left_panel = QVBoxLayout()
-        main_layout.addLayout(left_panel, 1)
+        main_layout.addLayout(left_panel, 2)
+
+        # =====================================================
+        # CAMERA
+        # =====================================================
+
+        camera_group = QGroupBox("Camera")
+
+        camera_layout = QVBoxLayout()
+
+        camera_group.setLayout(camera_layout)
+
+        left_panel.addWidget(camera_group)
 
         # =====================================================
         # CAMERA CONTROLS
         # =====================================================
 
-        cam_box = QGroupBox("Camera")
-        left_panel.addWidget(cam_box)
-
-        cam_layout = QVBoxLayout()
-        cam_box.setLayout(cam_layout)
+        # -----------------------------
+        # Stream buttons
+        # -----------------------------
 
         self.start_button = QPushButton("Start Stream")
         self.start_button.clicked.connect(self.start_stream)
-        cam_layout.addWidget(self.start_button)
+        camera_layout.addWidget(self.start_button)
 
         self.stop_button = QPushButton("Stop Stream")
         self.stop_button.clicked.connect(self.stop_stream)
-        cam_layout.addWidget(self.stop_button)
+        camera_layout.addWidget(self.stop_button)
 
-        # Exposure control
+        # -----------------------------
+        # Exposure
+        # -----------------------------
+
         exposure_layout = QHBoxLayout()
         exposure_layout.addWidget(QLabel("Exposure (s):"))
 
@@ -93,9 +107,12 @@ class MainWindow(QMainWindow):
         self.exposure_spin.valueChanged.connect(self.set_exposure)
 
         exposure_layout.addWidget(self.exposure_spin)
-        cam_layout.addLayout(exposure_layout)
+        camera_layout.addLayout(exposure_layout)
 
-        # Binning control
+        # -----------------------------
+        # Binning
+        # -----------------------------
+
         binning_layout = QHBoxLayout()
         binning_layout.addWidget(QLabel("Binning:"))
 
@@ -105,14 +122,14 @@ class MainWindow(QMainWindow):
         self.binning_spin.valueChanged.connect(self.set_binning)
 
         binning_layout.addWidget(self.binning_spin)
-        cam_layout.addLayout(binning_layout)
+        camera_layout.addLayout(binning_layout)
 
-        # =====================================================
-        # ROI INFO
-        # =====================================================
+        # -----------------------------
+        # ROI
+        # -----------------------------
 
         roi_box = QGroupBox("ROI")
-        left_panel.addWidget(roi_box)
+        camera_layout.addWidget(roi_box)
 
         roi_layout = QVBoxLayout()
         roi_box.setLayout(roi_layout)
@@ -121,20 +138,110 @@ class MainWindow(QMainWindow):
         roi_layout.addWidget(self.roi_label)
 
         # =====================================================
-        # OPEN ODMR WINDOW
+        # EXPERIMENTS
         # =====================================================
 
-        self.open_odmr_button = QPushButton("Open ODMR")
+        experiment_group = QGroupBox("Experiments")
+        experiment_layout = QVBoxLayout()
+        experiment_group.setLayout(experiment_layout)
+        left_panel.addWidget(experiment_group)
+        experiment_layout.setSpacing(8)
+        experiment_layout.setContentsMargins(10, 10, 10, 10)
+
+        # =====================================================
+        # HARDWARE
+        # =====================================================
+
+        hardware_group = QGroupBox("Hardware")
+
+        hardware_layout = QVBoxLayout()
+
+        hardware_group.setLayout(hardware_layout)
+
+        left_panel.addWidget(hardware_group)
+
+        # -----------------------------------------------------
+        # Magnet Control
+        # -----------------------------------------------------
+
+        self.open_magnet_button = QPushButton("Magnet")
+
+        self.open_magnet_button.setMinimumHeight(36)
+
+        self.open_magnet_button.clicked.connect(
+            self.open_magnet_window
+        )
+
+        hardware_layout.addWidget(
+            self.open_magnet_button
+        )
+
+        # -----------------------------------------------------
+        # Future Hardware
+        # -----------------------------------------------------
+
+        self.open_microwave_button = QPushButton("Microwave")
+
+        self.open_microwave_button.setEnabled(False)
+
+        hardware_layout.addWidget(
+            self.open_microwave_button
+        )
+
+        self.open_power_supply_button = QPushButton("Power Supplies")
+
+        self.open_power_supply_button.setEnabled(False)
+
+        hardware_layout.addWidget(
+            self.open_power_supply_button
+        )
+
+        # =====================================================
+        # OPEN ODMR WINDOW
+        # =====================================================
+        self.open_odmr_button = QPushButton("ODMR")
         self.open_odmr_button.clicked.connect(self.open_odmr_window)
-        left_panel.addWidget(self.open_odmr_button)
+        experiment_layout.addWidget(self.open_odmr_button)
+        self.open_odmr_button.setMinimumHeight(36)
+        
+        # =====================================================
+        # Zero-Field IMAGING
+        # =====================================================
+        
+        self.open_zero_field_button = QPushButton("Zero-Field Imaging")
+        self.open_zero_field_button.clicked.connect(self.open_zero_field_window)
+        experiment_layout.addWidget(self.open_zero_field_button)
+        self.open_zero_field_button.setMinimumHeight(36)
+
+        # =====================================================
+        # upcoming Experiments (disabled for now)
+        # =====================================================
+        
+        #Rabi Button
+        self.open_rabi_button = QPushButton("Rabi")
+        self.open_rabi_button.setEnabled(False)
+        experiment_layout.addWidget(self.open_rabi_button)
+
+        #Ramsy Button
+        self.open_ramsy_button = QPushButton("Ramsy")
+        self.open_ramsy_button.setEnabled(False)
+        experiment_layout.addWidget(self.open_ramsy_button)
+
+        #T1 Button
+        self.open_t1_button = QPushButton("T1")
+        self.open_t1_button.setEnabled(False)
+        experiment_layout.addWidget(self.open_t1_button)
+
+        #T2 Button
+        self.open_t2_button = QPushButton("T2")
+        self.open_t2_button.setEnabled(False)
+        experiment_layout.addWidget(self.open_t2_button)
 
         # =====================================================
         # STATUS
         # =====================================================
-
         status_box = QGroupBox("Status")
         left_panel.addWidget(status_box)
-
         status_layout = QVBoxLayout()
         status_box.setLayout(status_layout)
 
@@ -142,6 +249,15 @@ class MainWindow(QMainWindow):
         status_layout.addWidget(self.state_label)
 
         left_panel.addStretch()
+        # =====================================================
+        # UTILITIES
+        # =====================================================
+
+        utility_group = QGroupBox("Utilities")
+        utility_layout = QVBoxLayout()
+        utility_group.setLayout(utility_layout)
+        left_panel.addWidget(utility_group)
+        utility_layout.addWidget(QLabel("Future tools"))
 
         # =====================================================
         # RIGHT IMAGE PANEL
@@ -169,6 +285,34 @@ class MainWindow(QMainWindow):
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_image)
+
+    # =====================================================
+    # OPEN MAGNET WINDOW
+    # =====================================================
+
+    def open_magnet_window(self):
+
+        if hasattr(self, "magnet_window"):
+
+            self.magnet_window.raise_()
+
+            self.magnet_window.activateWindow()
+
+            return
+
+        self.magnet_window = MagnetControlWindow(
+            self.hardware
+        )
+
+        self.magnet_window.show()
+
+        self.magnet_window.destroyed.connect(
+            lambda: setattr(
+                self,
+                "magnet_window",
+                None
+            )
+        )
 
     # =========================================================
     # STATE
@@ -290,7 +434,25 @@ class MainWindow(QMainWindow):
         )
 
         self.odmr_window.show()
+    # =====================================================
+    # ZERO-FIELD IMAGING WINDOW
+    # =====================================================
 
+    def open_zero_field_window(self):
+
+        self.zero_field_window = ZeroFieldWindow(
+
+            hardware=self.hardware,
+
+            camera=self.camera,
+
+            roi_getter=self.get_current_roi,
+
+            exposure_getter=self.get_current_exposure,
+
+        )
+
+        self.zero_field_window.show()
     # =========================================================
     # MAIN GUI CLOSE WARNING + CLEAN EXIT
     # =========================================================

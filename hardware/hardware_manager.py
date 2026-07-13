@@ -7,6 +7,8 @@ from hardware.sim_hardware import SimPulseStreamer
 from hardware.pulse_streamer.swabian_pulse_streamer import SwabianPulseStreamer
 
 from hardware.camera.andor_neo_andor3 import AndorNeoAndor3
+from hardware.power_supply.sim_power_supply import SimPowerSupply
+from hardware.magnet import Magnet
 
 class HardwareManager:
 
@@ -102,7 +104,50 @@ class HardwareManager:
             raise ValueError(
                 f"Unknown pulse generator type: {ps_cfg['type']}"
             )
+        # =================================================
+        # POWER SUPPLIES
+        # =================================================
 
+        helmholtz_cfg = self.cfg.get("Helmholtz")
+
+        power_supplies = {}
+
+        for axis in ["X", "Y", "Z"]:
+
+            ps = SimPowerSupply(
+                helmholtz_cfg[axis]
+            )
+
+            ps.connect()
+
+            power_supplies[axis] = ps
+
+        self.hardware["power_supplies"] = power_supplies
+        
+        # =================================================
+        # MAGNET
+        # =================================================
+
+        magnet = Magnet(
+
+            config=helmholtz_cfg,
+
+            power_supplies=power_supplies,
+
+            pulse_streamer=self.hardware["pulse_streamer"]
+
+        )
+
+        self.hardware["magnet"] = magnet
+        # =================================================
+        # HARDWARE SUMMARY (TEMPORARY)
+        # =================================================
+
+        print("\nAvailable hardware:\n")
+
+        for name in self.hardware:
+
+            print(f"  {name}")
     # =====================================================
     # GET HARDWARE
     # =====================================================
