@@ -74,14 +74,9 @@ class MagnetAxis:
     # CONTROL
     # =====================================================
 
-    def set_field(
-        self,
-        field_mT,
-    ):
+    def set_field(self,field_mT):
 
-        current = self.field_to_current(
-            field_mT
-        )
+        current = self.field_to_current(field_mT)
 
         if abs(current) > self.max_current:
 
@@ -89,19 +84,33 @@ class MagnetAxis:
                 f"{self.name}-coil exceeds maximum current."
             )
 
-        #
-        # Send command to power supply
-        #
+        # -------------------------------------------------
+        # Zero field
+        # -------------------------------------------------
 
-        self.power_supply.set_current(current)
+        if abs(current) < 1e-9:
+
+            self.power_supply.safe_shutdown()
+
+        else:
+
+            self.power_supply.set_current(current)
+
+            current = self.field_to_current(field_mT)
+
+            self.power_supply.set_current(current)
+
+            self.current_field = field_mT
 
         self.current_field = field_mT
+
         self.current_current = current
 
     def zero(self):
 
-        self.set_field(0.0)
+        self.power_supply.safe_shutdown()
 
+        self.current_field = 0.0
     # =====================================================
     # GETTERS
     # =====================================================

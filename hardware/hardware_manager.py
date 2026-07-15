@@ -7,7 +7,11 @@ from hardware.sim_hardware import SimPulseStreamer
 from hardware.pulse_streamer.swabian_pulse_streamer import SwabianPulseStreamer
 
 from hardware.camera.andor_neo_andor3 import AndorNeoAndor3
-from hardware.power_supply.sim_power_supply import SimPowerSupply
+from hardware.power_supply import (
+    SimPowerSupply,
+    E3631A,
+    E3632A,
+)
 from hardware.magnet import Magnet
 
 class HardwareManager:
@@ -19,9 +23,46 @@ class HardwareManager:
         self.hardware = {}
 
     # =====================================================
-    # INITIALIZE ALL HARDWARE
+    # CREATE POWER SUPPLY
     # =====================================================
 
+    def create_power_supply(self, config):
+
+        ps_type = config["type"].upper()
+
+        # ---------------------------------------------
+        # Simulated Power Supply
+        # ---------------------------------------------
+
+        if ps_type == "SIM":
+
+            return SimPowerSupply(config)
+
+        # ---------------------------------------------
+        # Keysight E3631A
+        # ---------------------------------------------
+
+        elif ps_type == "E3631A":
+
+            return E3631A(config)
+
+        # ---------------------------------------------
+        # Keysight E3632A
+        # ---------------------------------------------
+
+        elif ps_type == "E3632A":
+
+            return E3632A(config)
+
+        else:
+
+            raise ValueError(
+                f"Unknown power supply type: {ps_type}"
+            )
+    # =====================================================
+    # INITIALIZE ALL HARDWARE
+    # =====================================================
+    
     def initialize(self):
         # =================================================
         # CHANNEL MAP
@@ -114,7 +155,7 @@ class HardwareManager:
 
         for axis in ["X", "Y", "Z"]:
 
-            ps = SimPowerSupply(
+            ps = self.create_power_supply(
                 helmholtz_cfg[axis]
             )
 
@@ -155,3 +196,52 @@ class HardwareManager:
     def get_hardware(self):
 
         return self.hardware
+    # =====================================================
+    # SHUTDOWN
+    # =====================================================
+
+    def shutdown(self):
+
+        print("\nShutting down hardware...")
+
+        # --------------------------------------------
+        # Magnet
+        # --------------------------------------------
+
+        if "magnet" in self.hardware:
+
+            self.hardware["magnet"].disable()
+
+        # --------------------------------------------
+        # Power supplies
+        # --------------------------------------------
+
+        if "power_supplies" in self.hardware:
+
+            for ps in self.hardware["power_supplies"].values():
+
+                ps.disconnect()
+
+        # --------------------------------------------
+        # Microwave
+        # --------------------------------------------
+
+        if "microwave" in self.hardware:
+
+            try:
+                self.hardware["microwave"].disconnect()
+            except AttributeError:
+                pass
+
+        # --------------------------------------------
+        # Camera
+        # --------------------------------------------
+
+        if "camera" in self.hardware:
+
+            try:
+                self.hardware["camera"].disconnect()
+            except AttributeError:
+                pass
+
+        print("Hardware shutdown complete.")

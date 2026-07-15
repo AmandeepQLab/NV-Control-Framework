@@ -12,7 +12,9 @@ Author:
 =====================================================
 """
 
-from hardware.power_supply.base_power_supply import BasePowerSupply
+from hardware.power_supply.base_power_supply import (
+    BasePowerSupply,
+)
 
 
 class SimPowerSupply(BasePowerSupply):
@@ -24,8 +26,6 @@ class SimPowerSupply(BasePowerSupply):
     def __init__(self, config):
 
         super().__init__(config)
-
-        self.output_enabled = False
 
         self.voltage = 0.0
 
@@ -67,41 +67,33 @@ class SimPowerSupply(BasePowerSupply):
     # PROGRAMMING
     # =================================================
 
-    def set_voltage(
-        self,
-        voltage,
-    ):
+    def set_voltage(self, voltage):
 
         self.voltage = voltage
 
         print(
-
-            f"{self.name}: voltage = {voltage:.3f} V"
-
+            f"{self.name}: voltage = "
+            f"{voltage:.3f} V"
         )
 
-    def set_current(
-        self,
-        current,
-    ):
+    def set_current(self, current):
 
         self.current = current
 
         print(
-
-            f"{self.name}: current = {current:.3f} A"
-
+            f"{self.name}: current = "
+            f"{current:.3f} A"
         )
 
     # =================================================
     # MEASUREMENTS
     # =================================================
 
-    def measure_voltage(self):
+    def get_voltage(self):
 
         return self.voltage
 
-    def measure_current(self):
+    def get_current(self):
 
         return self.current
 

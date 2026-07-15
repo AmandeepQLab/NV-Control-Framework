@@ -2,87 +2,103 @@
 =====================================================
 Base Power Supply
 -----------------------------------------------------
-Abstract base class for programmable power supplies.
+Abstract interface for programmable power supplies.
 
-All concrete power supply drivers should inherit from
-this class.
+Every power supply driver should inherit from this
+class.
 
 Author:
     Amandeep + ChatGPT
 =====================================================
 """
 
-from abc import ABC, abstractmethod
 
+class BasePowerSupply:
 
-class BasePowerSupply(ABC):
+    # =================================================
+    # INITIALIZATION
+    # =================================================
 
     def __init__(self, config):
 
         self.config = config
 
-        self.name = config.get("name", "Power Supply")
+        self.name = config.get(
+            "name",
+            "Power Supply"
+        )
+
+        self.address = config.get(
+            "address",
+            ""
+        )
 
         self.connected = False
+
+        self.output_enabled = False
 
     # =================================================
     # CONNECTION
     # =================================================
 
-    @abstractmethod
     def connect(self):
-        pass
+        raise NotImplementedError()
 
-    @abstractmethod
     def disconnect(self):
-        pass
+        raise NotImplementedError()
+
+    def is_connected(self):
+
+        return self.connected
 
     # =================================================
     # OUTPUT
     # =================================================
 
-    @abstractmethod
     def output_on(self):
-        pass
+        raise NotImplementedError()
 
-    @abstractmethod
     def output_off(self):
-        pass
+        raise NotImplementedError()
+
+    def is_output_on(self):
+
+        return self.output_enabled
 
     # =================================================
     # PROGRAMMING
     # =================================================
 
-    @abstractmethod
-    def set_voltage(
-        self,
-        voltage,
-    ):
-        pass
+    def set_voltage(self, voltage):
+        raise NotImplementedError()
 
-    @abstractmethod
-    def set_current(
-        self,
-        current,
-    ):
-        pass
+    def set_current(self, current):
+        raise NotImplementedError()
 
     # =================================================
     # MEASUREMENTS
     # =================================================
 
-    @abstractmethod
-    def measure_voltage(self):
-        pass
+    def get_voltage(self):
+        raise NotImplementedError()
 
-    @abstractmethod
-    def measure_current(self):
-        pass
+    def get_current(self):
+        raise NotImplementedError()
 
     # =================================================
     # IDENTIFICATION
     # =================================================
 
-    @abstractmethod
     def identify(self):
-        pass
+        raise NotImplementedError()
+    # =================================================
+    # SAFE SHUTDOWN
+    # =================================================
+
+    def safe_shutdown(self):
+
+        self.set_current(0.0)
+
+        self.output_off()
+
+        self.current = 0.0

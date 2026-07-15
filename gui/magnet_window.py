@@ -81,6 +81,7 @@ class MagnetControlWindow(QMainWindow):
         self.build_ui()
         self.connect_signals()
         self.update_display()
+        self.update_power_button()
 
     # =====================================================
     # BUILD GUI
@@ -92,6 +93,16 @@ class MagnetControlWindow(QMainWindow):
         self.setCentralWidget(central)
 
         main_layout = QVBoxLayout(central)
+
+        # =================================================
+        # MAGNET POWER
+        # =================================================
+
+        self.power_button = QPushButton()
+
+        self.power_button.setMinimumHeight(42)
+
+        main_layout.addWidget(self.power_button)
 
         self.tabs = QTabWidget()
         main_layout.addWidget(self.tabs)
@@ -174,7 +185,6 @@ class MagnetControlWindow(QMainWindow):
         button_layout.addWidget(self.apply_button)
         button_layout.addWidget(self.read_button)
         button_layout.addWidget(self.zero_button)
-
         layout.addLayout(button_layout)
 
         # =================================================
@@ -365,6 +375,65 @@ class MagnetControlWindow(QMainWindow):
             self.read_field
         )
 
+        self.power_button.clicked.connect(
+            self.toggle_power
+        )
+
+    # =====================================================
+    # MAGNET POWER
+    # =====================================================
+
+    def toggle_power(self):
+
+        try:
+
+            if self.magnet.is_enabled():
+
+                self.magnet.disable()
+
+                self.status_label.setText(
+                    "Magnet power is OFF."
+                )
+
+            else:
+
+                self.magnet.enable()
+
+                self.status_label.setText(
+                    "Magnet power is ON."
+                )
+
+        except Exception as err:
+
+            self.status_label.setText(
+                str(err)
+            )
+
+        self.update_power_button()
+        self.update_display()
+
+    # =====================================================
+    # UPDATE POWER BUTTON
+    # =====================================================
+
+    def update_power_button(self):
+
+        if self.magnet.is_enabled():
+
+            self.power_button.setText("Magnet ON")
+
+            self.power_button.setStyleSheet(
+                "background-color: lightgreen;"
+            )
+
+        else:
+
+            self.power_button.setText("Magnet OFF")
+
+            self.power_button.setStyleSheet(
+                "background-color: lightgray;"
+            )
+
     # =====================================================
     # GET SELECTED AXIS
     # =====================================================
@@ -461,6 +530,14 @@ class MagnetControlWindow(QMainWindow):
 
     def apply_field(self):
 
+        if not self.magnet.is_enabled():
+
+            self.status_label.setText(
+                "Magnet power is OFF."
+            )
+
+            return
+
         axis = self.get_selected_axis()
 
         field = self.field_spin.value()
@@ -487,16 +564,14 @@ class MagnetControlWindow(QMainWindow):
 
     def zero_field(self):
 
-        axis = self.get_selected_axis()
-
         try:
 
-            axis.zero()
+            self.magnet.zero()
 
             self.field_spin.setValue(0.0)
 
             self.status_label.setText(
-                f"{axis.name}-axis zeroed"
+                "Magnet field zeroed"
             )
 
         except Exception as err:
@@ -546,3 +621,4 @@ class MagnetControlWindow(QMainWindow):
         super().showEvent(event)
 
         self.update_display()
+        self.update_power_button()

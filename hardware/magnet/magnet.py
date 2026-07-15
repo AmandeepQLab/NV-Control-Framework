@@ -102,6 +102,12 @@ class Magnet:
         self.flip_channel_name = (
             flip["switch"]["switchChannelName"]
         )
+    
+    # =================================================
+    # MAGNET STATE
+    # =================================================
+
+        self.enabled = False
 
     # =====================================================
     # ZERO MAGNET
@@ -109,11 +115,13 @@ class Magnet:
 
     def zero(self):
 
-        self.x.zero()
+        for axis in (self.x, self.y, self.z):
 
-        self.y.zero()
+            axis.power_supply.set_current(0.0)
 
-        self.z.zero()
+            axis.current_field = 0.0
+
+            axis.current_current = 0.0
 
     # =====================================================
     # VECTOR CONTROL
@@ -185,6 +193,42 @@ class Magnet:
             "z": self.direction.value * self.z.get_field(),
 
         }
+        
+    # =================================================
+    # ENABLE MAGNET
+    # =================================================
+
+    def enable(self):
+
+        self.x.power_supply.output_on()
+
+        self.y.power_supply.output_on()
+
+        self.z.power_supply.output_on()
+
+        self.enabled = True
+
+    # =================================================
+    # DISABLE MAGNET
+    # =================================================
+
+    def disable(self):
+
+        self.x.power_supply.safe_shutdown()
+
+        self.y.power_supply.safe_shutdown()
+
+        self.z.power_supply.safe_shutdown()
+
+        self.enabled = False
+
+    # =================================================
+    # MAGNET STATE
+    # =================================================
+
+    def is_enabled(self):
+
+        return self.enabled
 
     # =====================================================
     # MAGNET STATUS
