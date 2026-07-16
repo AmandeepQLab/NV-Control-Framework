@@ -86,7 +86,7 @@
 	},
         "Helmholtz": {
         "flip_direction": {
-            "available": false,
+            "available": true,
             "type": "pulse_generator",
             "switch": {
                 "classname": "pulseStreamer",

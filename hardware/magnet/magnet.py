@@ -129,48 +129,17 @@ class Magnet:
 
     def set_vector(self, bx=0.0, by=0.0, bz=0.0,):
 
-        #
-        # Determine requested direction
-        #
-
         values = [bx, by, bz]
 
-        signs = set()
+        direction = self._determine_global_polarity(
+            values
+        )
 
-        for value in values:
+        self._apply_global_polarity(direction)
 
-            if value > 0:
-
-                signs.add(POSITIVE)
-
-            elif value < 0:
-
-                signs.add(NEGATIVE)
-
-        if len(signs) > 1:
-
-            raise ValueError(
-
-                "Mixed-sign magnetic fields "
-                "are not supported."
-
-            )
-
-        #
-        # Select direction
-        #
-
-        if NEGATIVE in signs:
-
-            self.set_direction(NEGATIVE)
-
-        else:
-
-            self.set_direction(POSITIVE)
-
-        #
+        # -------------------------------------------------
         # Set positive magnitudes
-        #
+        # -------------------------------------------------
 
         self.x.set_field(abs(bx))
 
@@ -200,6 +169,8 @@ class Magnet:
 
     def enable(self):
 
+        self._sync_positive_polarity()
+
         self.x.power_supply.output_on()
 
         self.y.power_supply.output_on()
@@ -214,11 +185,15 @@ class Magnet:
 
     def disable(self):
 
-        self.x.power_supply.safe_shutdown()
+        self.zero()
 
-        self.y.power_supply.safe_shutdown()
+        self._sync_positive_polarity()
 
-        self.z.power_supply.safe_shutdown()
+        self.x.power_supply.output_off()
+
+        self.y.power_supply.output_off()
+
+        self.z.power_supply.output_off()
 
         self.enabled = False
 
@@ -249,6 +224,79 @@ class Magnet:
     # DIRECTION
     # =====================================================
 
+    def _sync_positive_polarity(self):
+        # The polarity relay is a latched hardware device whose state survives
+        # application restarts. Therefore the framework explicitly synchronizes
+        # the relay to POSITIVE whenever the magnet subsystem is enabled or disabled.
+        if self.flip_available and self.pulse_streamer is not None:
+            self.pulse_streamer.set_digital_output(
+                self.flip_channel,
+                False
+            )
+
+        self.direction = POSITIVE
+
+    def _determine_global_polarity(self, values):
+
+        signs = set()
+
+        for value in values:
+
+            if value > 0:
+
+                signs.add(POSITIVE)
+
+            elif value < 0:
+
+                signs.add(NEGATIVE)
+
+        if len(signs) > 1:
+
+            raise ValueError(
+                "Mixed-sign magnetic fields cannot be "
+                "generated because the polarity relay "
+                "is global."
+            )
+
+        if NEGATIVE in signs:
+
+            return NEGATIVE
+
+        if POSITIVE in signs:
+
+            return POSITIVE
+
+        return self.direction
+
+    # =====================================================
+    # APPLY GLOBAL POLARITY
+    # =====================================================
+
+    def _apply_global_polarity(self, direction):
+
+        if (
+            direction == NEGATIVE
+            and not self.flip_available
+        ):
+
+            raise RuntimeError(
+                "Negative magnetic fields are not supported "
+                "because the global polarity relay is unavailable."
+            )
+
+        if direction == self.direction:
+
+            return
+
+        if self.pulse_streamer is not None:
+
+           self.pulse_streamer.set_digital_output(
+                self.flip_channel,
+                direction == NEGATIVE
+            )
+
+        self.direction = direction
+
     def get_direction(self):
 
         return self.direction
@@ -262,12 +310,7 @@ class Magnet:
                 "Direction must be +1 or -1."
             )
 
-        #
-        # TODO:
-        # Send TTL to Pulse Streamer
-        #
-
-        self.direction = direction
+        self._apply_global_polarity(direction)
 
 
     def flip_direction(self):

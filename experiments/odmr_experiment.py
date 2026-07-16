@@ -2,14 +2,31 @@ import numpy as np
 import time
 import threading
 
-from experiments.pulsed_experiment import PulsedExperiment
+from framework.base_experiment import BaseExperiment
 from sequencing.pulse_sequence import PulseSequence
 
 
-class ODMRExperiment(PulsedExperiment):
+class ODMRExperiment(BaseExperiment):
 
     def __init__(self, hardware, config):
+
         super().__init__(hardware, config)
+
+    # =====================================================
+    # SETUP
+    # =====================================================
+
+    def setup(self):
+
+        super().setup()
+
+    # =====================================================
+    # CLEANUP
+    # =====================================================
+
+    def cleanup(self):
+
+        super().cleanup()
 
     # =====================================================
     # BUILD PULSE SEQUENCE
@@ -333,25 +350,43 @@ class ODMRExperiment(PulsedExperiment):
 
     def run(self):
 
-        f_start = self.config["f_start"]
-        f_stop = self.config["f_stop"]
-        steps = self.config["steps"]
+        self.state = self.RUNNING
 
-        freqs = np.linspace(
-            f_start,
-            f_stop,
-            steps
-        )
+        self.start_time = time.time()
 
-        signal = []
+        try:
 
-        for f in freqs:
+            f_start = self.config["f_start"]
+            f_stop = self.config["f_stop"]
+            steps = self.config["steps"]
 
-            if not self.running:
-                break
+            freqs = np.linspace(
+                f_start,
+                f_stop,
+                steps
+            )
 
-            s = self.acquire_point(f)
+            signal = []
 
-            signal.append(s)
+            for f in freqs:
 
-        return freqs, np.array(signal)
+                if self.stop_requested or not self.running:
+                    break
+
+                s = self.acquire_point(f)
+
+                signal.append(s)
+
+            return freqs, np.array(signal)
+
+        except Exception:
+
+            self.state = self.ERROR
+
+            raise
+
+        finally:
+
+            self.end_time = time.time()
+
+            self.cleanup()

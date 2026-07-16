@@ -93,6 +93,21 @@ class SwabianPulseStreamer:
 
         print("[Swabian] Outputs reset LOW")
 
+    def set_digital_output(self, channel, state):
+        """
+        Set one digital output using a short streamed sequence.
+        """
+        ps = PulseStreamer(self.ip_address)
+
+        seq = ps.createSequence()
+
+        seq.setDigital(
+            channel,
+            [(100000000, int(state))]
+        )
+
+        ps.stream(seq)
+
     def close(self):
         try:
             self.reset_outputs()

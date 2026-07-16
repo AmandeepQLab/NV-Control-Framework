@@ -5,6 +5,7 @@ class SimPulseStreamer:
 
     def __init__(self):
         self.sequence = None
+        self.digital_outputs = {}
 
     def load_sequence(self, sequence):
         self.sequence = sequence
@@ -36,3 +37,7 @@ class SimPulseStreamer:
             print(f"t={dt:6d} ns | CH {ch} {state}")
 
         print("[Sim Pulse Streamer END]\n")
+
+    def set_digital_output(self, channel, state):
+
+        self.digital_outputs[channel] = bool(state)

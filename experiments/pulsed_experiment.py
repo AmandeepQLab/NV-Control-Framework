@@ -1,4 +1,4 @@
-from experiments.base_experiment import BaseExperiment
+from framework.base_experiment import BaseExperiment
 
 
 class PulsedExperiment(BaseExperiment):

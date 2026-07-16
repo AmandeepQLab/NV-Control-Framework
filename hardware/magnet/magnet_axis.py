@@ -76,6 +76,8 @@ class MagnetAxis:
 
     def set_field(self,field_mT):
 
+        field_mT = abs(field_mT)
+
         current = self.field_to_current(field_mT)
 
         if abs(current) > self.max_current:

@@ -136,7 +136,10 @@ class HardwareManager:
 
             ip = ps_cfg["ipAddress"]
 
-            pulse = SwabianPulseStreamer(ip)
+            pulse = SwabianPulseStreamer(
+                ip_address=ip,
+                channel_map=self.hardware["channels"],
+            )
             pulse.connect()
 
             self.hardware["pulse_streamer"] = pulse
