@@ -135,7 +135,7 @@ class Magnet:
             values
         )
 
-        self._apply_global_polarity(direction)
+        self.set_polarity(direction)
 
         # -------------------------------------------------
         # Set positive magnitudes
@@ -224,6 +224,30 @@ class Magnet:
     # DIRECTION
     # =====================================================
 
+    def set_polarity(self, direction):
+
+        if direction not in (POSITIVE, NEGATIVE):
+
+            raise ValueError(
+                "Polarity must be POSITIVE or NEGATIVE."
+            )
+
+        self._apply_global_polarity(direction)
+
+    def flip_polarity(self):
+
+        if self.direction == POSITIVE:
+
+            self.set_polarity(NEGATIVE)
+
+        else:
+
+            self.set_polarity(POSITIVE)
+
+    def get_polarity(self):
+
+        return self.direction
+
     def _sync_positive_polarity(self):
         # The polarity relay is a latched hardware device whose state survives
         # application restarts. Therefore the framework explicitly synchronizes
@@ -233,6 +257,7 @@ class Magnet:
                 self.flip_channel,
                 False
             )
+            self.pulse_streamer.sync_outputs()
 
         self.direction = POSITIVE
 
@@ -294,31 +319,20 @@ class Magnet:
                 self.flip_channel,
                 direction == NEGATIVE
             )
+           self.pulse_streamer.sync_outputs()
 
         self.direction = direction
 
     def get_direction(self):
 
-        return self.direction
+        return self.get_polarity()
 
 
     def set_direction(self, direction):
 
-        if direction not in (POSITIVE, NEGATIVE):
-
-            raise ValueError(
-                "Direction must be +1 or -1."
-            )
-
-        self._apply_global_polarity(direction)
+        self.set_polarity(direction)
 
 
     def flip_direction(self):
 
-        if self.direction == POSITIVE:
-
-            self.set_direction(NEGATIVE)
-
-        else:
-
-            self.set_direction(POSITIVE)
+        self.flip_polarity()

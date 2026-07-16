@@ -98,11 +98,20 @@ class MagnetControlWindow(QMainWindow):
         # MAGNET POWER
         # =================================================
 
+        power_layout = QHBoxLayout()
+
         self.power_button = QPushButton()
 
         self.power_button.setMinimumHeight(42)
 
-        main_layout.addWidget(self.power_button)
+        self.polarity_button = QPushButton()
+        self.polarity_button.setCheckable(True)
+        self.polarity_button.setMinimumHeight(42)
+
+        power_layout.addWidget(self.power_button)
+        power_layout.addWidget(self.polarity_button)
+
+        main_layout.addLayout(power_layout)
 
         self.tabs = QTabWidget()
         main_layout.addWidget(self.tabs)
@@ -379,6 +388,10 @@ class MagnetControlWindow(QMainWindow):
             self.toggle_power
         )
 
+        self.polarity_button.toggled.connect(
+            self.toggle_polarity
+        )
+
     # =====================================================
     # MAGNET POWER
     # =====================================================
@@ -412,6 +425,22 @@ class MagnetControlWindow(QMainWindow):
         self.update_power_button()
         self.update_display()
 
+    def toggle_polarity(self, negative):
+
+        try:
+
+            self.magnet.set_polarity(
+                NEGATIVE if negative else POSITIVE
+            )
+
+        except Exception as err:
+
+            self.status_label.setText(
+                str(err)
+            )
+
+        self.update_display()
+
     # =====================================================
     # UPDATE POWER BUTTON
     # =====================================================
@@ -433,6 +462,26 @@ class MagnetControlWindow(QMainWindow):
             self.power_button.setStyleSheet(
                 "background-color: lightgray;"
             )
+
+        self.update_polarity_button()
+
+    def update_polarity_button(self):
+
+        polarity = self.magnet.get_polarity()
+
+        self.polarity_button.blockSignals(True)
+        self.polarity_button.setChecked(polarity == NEGATIVE)
+        self.polarity_button.blockSignals(False)
+
+        self.polarity_button.setText(
+            "Polarity: NEGATIVE"
+            if polarity == NEGATIVE
+            else "Polarity: POSITIVE"
+        )
+
+        self.polarity_button.setEnabled(
+            self.magnet.is_enabled()
+        )
 
     # =====================================================
     # GET SELECTED AXIS
@@ -493,12 +542,14 @@ class MagnetControlWindow(QMainWindow):
 
         self.bz_label.setText(f"{vector['z']:.3f} mT")
 
-        direction = self.magnet.get_direction()
+        direction = self.magnet.get_polarity()
 
         if direction == POSITIVE:
             self.direction_label.setText("Positive")
         else:
             self.direction_label.setText("Negative")
+
+        self.update_polarity_button()
 
 
         self.config_file_label.setText(

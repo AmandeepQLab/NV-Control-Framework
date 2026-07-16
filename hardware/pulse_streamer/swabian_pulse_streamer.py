@@ -8,6 +8,14 @@ class SwabianPulseStreamer:
         self.channel_map = channel_map or {}
         self.ps = None
         self.sequence = None
+        # Manual controls: set_digital_output -> cache -> sync_outputs -> hardware.
+        # Experiments: load_sequence -> compile_sequence -> run -> hardware.
+        # Keeping these paths separate prevents manual controls from replacing
+        # experiment pulse sequences.
+        self.persistent_outputs = {
+            channel: False
+            for channel in self.channel_map.values()
+        }
 
     def connect(self):
         self.ps = PulseStreamer(self.ip_address)
@@ -21,23 +29,28 @@ class SwabianPulseStreamer:
         if self.sequence is None:
             raise RuntimeError("No sequence loaded")
 
+        # Build experiment timing, then merge pulse overrides onto the
+        # persistent output state for every affected digital channel.
         events = set([0])
 
         for p in self.sequence.digital_pulses:
             events.add(p.start_ns)
             events.add(p.start_ns + p.duration_ns)
 
-        # Add short low tail so outputs return low
+        # Add a short tail so pulse channels return to their persistent state.
         end_time = max(events)
         events.add(end_time + 1000)
 
         times = sorted(events)
 
-        channels = sorted(set(p.channel for p in self.sequence.digital_pulses))
+        channels = set(self.persistent_outputs)
+        channels.update(
+            p.channel for p in self.sequence.digital_pulses
+        )
 
         compiled = {}
 
-        for ch in channels:
+        for ch in sorted(channels):
             pattern = []
 
             for i in range(len(times) - 1):
@@ -45,7 +58,7 @@ class SwabianPulseStreamer:
                 t1 = times[i + 1]
                 duration = t1 - t0
 
-                state = 0
+                state = int(self.get_digital_output(ch))
 
                 for p in self.sequence.digital_pulses:
                     if p.channel == ch:
@@ -72,12 +85,9 @@ class SwabianPulseStreamer:
 
     def reset_outputs(self, duration_ns=1000):
         """
-        Force all known digital output channels LOW.
+        Temporarily reset all known physical digital outputs to LOW.
         """
-
-        seq = self.ps.createSequence()
-
-        channels = set()
+        channels = set(self.persistent_outputs)
 
         if self.channel_map:
             channels.update(self.channel_map.values())
@@ -86,27 +96,38 @@ class SwabianPulseStreamer:
             for p in self.sequence.digital_pulses:
                 channels.add(p.channel)
 
+        seq = self.ps.createSequence()
+
         for ch in channels:
             seq.setDigital(ch, [(duration_ns, 0)])
 
         self.ps.stream(seq)
 
-        print("[Swabian] Outputs reset LOW")
-
     def set_digital_output(self, channel, state):
         """
-        Set one digital output using a short streamed sequence.
+        Store one persistent digital output state.
         """
-        ps = PulseStreamer(self.ip_address)
+        self.persistent_outputs[channel] = bool(state)
 
-        seq = ps.createSequence()
+    def sync_outputs(self):
+        """
+        Synchronize cached persistent digital outputs with hardware.
+        """
+        seq = self.ps.createSequence()
 
-        seq.setDigital(
-            channel,
-            [(100000000, int(state))]
-        )
+        for channel, state in self.persistent_outputs.items():
+            seq.setDigital(
+                channel,
+                [(100_000_000, int(state))]
+            )
 
-        ps.stream(seq)
+        self.ps.stream(seq)
+
+    def get_digital_output(self, channel):
+        """
+        Return the persistent state stored for one digital output.
+        """
+        return self.persistent_outputs.get(channel, False)
 
     def close(self):
         try:
