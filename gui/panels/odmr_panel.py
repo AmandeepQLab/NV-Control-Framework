@@ -163,7 +163,7 @@ class ODMRPanel(QWidget):
         mode_layout.addWidget(QLabel("Plot mode:"))
 
         self.plot_mode_combo = QComboBox()
-        self.plot_mode_combo.addItems(["Normalized ESR", "Raw I_on / I_off"])
+        self.plot_mode_combo.addItems(["Normalized ESR", "Mean I_on / I_off"])
 
         mode_layout.addWidget(self.plot_mode_combo)
         odmr_layout.addLayout(mode_layout)
@@ -375,12 +375,12 @@ class ODMRPanel(QWidget):
 
     def update_plot_raw(self, x, i_on, i_off):
         self.plot.clear()
-        self.plot.setLabel("left", "Raw Fluorescence")
+        self.plot.setLabel("left", "Mean Fluorescence (counts/pixel)")
         self.plot.setLabel("bottom", "Microwave Frequency (GHz)")
         self.plot.showGrid(x=True, y=True)
         self.plot.addLegend()
-        self.plot.plot(x, i_on, pen="g", symbol="o", symbolSize=6, name="I_on")
-        self.plot.plot(x, i_off, pen="r", symbol="o", symbolSize=6, name="I_off")
+        self.plot.plot(x, i_on, pen="g", symbol="o", symbolSize=6, name="Mean I_on")
+        self.plot.plot(x, i_off, pen="r", symbol="o", symbolSize=6, name="Mean I_off")
 
     def update_plot(self, x, y):
         self.update_plot_normalized(x, y)

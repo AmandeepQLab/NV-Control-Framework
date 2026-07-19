@@ -74,7 +74,7 @@ class MagnetAxis:
     # CONTROL
     # =====================================================
 
-    def set_field(self,field_mT):
+    def set_field(self, field_mT, keep_output_enabled=False):
 
         field_mT = abs(field_mT)
 
@@ -92,7 +92,10 @@ class MagnetAxis:
 
         if abs(current) < 1e-9:
 
-            self.power_supply.safe_shutdown()
+            if keep_output_enabled:
+                self.power_supply.set_current(0.0)
+            else:
+                self.power_supply.safe_shutdown()
 
         else:
 

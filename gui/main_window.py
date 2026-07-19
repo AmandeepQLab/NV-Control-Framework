@@ -14,6 +14,12 @@ from config.config_manager import ConfigManager
 from hardware.hardware_manager import HardwareManager
 from gui.odmr_window import ODMRWindow
 from gui.zero_field_window import ZeroFieldWindow
+from framework.camera_ownership import (
+    register_live_view_controller,
+    start_live_stream_if_available,
+)
+from gui.live_view_controller import LiveViewTimerController
+from utils.camera_diagnostics import log_event
 
 
 class MainWindow(QMainWindow):
@@ -285,6 +291,8 @@ class MainWindow(QMainWindow):
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_image)
+        self.live_view_timer = LiveViewTimerController(self.timer, 30)
+        register_live_view_controller(self.camera, self.live_view_timer)
 
     # =====================================================
     # OPEN MAGNET WINDOW
@@ -332,7 +340,9 @@ class MainWindow(QMainWindow):
         if self.state == "ODMR_RUNNING":
             return
 
-        self.camera.start_stream()
+        if not start_live_stream_if_available(self.camera):
+            return
+
         self.timer.start(30)
 
         self.set_state("LIVE_VIEW")
@@ -360,6 +370,7 @@ class MainWindow(QMainWindow):
         frame = self.camera.get_latest_frame()
 
         if frame is not None:
+            log_event("gui_image_update", source="live stream", image_target="main live-view image")
             self.image_view.setImage(
                 frame.T,
                 autoLevels=False
@@ -402,8 +413,8 @@ class MainWindow(QMainWindow):
 
         return (
             int(pos.x()),
-            int(pos.x() + size.x()),
             int(pos.y()),
+            int(pos.x() + size.x()),
             int(pos.y() + size.y())
         )
 
@@ -440,7 +451,18 @@ class MainWindow(QMainWindow):
 
     def open_zero_field_window(self):
 
+        if (
+            hasattr(self, "zero_field_window")
+            and self.zero_field_window is not None
+            and self.zero_field_window.isVisible()
+        ):
+            self.zero_field_window.raise_()
+            self.zero_field_window.activateWindow()
+            return
+
         self.zero_field_window = ZeroFieldWindow(
+
+            hardware_manager=self.hw_manager,
 
             hardware=self.hardware,
 
@@ -449,6 +471,8 @@ class MainWindow(QMainWindow):
             roi_getter=self.get_current_roi,
 
             exposure_getter=self.get_current_exposure,
+
+            binning_getter=lambda: self.binning_spin.value(),
 
         )
 
@@ -494,6 +518,12 @@ class MainWindow(QMainWindow):
             try:
                 if self.odmr_window is not None:
                     self.odmr_window.close()
+            except Exception:
+                pass
+
+            try:
+                if getattr(self, "zero_field_window", None) is not None:
+                    self.zero_field_window.close()
             except Exception:
                 pass
 

@@ -141,11 +141,14 @@ class Magnet:
         # Set positive magnitudes
         # -------------------------------------------------
 
-        self.x.set_field(abs(bx))
+        # A vector update is commonly used inside a scan.  Zero-current axes
+        # must remain enabled while the scan is active; shutdown remains the
+        # responsibility of ``disable()`` or an explicit axis zero operation.
+        self.x.set_field(abs(bx), keep_output_enabled=True)
 
-        self.y.set_field(abs(by))
+        self.y.set_field(abs(by), keep_output_enabled=True)
 
-        self.z.set_field(abs(bz))
+        self.z.set_field(abs(bz), keep_output_enabled=True)
 
     # =====================================================
     # GET VECTOR

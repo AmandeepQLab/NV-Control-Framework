@@ -2,15 +2,26 @@ import numpy as np
 import time
 import threading
 
-from framework.base_experiment import BaseExperiment
+from framework.scan_experiment import ScanExperiment
+from framework.fluorescence import mean_fluorescence
 from sequencing.pulse_sequence import PulseSequence
 
 
-class ODMRExperiment(BaseExperiment):
+class ODMRExperiment(ScanExperiment):
+
+    scan_axis_name = "frequency"
+    scan_axis_unit = "Hz"
 
     def __init__(self, hardware, config):
 
         super().__init__(hardware, config)
+
+        if all(key in config for key in ("f_start", "f_stop", "steps")):
+            self.scan_vector = np.linspace(
+                config["f_start"],
+                config["f_stop"],
+                config["steps"],
+            )
 
     # =====================================================
     # SETUP
@@ -19,6 +30,11 @@ class ODMRExperiment(BaseExperiment):
     def setup(self):
 
         super().setup()
+
+    def setup_scan(self):
+        self.image_cube.scan_axis_name = self.scan_axis_name
+        self.image_cube.scan_axis_unit = self.scan_axis_unit
+        self.image_cube.scan_axis_values = self.scan_vector
 
     # =====================================================
     # CLEANUP
@@ -206,18 +222,50 @@ class ODMRExperiment(BaseExperiment):
     # FRAME PROCESSING
     # =====================================================
 
+    def _mean_fluorescence(self, frame):
+        """Return mean fluorescence per pixel for a frame or selected ROI."""
+        return mean_fluorescence(frame, self.config.get("roi"))
+
+    def _integrate_frame(self, frame):
+        """Backward-compatible alias for the former frame integration hook."""
+        return self._mean_fluorescence(frame)
+
     def process_frame(self, frame):
+        """Process a raw camera frame or one ODMR OFF/ON acquisition."""
+        frame = np.asarray(frame)
 
-        roi = self.config.get("roi", None)
+        # A single camera image remains supported for callers that used this
+        # method directly before ODMR became a ScanExperiment.
+        if frame.ndim == 2:
+            return self._mean_fluorescence(frame)
 
-        if roi is None:
-            return frame.sum()
+        pairs = frame[np.newaxis, ...] if frame.ndim == 3 else frame
+        i_off_list = []
+        i_on_list = []
+        signals = []
 
-        x0, x1, y0, y1 = roi
+        for r, pair in enumerate(pairs):
+            I_off = self._mean_fluorescence(pair[0])
+            I_on = self._mean_fluorescence(pair[1])
 
-        roi_frame = frame[y0:y1, x0:x1]
+            print(
+                f"Repeat {r+1}: "
+                f"I_off={I_off:.2f}, "
+                f"I_on={I_on:.2f}, "
+                f"ratio={I_on/I_off:.6f}"
+            )
 
-        return roi_frame.sum()
+            i_off_list.append(I_off)
+            i_on_list.append(I_on)
+
+            if I_on != 0:
+                signals.append(100.0 * I_on / I_off)
+            else:
+                signals.append(0)
+
+        self._last_i_off = np.mean(i_off_list)
+        self._last_i_on = np.mean(i_on_list)
+        return np.mean(signals)
 
     # =====================================================
     # TRIGGERED FRAME ACQUISITION
@@ -260,13 +308,11 @@ class ODMRExperiment(BaseExperiment):
 
         return frame
     # =====================================================
-    # SINGLE ODMR POINT
+    # SCAN EXPERIMENT HOOKS
     # =====================================================
 
-    def acquire_point(self, frequency, return_raw=False):
-
+    def set_scan_point(self, frequency):
         mw = self.hw["microwave"]
-        pulse = self.hw["pulse_streamer"]
 
         mw.set_frequency(frequency)
 
@@ -281,11 +327,14 @@ class ODMRExperiment(BaseExperiment):
         if hasattr(mw, "rf_on"):
             mw.rf_on()
 
-        repeats = self.config.get("repeats", 1)
+    def acquire_frame(self):
+        """Acquire the OFF/ON camera-frame pairs for one configured point."""
+        mw = self.hw["microwave"]
+        pulse = self.hw["pulse_streamer"]
 
-        i_off_list = []
-        i_on_list = []
-        signals = []
+        power_dbm = self.config.get("mw_power_dbm", -10)
+        repeats = self.config.get("repeats", 1)
+        frames = []
 
         for r in range(repeats):
 
@@ -317,76 +366,21 @@ class ODMRExperiment(BaseExperiment):
                 seq_on
             )
 
-            I_off = self.process_frame(frame_off)
-            I_on = self.process_frame(frame_on)
+            frames.append(np.stack((frame_off, frame_on)))
 
-            print(
-                f"Repeat {r+1}: "
-                f"I_off={I_off:.2f}, "
-                f"I_on={I_on:.2f}, "
-                f"ratio={I_on/I_off:.6f}"
-            )
+        return np.stack(frames)
 
-            i_off_list.append(I_off)
-            i_on_list.append(I_on)
+    # =====================================================
+    # SINGLE ODMR POINT (backward-compatible convenience API)
+    # =====================================================
 
-            if I_on != 0:
-                signals.append(100.0 * I_on / I_off)
-            else:
-                signals.append(0)
+    def acquire_point(self, frequency, return_raw=False):
 
-        signal = np.mean(signals)
-
-        I_off = np.mean(i_off_list)
-        I_on = np.mean(i_on_list)
+        self.set_scan_point(frequency)
+        frame = self.acquire_frame()
+        signal = self.process_frame(frame)
 
         if return_raw:
-            return signal, I_off, I_on
+            return signal, self._last_i_off, self._last_i_on
 
         return signal
-    # =====================================================
-    # RUN FULL EXPERIMENT
-    # =====================================================
-
-    def run(self):
-
-        self.state = self.RUNNING
-
-        self.start_time = time.time()
-
-        try:
-
-            f_start = self.config["f_start"]
-            f_stop = self.config["f_stop"]
-            steps = self.config["steps"]
-
-            freqs = np.linspace(
-                f_start,
-                f_stop,
-                steps
-            )
-
-            signal = []
-
-            for f in freqs:
-
-                if self.stop_requested or not self.running:
-                    break
-
-                s = self.acquire_point(f)
-
-                signal.append(s)
-
-            return freqs, np.array(signal)
-
-        except Exception:
-
-            self.state = self.ERROR
-
-            raise
-
-        finally:
-
-            self.end_time = time.time()
-
-            self.cleanup()

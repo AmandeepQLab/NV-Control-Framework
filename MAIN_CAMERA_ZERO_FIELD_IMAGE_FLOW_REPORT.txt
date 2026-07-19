@@ -1,0 +1,238 @@
+MAIN CAMERA IMAGE UPDATES DURING ZERO FIELD SCAN
+=================================================
+
+Scope
+-----
+This report is a read-only trace of how NumPy image data can reach the main
+camera display widget while a Zero Field scan is running. No code was changed
+for this investigation.
+
+Conclusion
+----------
+The main camera display is updated by MainWindow.update_image() during a Zero
+Field scan.
+
+Stopping the live camera stream does not stop the main GUI's independent 30 ms
+QTimer. During the Zero Field experiment, camera.snap() writes each acquired
+frame into the shared camera object's latest_frame field. The still-running
+main-window timer polls that field and renders it through
+MainWindow.image_view.setImage(frame.T).
+
+Therefore, there are no live stream snap() calls during the experiment, yet
+the main display visibly changes because it is displaying Zero Field frames
+from the shared camera latest-frame buffer.
+
+Main Live-View Display Path During a Zero Field Scan
+----------------------------------------------------
+
+ZeroFieldExperiment.acquire_frame()
+    |
+    +--> camera.snap()
+             |
+             +--> Camera.snap()
+                    |
+                    +--> camera.latest_frame = frame
+
+At the same time, independently:
+
+MainWindow.timer (30 ms timer remains active)
+    |
+    +--> MainWindow.update_image()
+             |
+             +--> camera.get_latest_frame()
+             |      |
+             |      +--> copy of the Zero Field frame
+             |
+             +--> MainWindow.image_view.setImage(frame.T)
+                      |
+                      +--> main camera display visibly updates
+
+Exact Main Display Update Function
+----------------------------------
+
+The function that updates the main camera display is:
+
+    gui/main_window.py
+    MainWindow.update_image()
+
+Its data path is:
+
+    frame = self.camera.get_latest_frame()
+    self.image_view.setImage(frame.T, autoLevels=False)
+
+This is the only direct setImage() call for the main pg.ImageView in the
+application source.
+
+Timer Lifecycle
+---------------
+
+MainWindow.start_stream() starts the GUI timer:
+
+    self.timer.start(30)
+
+MainWindow.stop_stream() stops the GUI timer:
+
+    self.timer.stop()
+
+The Zero Field experiment instead uses exclusive_camera_access(camera).
+That context manager calls camera.stop_stream() when the stream was active,
+but it does not call MainWindow.stop_stream() and has no reference to
+MainWindow.timer. Thus, it stops the camera's streaming thread but leaves the
+main window polling timer active.
+
+Zero Field Experiment Image Flow
+--------------------------------
+
+Camera
+  |
+  +--> ZeroFieldExperiment.acquire_frame()
+         |
+         +--> camera.snap() for each requested average
+         |
+         +--> numpy.mean(numpy.stack(frames), axis=0)
+                |
+                +--> ScanExperiment.run()
+                       |
+                       +--> image_cube.add(frame)
+                       |
+                       +--> ZeroFieldExperiment.process_frame(frame)
+                       |      |
+                       |      +--> self.latest_image = frame
+                       |      +--> mean_fluorescence(frame, roi)
+                       |
+                       +--> ZeroFieldExperiment.emit_live_update(value, signal)
+                              |
+                              +--> live_update_callback(value, signal,
+                                   self.latest_image)
+                                     |
+                                     +--> ZeroFieldWorker._on_live_update()
+                                            |
+                                            +--> live_update_signal(field,
+                                            |    signal, image)
+                                            |
+                                            +--> progress_signal(current,
+                                                 total)
+
+Zero Field Qt Signals and Slots
+-------------------------------
+
+1. QThread.started
+
+    ZeroFieldWindow.thread.started
+        --> ZeroFieldWorker.start
+
+2. Per-frame live-update signal
+
+    ZeroFieldWorker.live_update_signal(field, signal, image)
+        --> ZeroFieldWindow.handle_live_update(field, signal, _image)
+
+    The image argument is named _image and is not displayed or forwarded by
+    handle_live_update(). That method stores only field and signal values.
+
+3. Per-frame progress signal
+
+    ZeroFieldWorker.progress_signal(current, total)
+        --> ZeroFieldWindow.handle_progress(current, total)
+        --> ZeroFieldWidget.update_live_data(...)
+
+    update_live_data() updates the Zero Field plot, progress bar, and labels.
+    It does not display a NumPy image.
+
+4. Completion signal
+
+    ZeroFieldWorker.finished_signal(image_cube, fields, signals, stopped)
+        --> ZeroFieldWindow.scan_finished(...)
+        --> QThread.quit
+
+5. Error signal
+
+    ZeroFieldWorker.error_signal(message)
+        --> ZeroFieldWindow.show_error(message)
+        --> QThread.quit
+
+Verification of Possible Routes to the Main Widget
+---------------------------------------------------
+
+Shared signals:
+    No. ZeroFieldWorker.live_update_signal is connected only to
+    ZeroFieldWindow.handle_live_update. It is not connected to MainWindow,
+    MainWindow.update_image, or MainWindow.image_view.
+
+Shared widgets:
+    No. The main display is MainWindow.image_view, a pyqtgraph ImageView.
+    The Zero Field window owns a separate ZeroFieldWidget containing a plot,
+    controls, labels, and progress bar. It does not share the main ImageView.
+
+Shared image model:
+    Yes. MainWindow and ZeroFieldExperiment receive the same camera instance.
+    Every camera snap() updates that instance's camera.latest_frame. The main
+    display reads this same field through camera.get_latest_frame().
+
+Shared display functions:
+    No. The Zero Field display path does not call MainWindow.update_image()
+    directly. The independently scheduled MainWindow.timer invokes it.
+
+Shared camera callbacks:
+    No. The main display is not driven by a camera callback or a Qt camera
+    signal. It is driven by polling in MainWindow.update_image().
+
+Direct Image Display Calls Found
+--------------------------------
+
+Main camera display:
+
+    MainWindow.image_view.setImage(frame.T, autoLevels=False)
+    Location: gui/main_window.py, MainWindow.update_image()
+
+Zero Field GUI:
+
+    No setImage(), setPixmap(), or display() call consumes the Zero Field
+    NumPy image. The image carried by live_update_signal is ignored by the
+    Zero Field window; only numeric scan data is plotted.
+
+Other plotting code:
+
+    framework/image_cube.py contains matplotlib imshow() helper methods, but
+    they are not connected to MainWindow.image_view and are not part of the
+    Zero Field live update route.
+
+Final Dataflow Diagram
+----------------------
+
+                         +----------------------------------+
+                         |          Shared camera           |
+                         |           latest_frame           |
+                         +----------------+-----------------+
+                                          ^ |
+                                          | |
+          Zero Field acquisition          | | Main GUI polling
+                                          | |
+Camera --> ZeroFieldExperiment.acquire_frame() |
+             |                                |
+             +--> camera.snap() --------------+
+                                                  |
+MainWindow.timer.timeout ------------------------+
+    |
+    +--> MainWindow.update_image()
+            |
+            +--> camera.get_latest_frame()
+            |
+            +--> MainWindow.image_view.setImage(frame.T)
+                    |
+                    +--> Main camera display
+
+Separate Zero Field notification path:
+
+ZeroFieldExperiment.emit_live_update()
+    --> ZeroFieldWorker._on_live_update()
+    --> live_update_signal(field, signal, image)
+    --> ZeroFieldWindow.handle_live_update(...)
+    --> stores field and signal only; ignores image
+    --> progress_signal(...)
+    --> ZeroFieldWidget.update_live_data(...)
+    --> Zero Field plot, labels, and progress bar
+
+No shared Qt signal, shared widget, shared display method, or camera callback
+sends the Zero Field image directly to the main camera display. The exact
+mechanism is the shared camera.latest_frame buffer plus the main window timer
+that remains active during the scan.

@@ -266,7 +266,7 @@ class ODMRWindow(QMainWindow):
 
         mode = self.panel.get_plot_mode()
 
-        if mode == "Raw I_on / I_off":
+        if mode == "Mean I_on / I_off":
 
             if self.odmr_worker is None:
                 return

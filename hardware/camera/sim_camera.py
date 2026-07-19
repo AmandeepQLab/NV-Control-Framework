@@ -2,13 +2,17 @@ import numpy as np
 import threading
 import time
 
+from hardware.camera.streaming import StreamController
+from utils.camera_diagnostics import log_camera_snap, log_event
+
 
 class SimCamera:
 
     def __init__(
         self,
         image_shape=(64, 64),
-        microwave=None
+        microwave=None,
+        stream_shutdown_timeout_s=12.0,
     ):
 
         # =====================================================
@@ -38,13 +42,11 @@ class SimCamera:
 
         self.image_shape = image_shape
 
-        self.streaming = False
-
         self.latest_frame = None
 
         self._lock = threading.Lock()
-
-        self._stream_thread = None
+        self._stream_controller = StreamController()
+        self.stream_shutdown_timeout_s = stream_shutdown_timeout_s
 
         # =====================================================
         # ODMR PHYSICS PARAMETERS
@@ -57,6 +59,10 @@ class SimCamera:
         self.linewidth = 5e6
 
         self.contrast = 0.03
+
+    @property
+    def streaming(self):
+        return self._stream_controller.is_streaming
 
     # =========================================================
     # CONFIGURATION
@@ -129,6 +135,8 @@ class SimCamera:
 
     def snap(self):
 
+        log_camera_snap(type(self).__name__)
+
         time.sleep(self.exposure_time)
 
         frame = self._generate_frame()
@@ -144,38 +152,34 @@ class SimCamera:
     # =========================================================
 
     def start_stream(self):
-
-        if self.streaming:
-            return
-
-        self.streaming = True
-
-        self._stream_thread = threading.Thread(
-            target=self._stream_loop,
-            daemon=True
-        )
-
-        self._stream_thread.start()
+        log_event("start_stream", source="live stream", camera_type=type(self).__name__)
+        self._stream_controller.start(self._stream_loop)
 
     def _stream_loop(self):
+        log_event("stream_thread_start", source="live stream", camera_type=type(self).__name__)
+        try:
+            while not self._stream_controller.wait(0):
+                def acquire():
+                    log_event("camera.acquisition", source="live stream", camera_type=type(self).__name__, caller_function="_stream_loop", caller_file=__file__)
+                    frame = self._generate_frame()
+                    with self._lock:
+                        self.latest_frame = frame
 
-        while self.streaming:
+                if not self._stream_controller.acquire_once(acquire):
+                    break
 
-            frame = self._generate_frame()
+                self._stream_controller.wait(self.exposure_time)
+        finally:
+            log_event("stream_thread_exit", source="live stream", camera_type=type(self).__name__)
 
-            with self._lock:
-
-                self.latest_frame = frame
-
-            time.sleep(self.exposure_time)
-
-    def stop_stream(self):
-
-        self.streaming = False
-
-        if self._stream_thread:
-
-            self._stream_thread.join(timeout=1)
+    def stop_stream(self, timeout_s=None):
+        log_event("stop_stream", source="live stream", camera_type=type(self).__name__)
+        timeout_s = (
+            self.stream_shutdown_timeout_s
+            if timeout_s is None
+            else timeout_s
+        )
+        self._stream_controller.stop(timeout_s)
 
     # =========================================================
     # GET FRAME

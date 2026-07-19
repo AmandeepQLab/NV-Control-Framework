@@ -3,11 +3,13 @@ import threading
 import time
 
 from pylablib.devices import Andor
+from hardware.camera.streaming import StreamController
+from utils.camera_diagnostics import log_camera_snap, log_event
 
 
 class AndorNeo:
 
-    def __init__(self):
+    def __init__(self, stream_shutdown_timeout_s=12.0):
 
         # =================================================
         # CAMERA HANDLE
@@ -29,13 +31,15 @@ class AndorNeo:
         # STREAMING
         # =================================================
 
-        self.streaming = False
-
         self.latest_frame = None
 
         self._lock = threading.Lock()
+        self._stream_controller = StreamController()
+        self.stream_shutdown_timeout_s = stream_shutdown_timeout_s
 
-        self._stream_thread = None
+    @property
+    def streaming(self):
+        return self._stream_controller.is_streaming
 
     # =====================================================
     # CONNECT
@@ -80,6 +84,8 @@ class AndorNeo:
     # =====================================================
 
     def snap(self):
+
+        log_camera_snap(type(self).__name__)
 
         frame = self.cam.snap()
 
@@ -130,55 +136,43 @@ class AndorNeo:
     # =====================================================
 
     def _stream_loop(self):
+        log_event("stream_thread_start", source="live stream", camera_type=type(self).__name__)
+        try:
+            while not self._stream_controller.wait(0):
 
-        while self.streaming:
+                try:
+                    if not self._stream_controller.acquire_once(self.snap):
+                        break
 
-            try:
+                except Exception as e:
 
-                frame = self.cam.snap()
+                    print("Camera stream error:")
+                    print(e)
 
-                frame = np.array(frame)
-
-                with self._lock:
-
-                    self.latest_frame = frame
-
-            except Exception as e:
-
-                print("Camera stream error:")
-                print(e)
-
-            time.sleep(0.001)
+                self._stream_controller.wait(0.001)
+        finally:
+            log_event("stream_thread_exit", source="live stream", camera_type=type(self).__name__)
 
     # =====================================================
     # START STREAM
     # =====================================================
 
     def start_stream(self):
-
-        if self.streaming:
-            return
-
-        self.streaming = True
-
-        self._stream_thread = threading.Thread(
-            target=self._stream_loop,
-            daemon=True
-        )
-
-        self._stream_thread.start()
+        log_event("start_stream", source="live stream", camera_type=type(self).__name__)
+        self._stream_controller.start(self._stream_loop)
 
     # =====================================================
     # STOP STREAM
     # =====================================================
 
-    def stop_stream(self):
-
-        self.streaming = False
-
-        if self._stream_thread is not None:
-
-            self._stream_thread.join(timeout=1)
+    def stop_stream(self, timeout_s=None):
+        log_event("stop_stream", source="live stream", camera_type=type(self).__name__)
+        timeout_s = (
+            self.stream_shutdown_timeout_s
+            if timeout_s is None
+            else timeout_s
+        )
+        self._stream_controller.stop(timeout_s)
 
     # =====================================================
     # GET FRAME
