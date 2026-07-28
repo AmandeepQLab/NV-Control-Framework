@@ -28,28 +28,17 @@ class ZeroFieldAnalysisTests(unittest.TestCase):
         )
 
     def test_returns_expected_field_vector_and_full_frame_signal(self):
-        fields, signals = mean_fluorescence_vs_field(self.cube, roi=None)
+        fields, signals = mean_fluorescence_vs_field(self.cube)
 
         np.testing.assert_array_equal(fields, self.fields)
         np.testing.assert_allclose(signals, [2.5, 25.0, 250.0])
 
-    def test_roi_changes_calculated_signal(self):
-        fields, signals = mean_fluorescence_vs_field(
-            self.cube, roi=(0, 0, 1, 2)
-        )
+    def test_acquisition_roi_metadata_does_not_crop_images_again(self):
+        self.cube.metadata["acquisition_roi"] = (100, 200, 102, 202)
 
-        np.testing.assert_array_equal(fields, self.fields)
-        np.testing.assert_allclose(signals, [2.0, 20.0, 200.0])
+        _, signals = mean_fluorescence_vs_field(self.cube)
 
-    def test_matches_previous_per_frame_fluorescence_calculation(self):
-        roi = (1, 0, 2, 2)
-        _, signals = mean_fluorescence_vs_field(self.cube, roi=roi)
-        x0, y0, x1, y1 = roi
-        previous_signals = [
-            np.mean(frame[y0:y1, x0:x1]) for frame in self.data
-        ]
-
-        np.testing.assert_allclose(signals, previous_signals)
+        np.testing.assert_allclose(signals, [2.5, 25.0, 250.0])
 
     def test_loaded_image_cube_can_be_reanalyzed(self):
         with tempfile.TemporaryDirectory() as directory:

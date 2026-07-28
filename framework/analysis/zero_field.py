@@ -5,13 +5,14 @@ import numpy as np
 from framework.fluorescence import mean_fluorescence
 
 
-def mean_fluorescence_vs_field(image_cube, roi=None):
+def mean_fluorescence_vs_field(image_cube):
     """Return magnetic-field values and mean fluorescence for each image.
 
     The magnetic-field vector is read from the ImageCube scan-axis metadata,
     so the same analysis works for an in-memory acquisition or a cube loaded
-    from disk.  ROI validation and clipping are delegated to the shared
-    fluorescence and ROI utilities.
+    from disk.  Each received image is analyzed as acquired.  In particular,
+    a hardware acquisition ROI is already applied by the camera and must not
+    be cropped again during analysis.
     """
     data = image_cube.data
     if data is None:
@@ -31,5 +32,5 @@ def mean_fluorescence_vs_field(image_cube, roi=None):
             "value for each acquired image."
         )
 
-    signals = np.asarray([mean_fluorescence(frame, roi) for frame in data])
+    signals = np.asarray([mean_fluorescence(frame) for frame in data])
     return fields, signals

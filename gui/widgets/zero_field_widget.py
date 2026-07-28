@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
 class ZeroFieldWidget(QWidget):
     """Widget matching the ODMR control-and-plot layout."""
 
-    def __init__(self, exposure_s=0.02, binning=1):
+    def __init__(self):
         super().__init__()
 
         main_layout = QHBoxLayout(self)
@@ -71,18 +71,12 @@ class ZeroFieldWidget(QWidget):
         )
         self._set_averaging_controls_enabled(False)
 
-        camera_group = QGroupBox("Camera")
+        camera_group = QGroupBox("Camera Acquisition")
         camera_layout = QVBoxLayout(camera_group)
         control_layout.addWidget(camera_group)
-        self.exposure_spin = self._add_double(
-            camera_layout, "Exposure Time (s):", 0.001, 10.0, 4, exposure_s
+        camera_layout.addWidget(
+            QLabel("ROI, exposure, and binning are controlled in the main window.")
         )
-        self.binning_spin = self._add_int(
-            camera_layout, "Binning:", 1, 8, binning
-        )
-        self.use_roi_check = QCheckBox("Use ROI selected in main camera view")
-        self.use_roi_check.setChecked(True)
-        camera_layout.addWidget(self.use_roi_check)
 
         self.run_stop_button = QPushButton("Start Scan")
         self.run_stop_button.setStyleSheet(
@@ -150,8 +144,6 @@ class ZeroFieldWidget(QWidget):
             "field_axis": self.field_axis_combo.currentText(),
             "settling_time_ms": self.settling_time_spin.value(),
             "averages": self.averages_spin.value(),
-            "exposure_s": self.exposure_spin.value(),
-            "binning": self.binning_spin.value(),
             "averaging_enabled": self.averaging_enabled_check.isChecked(),
             "num_scans": self.num_scans_spin.value(),
             "save_raw_scans": self.save_raw_scans_check.isChecked(),

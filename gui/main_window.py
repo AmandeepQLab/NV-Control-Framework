@@ -15,9 +15,12 @@ from hardware.hardware_manager import HardwareManager
 from gui.odmr_window import ODMRWindow
 from gui.zero_field_window import ZeroFieldWindow
 from framework.camera_ownership import (
+    apply_live_acquisition_state,
+    register_camera_state_restorer,
     register_live_view_controller,
     start_live_stream_if_available,
 )
+from framework.acquisition_state import AcquisitionState
 from gui.live_view_controller import LiveViewTimerController
 from utils.camera_diagnostics import log_event
 
@@ -53,6 +56,9 @@ class MainWindow(QMainWindow):
 
         self.state = "IDLE"
         self.odmr_window = None
+        # Full-sensor coordinates for camera acquisition.  Experiments receive
+        # this value but never define a separate acquisition ROI of their own.
+        self.acquisition_state = AcquisitionState()
 
         # =====================================================
         # MAIN LAYOUT
@@ -140,8 +146,12 @@ class MainWindow(QMainWindow):
         roi_layout = QVBoxLayout()
         roi_box.setLayout(roi_layout)
 
-        self.roi_label = QLabel("ROI: None")
+        self.roi_label = QLabel("Acquisition ROI: None")
         roi_layout.addWidget(self.roi_label)
+
+        self.reset_roi_button = QPushButton("Reset ROI")
+        self.reset_roi_button.clicked.connect(self.reset_acquisition_roi)
+        roi_layout.addWidget(self.reset_roi_button)
 
         # =====================================================
         # EXPERIMENTS
@@ -284,6 +294,7 @@ class MainWindow(QMainWindow):
 
         self.image_view.addItem(self.roi)
         self.roi.sigRegionChanged.connect(self.update_roi_info)
+        self.update_roi_info()
 
         # =====================================================
         # LIVE VIEW TIMER
@@ -293,6 +304,9 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.update_image)
         self.live_view_timer = LiveViewTimerController(self.timer, 30)
         register_live_view_controller(self.camera, self.live_view_timer)
+        register_camera_state_restorer(
+            self.camera, self.apply_acquisition_state_to_camera
+        )
 
     # =====================================================
     # OPEN MAGNET WINDOW
@@ -340,6 +354,9 @@ class MainWindow(QMainWindow):
         if self.state == "ODMR_RUNNING":
             return
 
+        if not self.apply_acquisition_state():
+            return
+
         if not start_live_stream_if_available(self.camera):
             return
 
@@ -381,12 +398,20 @@ class MainWindow(QMainWindow):
     # =========================================================
 
     def set_exposure(self, value):
-
-        self.camera.set_exposure(value)
+        self.acquisition_state = AcquisitionState(
+            acquisition_roi=self.acquisition_state.acquisition_roi,
+            exposure_s=value,
+            binning=self.acquisition_state.binning,
+        )
+        self.apply_acquisition_state()
 
     def set_binning(self, value):
-
-        self.camera.set_binning(value)
+        self.acquisition_state = AcquisitionState(
+            acquisition_roi=self.acquisition_state.acquisition_roi,
+            exposure_s=self.acquisition_state.exposure_s,
+            binning=value,
+        )
+        self.apply_acquisition_state()
 
     # =========================================================
     # ROI
@@ -404,9 +429,15 @@ class MainWindow(QMainWindow):
             f"h={int(size.y())}"
         )
 
-        self.roi_label.setText(text)
+        self.roi_label.setText(f"Acquisition ROI: {text}")
+        self.acquisition_state = AcquisitionState(
+            acquisition_roi=self._roi_overlay_coordinates(),
+            exposure_s=self.acquisition_state.exposure_s,
+            binning=self.acquisition_state.binning,
+        )
+        self.apply_acquisition_state()
 
-    def get_current_roi(self):
+    def _roi_overlay_coordinates(self):
 
         pos = self.roi.pos()
         size = self.roi.size()
@@ -418,9 +449,41 @@ class MainWindow(QMainWindow):
             int(pos.y() + size.y())
         )
 
-    def get_current_exposure(self):
+    def get_acquisition_roi(self):
+        """Return the Main Window acquisition ROI in full-sensor coordinates."""
+        return self.acquisition_state.acquisition_roi
 
-        return self.exposure_spin.value()
+    def get_acquisition_state(self):
+        """Return the immutable Main-Window acquisition settings snapshot."""
+        return self.acquisition_state
+
+    def apply_acquisition_state_to_camera(self):
+        """Apply state to an idle camera; ownership is managed by the caller."""
+        self.acquisition_state.apply_to(self.camera)
+
+    def apply_acquisition_state(self):
+        """Safely update camera settings while preserving live-view state."""
+        return apply_live_acquisition_state(
+            self.camera, self.apply_acquisition_state_to_camera
+        )
+
+    def reset_acquisition_roi(self):
+        """Return the user's acquisition configuration to full-sensor AOI."""
+        self.acquisition_state = AcquisitionState(
+            acquisition_roi=None,
+            exposure_s=self.acquisition_state.exposure_s,
+            binning=self.acquisition_state.binning,
+        )
+        self.roi_label.setText("Acquisition ROI: Full sensor")
+        self.apply_acquisition_state()
+
+    def get_current_roi(self):
+        """Deprecated compatibility alias for :meth:`get_acquisition_roi`."""
+        return self.get_acquisition_roi()
+
+    def get_current_exposure(self):
+        """Deprecated compatibility accessor for Main-Window exposure."""
+        return self.acquisition_state.exposure_s
 
     # =========================================================
     # ODMR WINDOW
@@ -440,8 +503,7 @@ class MainWindow(QMainWindow):
         self.odmr_window = ODMRWindow(
             hardware=self.hardware,
             camera=self.camera,
-            roi_getter=self.get_current_roi,
-            exposure_getter=self.get_current_exposure
+            acquisition_state_getter=self.get_acquisition_state,
         )
 
         self.odmr_window.show()
@@ -468,11 +530,7 @@ class MainWindow(QMainWindow):
 
             camera=self.camera,
 
-            roi_getter=self.get_current_roi,
-
-            exposure_getter=self.get_current_exposure,
-
-            binning_getter=lambda: self.binning_spin.value(),
+            acquisition_state_getter=self.get_acquisition_state,
 
         )
 

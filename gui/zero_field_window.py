@@ -1,6 +1,8 @@
 """Window that integrates the zero-field scan widget with laboratory hardware."""
 
 from pathlib import Path
+import logging
+from datetime import datetime
 
 from PyQt6.QtCore import QThread
 from PyQt6.QtWidgets import QFileDialog, QMainWindow, QMessageBox
@@ -11,6 +13,9 @@ from framework.analysis.zero_field import mean_fluorescence_vs_field
 from utils.camera_diagnostics import log_event
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 class ZeroFieldWindow(QMainWindow):
     """Configure, run, monitor, and save a ZeroFieldExperiment."""
 
@@ -19,9 +24,7 @@ class ZeroFieldWindow(QMainWindow):
         hardware_manager,
         hardware,
         camera,
-        roi_getter,
-        exposure_getter,
-        binning_getter,
+        acquisition_state_getter,
     ):
         super().__init__()
         self.setWindowTitle("Zero-Field Imaging")
@@ -31,7 +34,7 @@ class ZeroFieldWindow(QMainWindow):
         self.hardware = hardware
         self.camera = camera
         self.magnet = hardware["magnet"]
-        self.roi_getter = roi_getter
+        self.acquisition_state_getter = acquisition_state_getter
 
         self.worker = None
         self.thread = None
@@ -39,17 +42,18 @@ class ZeroFieldWindow(QMainWindow):
         self.image_cube = None
         self.scan_fields = []
         self.scan_signals = []
-        self.analysis_roi = None
         self.field_point_count = 0
         self.total_scans = 1
-        self.raw_scans = []
+        self.output_directory = Path(__file__).resolve().parents[1] / "data"
+        self.output_path = None
 
-        self.widget = ZeroFieldWidget(
-            exposure_s=exposure_getter(), binning=binning_getter()
-        )
+        self.widget = ZeroFieldWidget()
         self.setCentralWidget(self.widget)
         self.widget.run_stop_button.clicked.connect(self.toggle_scan)
         self.widget.save_button.clicked.connect(self.save_data)
+        # Before acquisition this existing control selects an optional output
+        # directory.  The automatic timestamped filename remains unchanged.
+        self.widget.save_button.setEnabled(True)
 
     def toggle_scan(self):
         if self.zero_field_running:
@@ -59,24 +63,20 @@ class ZeroFieldWindow(QMainWindow):
 
     def start_scan(self):
         config = self.widget.get_config()
-        roi = self.roi_getter() if self.widget.use_roi_check.isChecked() else None
-
-        try:
-            self.camera.set_exposure(config["exposure_s"])
-            self.camera.set_binning(config["binning"])
-        except Exception as error:
-            QMessageBox.critical(self, "Camera Error", str(error))
-            return
+        acquisition_state = self.acquisition_state_getter()
+        acquisition_roi = acquisition_state.acquisition_roi
+        LOGGER.info("Using acquisition ROI from Main Window: %s", acquisition_roi)
 
         self.image_cube = None
         self.scan_fields = []
         self.scan_signals = []
-        self.analysis_roi = roi
         self.field_point_count = config["field_points"]
         self.total_scans = (
             config["num_scans"] if config["averaging_enabled"] else 1
         )
-        self.raw_scans = []
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        self.output_directory.mkdir(parents=True, exist_ok=True)
+        self.output_path = self.output_directory / f"zero_field_{timestamp}_average.npz"
         self.widget.save_button.setEnabled(False)
         self.widget.reset_scan(config["field_points"], self.total_scans)
         self.widget.set_running_state(True)
@@ -85,15 +85,21 @@ class ZeroFieldWindow(QMainWindow):
         metadata = {
             "scan_parameters": dict(config),
             "camera_parameters": {
-                "exposure_s": config["exposure_s"],
-                "binning": config["binning"],
-                "roi": roi,
+                "exposure_s": acquisition_state.exposure_s,
+                "binning": acquisition_state.binning,
+                "acquisition_roi": acquisition_roi,
             },
         }
 
         self.thread = QThread(self)
         self.worker = ZeroFieldWorker(
-            self.hardware_manager, self.camera, self.magnet, config, roi, metadata
+            self.hardware_manager,
+            self.camera,
+            self.magnet,
+            config,
+            acquisition_roi,
+            metadata,
+            self.output_path,
         )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.start)
@@ -129,7 +135,7 @@ class ZeroFieldWindow(QMainWindow):
         self.widget.update_scan_progress(current, total)
 
     def handle_scan_completed(self, image_cube, current, total):
-        fields, signals = mean_fluorescence_vs_field(image_cube, self.analysis_roi)
+        fields, signals = mean_fluorescence_vs_field(image_cube)
         self.scan_fields = fields.tolist()
         self.scan_signals = signals.tolist()
         self.widget.update_live_data(
@@ -140,9 +146,8 @@ class ZeroFieldWindow(QMainWindow):
         )
         self.widget.update_scan_progress(current, total)
 
-    def scan_finished(self, image_cube, _fields, _signals, raw_scans, stopped):
+    def scan_finished(self, image_cube, _fields, _signals, stopped):
         self.image_cube = image_cube
-        self.raw_scans = raw_scans
         self.zero_field_running = False
         self.widget.set_running_state(False)
         if image_cube is None:
@@ -151,9 +156,7 @@ class ZeroFieldWindow(QMainWindow):
             return
 
         if image_cube.data is not None:
-            fields, signals = mean_fluorescence_vs_field(
-                image_cube, self.analysis_roi
-            )
+            fields, signals = mean_fluorescence_vs_field(image_cube)
             self.scan_fields = fields.tolist()
             self.scan_signals = signals.tolist()
             self.widget.update_live_data(
@@ -166,7 +169,11 @@ class ZeroFieldWindow(QMainWindow):
         self.widget.status_label.setText(
             "Status: Stopped" if stopped else "Status: Complete"
         )
-        self.widget.save_button.setEnabled(image_cube is not None)
+        self.widget.save_button.setEnabled(False)
+        if self.output_path is not None:
+            self.widget.status_label.setText(
+                f"Status: {'Stopped' if stopped else 'Complete'} — saved {self.output_path.name}"
+            )
 
     def show_error(self, message):
         self.zero_field_running = False
@@ -175,36 +182,19 @@ class ZeroFieldWindow(QMainWindow):
         QMessageBox.critical(self, "Zero Field Error", message)
 
     def save_data(self):
-        if self.image_cube is None:
+        if self.image_cube is not None or self.zero_field_running:
             return
 
-        filename, _ = QFileDialog.getSaveFileName(
+        directory = QFileDialog.getExistingDirectory(
             self,
-            "Save Zero Field ImageCube",
-            "zero_field_scan.npz",
-            "ImageCube files (*.npz)",
+            "Choose Zero Field Data Directory",
+            str(self.output_directory),
         )
-        if not filename:
-            return
-
-        path = Path(filename)
-        if path.suffix.lower() != ".npz":
-            path = path.with_suffix(".npz")
-
-        try:
-            if self.raw_scans:
-                raw_filenames = []
-                for index, raw_cube in enumerate(self.raw_scans, start=1):
-                    raw_path = path.with_name(
-                        f"{path.stem}_scan_{index:03d}{path.suffix}"
-                    )
-                    raw_cube.save(raw_path)
-                    raw_filenames.append(raw_path.name)
-                self.image_cube.metadata["raw_scan_filenames"] = raw_filenames
-            self.image_cube.save(path)
-            self.widget.status_label.setText(f"Status: Saved {path.name}")
-        except Exception as error:
-            QMessageBox.critical(self, "Save Error", str(error))
+        if directory:
+            self.output_directory = Path(directory)
+            self.widget.status_label.setText(
+                f"Status: Output directory set to {self.output_directory}"
+            )
 
     def closeEvent(self, event):
         if self.zero_field_running:

@@ -3,7 +3,9 @@
 import unittest
 
 from framework.camera_ownership import (
+    apply_live_acquisition_state,
     exclusive_camera_access,
+    register_camera_state_restorer,
     register_live_view_controller,
     start_live_stream_if_available,
 )
@@ -14,12 +16,15 @@ class FakeCamera:
         self.streaming = streaming
         self.start_calls = 0
         self.stop_calls = 0
+        self.events = []
 
     def start_stream(self):
+        self.events.append("start")
         self.start_calls += 1
         self.streaming = True
 
     def stop_stream(self):
+        self.events.append("stop")
         self.stop_calls += 1
         self.streaming = False
 
@@ -96,6 +101,33 @@ class CameraOwnershipTests(unittest.TestCase):
         self.assertFalse(camera.streaming)
         self.assertFalse(controller.timer_running)
         self.assertEqual(controller.resume_arguments, [False])
+
+    def test_restores_main_window_state_before_restarting_live_view(self):
+        camera = FakeCamera(streaming=True)
+        restored = []
+
+        def restore():
+            restored.append(True)
+            camera.events.append("restore")
+
+        register_camera_state_restorer(camera, restore)
+
+        with exclusive_camera_access(camera):
+            pass
+
+        self.assertEqual(restored, [True])
+        self.assertEqual(camera.events, ["stop", "restore", "start"])
+
+    def test_live_setting_update_stops_and_restarts_stream(self):
+        camera = FakeCamera(streaming=True)
+        applied = []
+
+        self.assertTrue(
+            apply_live_acquisition_state(camera, lambda: applied.append(True))
+        )
+
+        self.assertEqual(applied, [True])
+        self.assertEqual(camera.events, ["stop", "start"])
 
 
 if __name__ == "__main__":

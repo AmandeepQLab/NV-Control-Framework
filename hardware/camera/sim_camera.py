@@ -21,12 +21,7 @@ class SimCamera:
 
         self.exposure_time = 0.01
 
-        self.roi = (
-            0,
-            image_shape[0],
-            0,
-            image_shape[1]
-        )
+        self.roi = None
 
         self.binning = 1
 
@@ -126,7 +121,25 @@ class SimCamera:
         )
 
         frame = signal + noise
+        return self._apply_acquisition_state(frame)
 
+    def _apply_acquisition_state(self, frame):
+        """Mirror hardware AOI/binning so simulation follows live settings."""
+        if self.roi is not None:
+            x0, y0, x1, y1 = self.roi
+            frame = frame[y0:y1, x0:x1]
+
+        if self.binning > 1:
+            height, width = frame.shape
+            height -= height % self.binning
+            width -= width % self.binning
+            frame = frame[:height, :width]
+            frame = frame.reshape(
+                height // self.binning,
+                self.binning,
+                width // self.binning,
+                self.binning,
+            ).mean(axis=(1, 3))
         return frame
 
     # =========================================================

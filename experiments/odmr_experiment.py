@@ -1,10 +1,16 @@
 import numpy as np
 import time
 import threading
+import logging
 
 from framework.scan_experiment import ScanExperiment
+from framework.camera_ownership import exclusive_camera_access
 from framework.fluorescence import mean_fluorescence
+from framework.roi import validate_roi
 from sequencing.pulse_sequence import PulseSequence
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class ODMRExperiment(ScanExperiment):
@@ -12,9 +18,10 @@ class ODMRExperiment(ScanExperiment):
     scan_axis_name = "frequency"
     scan_axis_unit = "Hz"
 
-    def __init__(self, hardware, config):
+    def __init__(self, hardware, config, acquisition_roi=None):
 
         super().__init__(hardware, config)
+        self.acquisition_roi = validate_roi(acquisition_roi)
 
         if all(key in config for key in ("f_start", "f_stop", "steps")):
             self.scan_vector = np.linspace(
@@ -32,9 +39,19 @@ class ODMRExperiment(ScanExperiment):
         super().setup()
 
     def setup_scan(self):
+        self.configure_acquisition()
         self.image_cube.scan_axis_name = self.scan_axis_name
         self.image_cube.scan_axis_unit = self.scan_axis_unit
         self.image_cube.scan_axis_values = self.scan_vector
+
+    def configure_acquisition(self):
+        """Apply this experiment's temporary camera AOI while it is borrowed."""
+        self.hw["camera"].set_roi(self.acquisition_roi)
+
+    def run(self):
+        """Run a scan under one exclusive camera lease."""
+        with exclusive_camera_access(self.hw["camera"]):
+            return super().run()
 
     # =====================================================
     # CLEANUP
@@ -215,7 +232,9 @@ class ODMRExperiment(ScanExperiment):
 
         trigger_thread.join()
 
-        print(f"multi-frame acquisition: {nframes} frames in {t1 - t0:.3f}s")
+        LOGGER.debug(
+            "Multi-frame acquisition: %d frames in %.3fs", nframes, t1 - t0
+        )
 
         return frames
     # =====================================================
@@ -223,8 +242,8 @@ class ODMRExperiment(ScanExperiment):
     # =====================================================
 
     def _mean_fluorescence(self, frame):
-        """Return mean fluorescence per pixel for a frame or selected ROI."""
-        return mean_fluorescence(frame, self.config.get("roi"))
+        """Return mean fluorescence per pixel from the received frame."""
+        return mean_fluorescence(frame)
 
     def _integrate_frame(self, frame):
         """Backward-compatible alias for the former frame integration hook."""
@@ -248,11 +267,9 @@ class ODMRExperiment(ScanExperiment):
             I_off = self._mean_fluorescence(pair[0])
             I_on = self._mean_fluorescence(pair[1])
 
-            print(
-                f"Repeat {r+1}: "
-                f"I_off={I_off:.2f}, "
-                f"I_on={I_on:.2f}, "
-                f"ratio={I_on/I_off:.6f}"
+            LOGGER.debug(
+                "Repeat %d: I_off=%.2f, I_on=%.2f, ratio=%.6f",
+                r + 1, I_off, I_on, I_on / I_off if I_off else float("nan"),
             )
 
             i_off_list.append(I_off)
@@ -299,11 +316,13 @@ class ODMRExperiment(ScanExperiment):
 
         trigger_thread.join()
 
-        print(
-            f"reset={t1 - t0:.3f}s, "
-            f"thread={t2 - t1:.3f}s, "
-            f"camera={t3 - t2:.3f}s, "
-            f"total={t3 - t0:.3f}s"
+        LOGGER.debug(
+            "Triggered frame timings: reset=%.3fs, thread=%.3fs, "
+            "camera=%.3fs, total=%.3fs",
+            t1 - t0,
+            t2 - t1,
+            t3 - t2,
+            t3 - t0,
         )
 
         return frame
@@ -374,8 +393,8 @@ class ODMRExperiment(ScanExperiment):
     # SINGLE ODMR POINT (backward-compatible convenience API)
     # =====================================================
 
-    def acquire_point(self, frequency, return_raw=False):
-
+    def acquire_configured_point(self, frequency, return_raw=False):
+        """Acquire one point with camera settings configured by the caller."""
         self.set_scan_point(frequency)
         frame = self.acquire_frame()
         signal = self.process_frame(frame)
@@ -384,3 +403,9 @@ class ODMRExperiment(ScanExperiment):
             return signal, self._last_i_off, self._last_i_on
 
         return signal
+
+    def acquire_point(self, frequency, return_raw=False):
+        """Backward-compatible one-point acquisition with exclusive access."""
+        with exclusive_camera_access(self.hw["camera"]):
+            self.configure_acquisition()
+            return self.acquire_configured_point(frequency, return_raw=return_raw)

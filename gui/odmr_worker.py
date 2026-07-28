@@ -1,7 +1,12 @@
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal # type: ignore
 import numpy as np # type: ignore
+import logging
 
 from experiments.odmr_experiment import ODMRExperiment
+from framework.camera_ownership import exclusive_camera_access
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class ODMRWorker(QObject):
@@ -12,11 +17,12 @@ class ODMRWorker(QObject):
     progress_signal = pyqtSignal(int, int)
     frequency_signal = pyqtSignal(float)
 
-    def __init__(self, hardware, config):
+    def __init__(self, hardware, config, acquisition_roi=None):
         super().__init__()
 
         self.hardware = hardware
         self.config = config
+        self.acquisition_roi = acquisition_roi
 
         coarse = np.linspace(
             config["f_start"],
@@ -91,18 +97,24 @@ class ODMRWorker(QObject):
 
         self.experiment = ODMRExperiment(
             self.hardware,
-            self.config
+            self.config,
+            acquisition_roi=self.acquisition_roi,
         )
 
         self.timer = None
+        self._camera_lease = None
 
     def start(self):
-
-        self.timer = QTimer()
-        self.timer.timeout.connect(
-            self.acquire_next_frequency
-        )
-        self.timer.start(10)
+        try:
+            self._camera_lease = exclusive_camera_access(self.hardware["camera"])
+            self._camera_lease.__enter__()
+            self.experiment.configure_acquisition()
+            self.timer = QTimer()
+            self.timer.timeout.connect(self.acquire_next_frequency)
+            self.timer.start(10)
+        except Exception as error:
+            self.error_signal.emit(str(error))
+            self._finish()
 
     def stop(self):
 
@@ -112,7 +124,7 @@ class ODMRWorker(QObject):
         if self.timer is not None:
             self.timer.stop()
 
-        self.finished_signal.emit()
+        self._finish()
 
     def acquire_next_frequency(self):
 
@@ -140,7 +152,7 @@ class ODMRWorker(QObject):
                 if not self.running:
                     break
 
-                value, i_off, i_on = self.experiment.acquire_point(
+                value, i_off, i_on = self.experiment.acquire_configured_point(
                     f,
                     return_raw=True
                 )
@@ -156,7 +168,7 @@ class ODMRWorker(QObject):
                 f"{f / 1e9:.6f} GHz:\n{e}"
             )
 
-            print(msg)
+            LOGGER.exception(msg)
 
             self.running = False
 
@@ -198,4 +210,9 @@ class ODMRWorker(QObject):
         if self.timer is not None:
             self.timer.stop()
 
-        self.finished_signal.emit()
+        try:
+            if self._camera_lease is not None:
+                self._camera_lease.__exit__(None, None, None)
+                self._camera_lease = None
+        finally:
+            self.finished_signal.emit()

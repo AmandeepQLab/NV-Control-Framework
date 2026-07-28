@@ -1,10 +1,14 @@
 import numpy as np
 import threading
 import time
+import logging
 
 from andor3 import Andor3
 from hardware.camera.streaming import StreamController
 from utils.camera_diagnostics import log_camera_snap, log_event
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class AndorNeoAndor3:
@@ -67,7 +71,7 @@ class AndorNeoAndor3:
             self.cam.setFloat("ExternalTriggerDelay", 0.0)
         except Exception:
             pass
-
+        self.cam.setBool("VerticallyCentreAOI", False)
     # =====================================================
     # BUFFER TO IMAGE
     # =====================================================
@@ -118,9 +122,46 @@ class AndorNeoAndor3:
     # =====================================================
 
     def set_roi(self, roi):
+        """
+        Set camera ROI.
+
+        ROI format:
+            (x0, y0, x1, y1)
+
+        where x1 and y1 are exclusive.
+        """
 
         self.roi = roi
 
+        # Stop acquisition if necessary
+        try:
+            self.cam.command("AcquisitionStop")
+        except Exception:
+            pass
+
+        self.cam.setBool("VerticallyCentreAOI", False)
+
+        if roi is None:
+            sensor_width = self.cam.getInt("SensorWidth")
+            sensor_height = self.cam.getInt("SensorHeight")
+
+            self.cam.setInt("AOILeft", 1)
+            self.cam.setInt("AOITop", 1)
+            self.cam.setInt("AOIWidth", sensor_width)
+            self.cam.setInt("AOIHeight", sensor_height)
+            return
+
+        x0, y0, x1, y1 = roi
+
+        width = x1 - x0
+        height = y1 - y0
+
+        self.cam.setInt("AOIWidth", width)
+        self.cam.setInt("AOIHeight", height)
+
+        # SDK3 uses 1-based coordinates
+        self.cam.setInt("AOILeft", x0 + 1)
+        self.cam.setInt("AOITop", y0 + 1)
     def set_binning(self, binning):
 
         self.binning = binning
@@ -137,16 +178,15 @@ class AndorNeoAndor3:
         }
 
         if binning not in bin_map:
-            print(f"Unsupported Andor binning: {binning}")
-            return
+            raise ValueError(f"Unsupported Andor binning: {binning}")
 
         try:
             self.cam.setEnumIndex("AOIBinning", bin_map[binning])
-            print(f"[Andor] AOIBinning set to {binning}x{binning}")
+            LOGGER.info("Andor AOI binning set to %dx%d", binning, binning)
 
-        except Exception as e:
-            print("[Andor] Failed to set AOIBinning:")
-            print(e)
+        except Exception:
+            LOGGER.exception("Failed to set Andor AOI binning")
+            raise
 
     # =====================================================
     # SOFTWARE SNAP

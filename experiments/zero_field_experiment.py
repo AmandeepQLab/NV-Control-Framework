@@ -1,12 +1,17 @@
 """Microwave-free widefield fluorescence scan over a magnetic-field axis."""
 
 import copy
+import logging
 
 import numpy as np
 
 from framework.scan_experiment import ScanExperiment
 from framework.camera_ownership import exclusive_camera_access
 from framework.image_cube import ImageCube
+from framework.roi import validate_roi
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class ZeroFieldExperiment(ScanExperiment):
@@ -31,7 +36,7 @@ class ZeroFieldExperiment(ScanExperiment):
         field_axis,
         settling_time_ms=0,
         averages=1,
-        roi=None,
+        acquisition_roi=None,
         metadata=None,
         live_update_callback=None,
         scan_started_callback=None,
@@ -39,6 +44,7 @@ class ZeroFieldExperiment(ScanExperiment):
         averaging_enabled=False,
         num_scans=1,
         save_raw_scans=False,
+        raw_scan_saver=None,
     ):
         config = {
             "settling_time_ms": settling_time_ms,
@@ -71,14 +77,19 @@ class ZeroFieldExperiment(ScanExperiment):
         self.field_points = field_points
         self.field_axis = axis
         self.averages = averages
+        # Acquisition ROI is expressed in full-sensor coordinates and frozen
+        # at construction so a GUI change cannot affect a running scan.
+        self.acquisition_roi = validate_roi(acquisition_roi)
         self.metadata = {} if metadata is None else dict(metadata)
+        self.metadata["acquisition_roi"] = self.acquisition_roi
         self.live_update_callback = live_update_callback
         self.scan_started_callback = scan_started_callback
         self.scan_completed_callback = scan_completed_callback
         self.averaging_enabled = averaging_enabled
         self.num_scans = num_scans
         self.save_raw_scans = save_raw_scans
-        self.raw_scans = []
+        self.raw_scan_saver = raw_scan_saver
+        self.raw_scan_filenames = []
         self._configured_field_mT = None
         self.latest_field = None
         self.latest_image = None
@@ -88,7 +99,6 @@ class ZeroFieldExperiment(ScanExperiment):
         # two non-swept axes remain at zero current but must not be repeatedly
         # power-cycled by their per-axis zero-field safety path.
         self.magnet.enable()
-
         self.scan_vector = np.linspace(
             self.field_start,
             self.field_stop,
@@ -134,6 +144,8 @@ class ZeroFieldExperiment(ScanExperiment):
     def run(self):
         """Execute one or more sweeps and return their averaged ImageCube."""
         with exclusive_camera_access(self.camera):
+            self.camera.set_roi(self.acquisition_roi)
+            LOGGER.info("Zero Field acquisition ROI: %s", self.acquisition_roi)
             scan_count = self.num_scans if self.averaging_enabled else 1
             averaged_cube = None
             completed_scans = 0
@@ -147,6 +159,7 @@ class ZeroFieldExperiment(ScanExperiment):
 
                 super().run()
                 acquired_cube = self.image_cube
+                LOGGER.info("Scan %d/%d acquired.", scan_index, scan_count)
 
                 if acquired_cube.data is None:
                     if averaged_cube is None:
@@ -154,9 +167,6 @@ class ZeroFieldExperiment(ScanExperiment):
                     break
 
                 completed_scans += 1
-                if self.save_raw_scans:
-                    self.raw_scans.append(acquired_cube)
-
                 if averaged_cube is None:
                     averaged_cube = (
                         acquired_cube
@@ -167,12 +177,27 @@ class ZeroFieldExperiment(ScanExperiment):
                     self._update_running_average(
                         averaged_cube.data, acquired_cube.data, completed_scans
                     )
+                LOGGER.info("Running average updated.")
+
+                if self.save_raw_scans:
+                    if self.raw_scan_saver is None:
+                        raise RuntimeError(
+                            "Saving raw Zero Field scans requires a raw scan saver."
+                        )
+                    filename = self.raw_scan_saver(scan_index, acquired_cube)
+                    self.raw_scan_filenames.append(str(filename))
+                    LOGGER.info("Raw scan saved: %s", filename)
 
                 self._set_averaging_metadata(averaged_cube, completed_scans)
                 if self.scan_completed_callback is not None:
-                    self.scan_completed_callback(
-                        averaged_cube, scan_index, scan_count
-                    )
+                    self.scan_completed_callback(averaged_cube, scan_index, scan_count)
+
+                # ``averaged_cube`` is the only image cube intentionally
+                # retained between scans.  Release the completed raw cube.
+                if acquired_cube is not averaged_cube:
+                    self.image_cube = None
+                    del acquired_cube
+                LOGGER.info("Scan memory released.")
 
             if averaged_cube is not None:
                 self._set_averaging_metadata(averaged_cube, completed_scans)
@@ -206,5 +231,5 @@ class ZeroFieldExperiment(ScanExperiment):
             }
         )
         if self.save_raw_scans:
-            metadata.setdefault("raw_scan_filenames", [])
+            metadata["raw_scan_filenames"] = list(self.raw_scan_filenames)
         image_cube.metadata = metadata

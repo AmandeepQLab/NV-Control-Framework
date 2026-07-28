@@ -66,6 +66,7 @@ def clip_roi(roi, image_shape):
         max(0, min(width, x1)),
         max(0, min(height, y1)),
     )
+
     clipped_x0, clipped_y0, clipped_x1, clipped_y1 = clipped_roi
     if clipped_x0 >= clipped_x1 or clipped_y0 >= clipped_y1:
         raise ValueError("ROI is completely outside the image boundaries.")

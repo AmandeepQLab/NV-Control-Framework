@@ -73,7 +73,7 @@ def main():
 
             averages=1,
 
-            roi=None,
+            acquisition_roi=None,
 
         )
 

@@ -22,7 +22,8 @@ class BaseCamera(ABC):
     @abstractmethod
     def set_roi(self, roi):
         """
-        roi = (x0, x1, y0, y1)
+        roi = (x0, y0, x1, y1), expressed in full-sensor coordinates.
+        ``None`` selects the complete sensor.
         """
         pass
 

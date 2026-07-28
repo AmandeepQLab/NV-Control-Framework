@@ -18,7 +18,7 @@ class ODMRWindow(QMainWindow):
 
     stop_requested = pyqtSignal()
 
-    def __init__(self, hardware, camera, roi_getter, exposure_getter):
+    def __init__(self, hardware, camera, acquisition_state_getter):
         super().__init__()
 
         self.setWindowTitle("ODMR Experiment")
@@ -26,8 +26,7 @@ class ODMRWindow(QMainWindow):
 
         self.hardware = hardware
         self.camera = camera
-        self.roi_getter = roi_getter
-        self.exposure_getter = exposure_getter
+        self.acquisition_state_getter = acquisition_state_getter
 
         self.data_manager = DataManager()
 
@@ -65,14 +64,15 @@ class ODMRWindow(QMainWindow):
     def show_pulse_sequence(self):
 
         config = self.panel.get_config()
-
-        config["exposure_s"] = self.exposure_getter()
+        acquisition_state = self.acquisition_state_getter()
+        config["exposure_s"] = acquisition_state.exposure_s
 
         from experiments.odmr_experiment import ODMRExperiment
 
         experiment = ODMRExperiment(
             self.hardware,
-            config
+            config,
+            acquisition_roi=acquisition_state.acquisition_roi,
         )
 
         repeats = config.get(
@@ -98,11 +98,11 @@ class ODMRWindow(QMainWindow):
 
     def run_odmr(self):
 
-        roi = self.roi_getter()
+        acquisition_state = self.acquisition_state_getter()
+        acquisition_roi = acquisition_state.acquisition_roi
 
         config = self.panel.get_config()
-        config["roi"] = roi
-        config["exposure_s"] = self.exposure_getter()
+        config["exposure_s"] = acquisition_state.exposure_s
 
         self.current_config = config.copy()
 
@@ -137,7 +137,8 @@ class ODMRWindow(QMainWindow):
 
         self.odmr_worker = ODMRWorker(
             self.hardware,
-            config
+            config,
+            acquisition_roi=acquisition_roi,
         )
 
         self.odmr_worker.moveToThread(self.odmr_thread)
