@@ -1,6 +1,39 @@
 MAIN CAMERA IMAGE UPDATES DURING ZERO FIELD SCAN
 =================================================
 
+STATUS HEADER — added 2026-08-04, do not remove
+--------------------------------------------------
+STALE. This report's central conclusion is no longer accurate and the
+body below has NOT been rewritten to match current code — read it as a
+historical trace only.
+
+Originally written and committed 2026-07-19 in 3403891 "Add Zero Field
+analysis separation and multi-scan averaging" — the same commit that
+also introduced gui/live_view_controller.py's LiveViewTimerController,
+whose suspend() method (called by
+framework.camera_ownership.exclusive_camera_access) stops the main
+window's live-view QTimer directly (self._timer.stop()). This report's
+"Conclusion" and "Timer Lifecycle" sections below state that the main
+GUI's 30 ms QTimer keeps running throughout a Zero Field scan and that
+exclusive_camera_access "has no reference to MainWindow.timer" — as of
+the current code that is not true: gui/main_window.py registers its
+timer controller via register_live_view_controller (2026-07-19) and
+register_camera_state_restorer (828907b, 2026-07-29), and
+exclusive_camera_access suspends that timer for the duration of any
+experiment's camera lease, Zero Field included. The shared
+camera.latest_frame bleed-through this report documents as the
+explanation for the main display changing during a scan should not
+occur under the current code, since the polling timer driving that read
+is now suspended for the scan's duration.
+
+Re-verified against the code: 2026-08-04. Per your instruction this
+file is not being rewritten — only flagged. If the underlying question
+("does a Zero Field scan visibly disturb the main camera display?")
+needs an authoritative current answer, it should be re-investigated
+fresh rather than patched here.
+--------------------------------------------------
+
+
 Scope
 -----
 This report is a read-only trace of how NumPy image data can reach the main
