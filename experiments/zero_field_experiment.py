@@ -48,6 +48,7 @@ class ZeroFieldExperiment(ScanExperiment):
         num_scans=1,
         save_raw_scans=False,
         raw_scan_saver=None,
+        zero_other_axes=True,
     ):
         config = {
             "settling_time_ms": settling_time_ms,
@@ -71,6 +72,8 @@ class ZeroFieldExperiment(ScanExperiment):
             raise ValueError("num_scans must be an integer greater than or equal to 1.")
         if not isinstance(save_raw_scans, bool):
             raise ValueError("save_raw_scans must be a boolean.")
+        if not isinstance(zero_other_axes, bool):
+            raise ValueError("zero_other_axes must be a boolean.")
 
         self.hardware_manager = hardware_manager
         self.camera = camera
@@ -93,7 +96,16 @@ class ZeroFieldExperiment(ScanExperiment):
         self.save_raw_scans = save_raw_scans
         self.raw_scan_saver = raw_scan_saver
         self.raw_scan_filenames = []
+        self.zero_other_axes = zero_other_axes
         self._configured_field_mT = None
+        self._resolved_non_swept_field_mT = None
+        # Captured once, from the first scan of a run: what the magnet was
+        # actually at before this experiment touched it.
+        self._initial_magnet_vector_mT = None
+        # One entry per scan, in order, regardless of zero_other_axes.  If
+        # cleanup_scan() ever fails to zero the magnet between scans, this is
+        # what would reveal it instead of hiding it in an averaged cube.
+        self.scan_entry_magnet_vectors_mT = []
         self.latest_field = None
         self.latest_image = None
         self._acquisition_started_at = None
@@ -103,6 +115,52 @@ class ZeroFieldExperiment(ScanExperiment):
         # two non-swept axes remain at zero current but must not be repeatedly
         # power-cycled by their per-axis zero-field safety path.
         self.magnet.enable()
+
+        # Magnet.get_vector() returns values in millitesla.  Record what was
+        # actually there before this scan touches anything, whether or not
+        # zero_other_axes ends up overriding it.
+        entry_vector_mT = self.magnet.get_vector()
+        self.scan_entry_magnet_vectors_mT.append(dict(entry_vector_mT))
+        if self._initial_magnet_vector_mT is None:
+            self._initial_magnet_vector_mT = dict(entry_vector_mT)
+
+        non_swept_axes = [
+            axis for axis in ("x", "y", "z") if axis != self.field_axis.lower()
+        ]
+
+        if self.zero_other_axes:
+            resolved_field_mT = {"x": 0.0, "y": 0.0, "z": 0.0}
+            # Physically zero now, rather than waiting for the first scan
+            # point, so the magnet visibly reflects the clean state from the
+            # start of the scan rather than whatever was left over.
+            self.magnet.set_vector(
+                bx=resolved_field_mT["x"],
+                by=resolved_field_mT["y"],
+                bz=resolved_field_mT["z"],
+            )
+        else:
+            resolved_field_mT = dict(entry_vector_mT)
+            retained_nonzero = {
+                axis: resolved_field_mT[axis]
+                for axis in non_swept_axes
+                if abs(resolved_field_mT[axis]) > 1e-9
+            }
+            if retained_nonzero:
+                LOGGER.warning(
+                    "Zero Field scan on axis %s is preserving a non-zero "
+                    "retained field on axis(es) %s: %s mT. This scan will be "
+                    "taken under a bias vector, not a clean field-only sweep. "
+                    "Pass zero_other_axes=True (the default) to avoid this.",
+                    self.field_axis, list(retained_nonzero), retained_nonzero,
+                )
+
+        # Preserve the resolved values on the two axes outside the scan; only
+        # the swept axis changes per point.  set_scan_point() merges into this.
+        self._configured_field_mT = resolved_field_mT
+        self._resolved_non_swept_field_mT = {
+            axis: resolved_field_mT[axis] for axis in non_swept_axes
+        }
+
         self.scan_vector = np.linspace(
             self.field_start,
             self.field_stop,
@@ -115,10 +173,6 @@ class ZeroFieldExperiment(ScanExperiment):
         self.image_cube.scan_axis_unit = self.scan_axis_unit
         self.image_cube.scan_axis_values = self.scan_vector
         self.image_cube.metadata = dict(self.metadata)
-
-        # Preserve the currently configured values on the two axes outside
-        # the scan.  Magnet.get_vector() returns values in millitesla.
-        self._configured_field_mT = self.magnet.get_vector()
 
     def cleanup_scan(self):
         """Return the magnet to its existing safe disabled state after a scan."""
@@ -293,6 +347,13 @@ class ZeroFieldExperiment(ScanExperiment):
                 "num_scans": self.num_scans,
                 "save_raw_scans": self.save_raw_scans,
                 "completed_scans": completed_scans,
+                # Re-read fresh on every call (like the accumulator above),
+                # not written once by _set_static_metadata(): a flat key
+                # there would freeze at scan 1's value once _new_averaged_cube()
+                # deep-copies it, hiding every later scan's entry vector.
+                "scan_entry_magnet_vectors_mT": [
+                    dict(vector) for vector in self.scan_entry_magnet_vectors_mT
+                ],
             }
         )
         if self.save_raw_scans:
@@ -317,6 +378,13 @@ class ZeroFieldExperiment(ScanExperiment):
                 "settling_time_ms": self.settling_time_ms,
                 "averages_per_point": self.averages,
                 "camera_model": type(self.camera).__name__,
+                "zero_other_axes": self.zero_other_axes,
+                "initial_magnet_vector_mT": (
+                    dict(self._initial_magnet_vector_mT)
+                    if self._initial_magnet_vector_mT is not None
+                    else None
+                ),
+                "non_swept_axis_field_mT": dict(self._resolved_non_swept_field_mT),
             }
         )
         power_supply_models = self._power_supply_models()

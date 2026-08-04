@@ -45,18 +45,43 @@ class FakeMagnet:
 
 
 class RecordingMagnet(FakeMagnet):
-    def __init__(self, events):
+    """Records set_vector() calls, and can report a caller-chosen vector.
+
+    ``initial_vector`` may be a single dict (returned from every
+    get_vector() call, matching FakeMagnet's constant-zero default when
+    omitted) or an iterable of dicts (one consumed per get_vector() call,
+    to simulate the magnet reading differently at the start of each scan
+    in a multi-scan run).
+    """
+
+    def __init__(self, events, initial_vector=None):
         self.events = events
+        self.vectors = []
+        if initial_vector is None:
+            self._vector_sequence = None
+            self._fixed_vector = {"x": 0.0, "y": 0.0, "z": 0.0}
+        elif isinstance(initial_vector, dict):
+            self._vector_sequence = None
+            self._fixed_vector = dict(initial_vector)
+        else:
+            self._vector_sequence = iter(initial_vector)
+            self._fixed_vector = None
 
-    def set_vector(self, **_fields):
+    def get_vector(self):
+        if self._vector_sequence is not None:
+            return dict(next(self._vector_sequence))
+        return dict(self._fixed_vector)
+
+    def set_vector(self, **fields):
         self.events.append("set_current")
+        self.vectors.append(dict(fields))
 
 
-def run_experiment(frames, **kwargs):
+def run_experiment(frames, magnet=None, **kwargs):
     experiment = ZeroFieldExperiment(
         hardware_manager=None,
         camera=FakeCamera(frames),
-        magnet=FakeMagnet(),
+        magnet=magnet if magnet is not None else FakeMagnet(),
         field_start=-1.0,
         field_stop=1.0,
         field_points=2,
@@ -176,6 +201,10 @@ class ZeroFieldAveragingTests(unittest.TestCase):
         cube = experiment.run()
 
         self.assertEqual(events, [
+            # First "set_current" is setup_scan()'s explicit zero of the
+            # non-swept axes (zero_other_axes defaults to True); the rest is
+            # the normal one-set_current-per-point pattern.
+            "set_current",
             "set_current", "camera_frame", "camera_frame",
             "set_current", "camera_frame", "camera_frame",
         ])
@@ -428,6 +457,138 @@ class ZeroFieldAveragingTests(unittest.TestCase):
         self.assertEqual(progress_updates, [(1, 2), (2, 2)])
         np.testing.assert_allclose(
             [image for _, _, image in live_updates], cube.data
+        )
+
+    def test_zero_other_axes_true_zeros_non_swept_axes_and_records_metadata(self):
+        events = []
+        magnet = RecordingMagnet(
+            events, initial_vector={"x": 0.4, "y": -0.2, "z": 0.0}
+        )
+        experiment = ZeroFieldExperiment(
+            hardware_manager=None,
+            camera=FakeCamera([np.ones((2, 2)), np.ones((2, 2))]),
+            magnet=magnet,
+            field_start=0.0,
+            field_stop=1.0,
+            field_points=2,
+            field_axis="Z",
+            settling_time_ms=0,
+            averages=1,
+        )
+
+        cube = experiment.run()
+
+        for vector in magnet.vectors:
+            self.assertEqual(vector["bx"], 0.0)
+            self.assertEqual(vector["by"], 0.0)
+        self.assertEqual(cube.metadata["zero_other_axes"], True)
+        self.assertEqual(
+            cube.metadata["non_swept_axis_field_mT"], {"x": 0.0, "y": 0.0}
+        )
+        self.assertEqual(
+            cube.metadata["initial_magnet_vector_mT"],
+            {"x": 0.4, "y": -0.2, "z": 0.0},
+        )
+        self.assertEqual(
+            cube.metadata["scan_entry_magnet_vectors_mT"],
+            [{"x": 0.4, "y": -0.2, "z": 0.0}],
+        )
+
+    def test_zero_other_axes_false_preserves_bias_and_warns(self):
+        events = []
+        magnet = RecordingMagnet(
+            events, initial_vector={"x": 0.4, "y": 0.0, "z": 0.0}
+        )
+
+        with self.assertLogs(
+            "experiments.zero_field_experiment", level="WARNING"
+        ) as logs:
+            experiment = ZeroFieldExperiment(
+                hardware_manager=None,
+                camera=FakeCamera([np.ones((2, 2)), np.ones((2, 2))]),
+                magnet=magnet,
+                field_start=0.0,
+                field_stop=1.0,
+                field_points=2,
+                field_axis="Z",
+                settling_time_ms=0,
+                averages=1,
+                zero_other_axes=False,
+            )
+            cube = experiment.run()
+
+        self.assertTrue(
+            any("bias vector" in message for message in logs.output)
+        )
+        for vector in magnet.vectors:
+            self.assertEqual(vector["bx"], 0.4)
+            self.assertEqual(vector["by"], 0.0)
+        self.assertEqual(cube.metadata["zero_other_axes"], False)
+        self.assertEqual(
+            cube.metadata["non_swept_axis_field_mT"], {"x": 0.4, "y": 0.0}
+        )
+        self.assertEqual(
+            cube.metadata["initial_magnet_vector_mT"],
+            {"x": 0.4, "y": 0.0, "z": 0.0},
+        )
+
+    def test_zero_other_axes_false_with_zero_initial_vector_emits_no_warning(self):
+        events = []
+        magnet = RecordingMagnet(events)  # defaults to an all-zero vector
+
+        with self.assertNoLogs(
+            "experiments.zero_field_experiment", level="WARNING"
+        ):
+            experiment = ZeroFieldExperiment(
+                hardware_manager=None,
+                camera=FakeCamera([np.ones((2, 2)), np.ones((2, 2))]),
+                magnet=magnet,
+                field_start=0.0,
+                field_stop=1.0,
+                field_points=2,
+                field_axis="Z",
+                settling_time_ms=0,
+                averages=1,
+                zero_other_axes=False,
+            )
+            experiment.run()
+
+    def test_scan_entry_magnet_vector_recorded_per_scan_even_if_it_changes(self):
+        # Simulates cleanup_scan() failing to fully zero the magnet between
+        # scan 1 and scan 2 -- exactly the failure this metadata exists to
+        # reveal rather than hide inside an averaged cube.
+        events = []
+        magnet = RecordingMagnet(
+            events,
+            initial_vector=iter(
+                [
+                    {"x": 0.0, "y": 0.0, "z": 0.0},
+                    {"x": 0.05, "y": 0.0, "z": 0.0},
+                ]
+            ),
+        )
+        frames = [
+            np.full((2, 2), 2.0), np.full((2, 2), 4.0),
+            np.full((2, 2), 6.0), np.full((2, 2), 8.0),
+        ]
+
+        cube, experiment = run_experiment(
+            frames,
+            magnet=magnet,
+            averaging_enabled=True,
+            num_scans=2,
+        )
+
+        self.assertEqual(
+            cube.metadata["scan_entry_magnet_vectors_mT"],
+            [
+                {"x": 0.0, "y": 0.0, "z": 0.0},
+                {"x": 0.05, "y": 0.0, "z": 0.0},
+            ],
+        )
+        self.assertEqual(
+            cube.metadata["initial_magnet_vector_mT"],
+            {"x": 0.0, "y": 0.0, "z": 0.0},
         )
 
 
