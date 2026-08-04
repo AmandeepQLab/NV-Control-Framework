@@ -1,4 +1,5 @@
 import sys
+import argparse
 import pyqtgraph as pg # type: ignore
 
 from PyQt6.QtWidgets import ( # type: ignore
@@ -28,7 +29,7 @@ from utils.camera_diagnostics import log_event
 
 class MainWindow(QMainWindow):
 
-    def __init__(self):
+    def __init__(self, sim=False):
         super().__init__()
 
         self.setWindowTitle("NV Control")
@@ -45,7 +46,7 @@ class MainWindow(QMainWindow):
         # INITIALIZE HARDWARE
         # =====================================================
 
-        self.hw_manager = HardwareManager(self.cfg)
+        self.hw_manager = HardwareManager(self.cfg, force_sim=sim)
         self.hw_manager.initialize()
 
         self.hardware = self.hw_manager.get_hardware()
@@ -749,9 +750,18 @@ class MainWindow(QMainWindow):
 
 def main():
 
+    parser = argparse.ArgumentParser(description="NV Control Framework")
+    parser.add_argument(
+        "--sim",
+        action="store_true",
+        default=False,
+        help="Launch with simulated hardware instead of connecting to real instruments.",
+    )
+    args, _ = parser.parse_known_args()
+
     app = QApplication(sys.argv)
 
-    win = MainWindow()
+    win = MainWindow(sim=args.sim)
     win.show()
 
     sys.exit(app.exec())

@@ -1,8 +1,9 @@
 from hardware.microwave.sg386 import SG386
+from hardware.microwave.sim_microwave import SimMicrowave
 
 from hardware.camera.sim_camera import SimCamera
 
-from hardware.sim_hardware import SimPulseStreamer
+from hardware.pulse_streamer.sim_pulse_streamer import SimPulseStreamer
 
 from hardware.pulse_streamer.swabian_pulse_streamer import SwabianPulseStreamer
 
@@ -16,11 +17,16 @@ from hardware.magnet import Magnet
 
 class HardwareManager:
 
-    def __init__(self, config_manager):
+    def __init__(self, config_manager, force_sim=False):
 
         self.cfg = config_manager
 
         self.hardware = {}
+
+        # When True, every device type is overridden to its simulated
+        # class regardless of config/setupInfo.json, without editing that
+        # file. Selected via the app's --sim launch flag.
+        self.force_sim = force_sim
 
     # =====================================================
     # CREATE POWER SUPPLY
@@ -92,7 +98,7 @@ class HardwareManager:
             "frequencyGenerators"
         )[0]
 
-        fg_type = fg["type"].lower()
+        fg_type = "sim" if self.force_sim else fg["type"].lower()
 
         # -------------------------------------------------
         # SRS SG386
@@ -110,6 +116,21 @@ class HardwareManager:
 
             self.hardware["microwave"] = mw
 
+        # -------------------------------------------------
+        # Simulated microwave source
+        # -------------------------------------------------
+
+        elif fg_type == "sim":
+
+            mw = SimMicrowave(
+                fg.get("address"),
+                fg.get("port"),
+            )
+
+            mw.connect()
+
+            self.hardware["microwave"] = mw
+
         else:
 
             raise ValueError(
@@ -120,9 +141,29 @@ class HardwareManager:
         # CAMERA
         # =================================================
 
-        camera = AndorNeoAndor3()
+        camera_cfg = self.cfg.get("spcm")
 
-        camera.connect()
+        camera_type = "sim" if self.force_sim else camera_cfg["type"].lower()
+
+        if camera_type == "andor":
+
+            camera = AndorNeoAndor3()
+
+            camera.connect()
+
+        elif camera_type == "sim":
+
+            camera = SimCamera(
+                microwave=self.hardware.get("microwave")
+            )
+
+            camera.connect()
+
+        else:
+
+            raise ValueError(
+                f"Unknown camera type: {camera_cfg['type']}"
+            )
 
         self.hardware["camera"] = camera
 
@@ -132,12 +173,24 @@ class HardwareManager:
 
         ps_cfg = self.cfg.get("pulseGenerator")
 
-        if ps_cfg["type"].lower() == "pulsestreamer":
+        pulse_gen_type = "sim" if self.force_sim else ps_cfg["type"].lower()
+
+        if pulse_gen_type == "pulsestreamer":
 
             ip = ps_cfg["ipAddress"]
 
             pulse = SwabianPulseStreamer(
                 ip_address=ip,
+                channel_map=self.hardware["channels"],
+            )
+            pulse.connect()
+
+            self.hardware["pulse_streamer"] = pulse
+
+        elif pulse_gen_type == "sim":
+
+            pulse = SimPulseStreamer(
+                ip_address=ps_cfg.get("ipAddress"),
                 channel_map=self.hardware["channels"],
             )
             pulse.connect()
@@ -158,8 +211,16 @@ class HardwareManager:
 
         for axis in ["X", "Y", "Z"]:
 
+            axis_cfg = helmholtz_cfg[axis]
+
+            if self.force_sim:
+                # Shallow copy: override the type without mutating the
+                # loaded config dict that self.cfg still holds.
+                axis_cfg = dict(axis_cfg)
+                axis_cfg["type"] = "SIM"
+
             ps = self.create_power_supply(
-                helmholtz_cfg[axis]
+                axis_cfg
             )
 
             ps.connect()

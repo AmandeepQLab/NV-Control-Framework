@@ -60,6 +60,26 @@ class SimCamera:
         return self._stream_controller.is_streaming
 
     # =========================================================
+    # CONNECTION
+    # =========================================================
+
+    def connect(self):
+
+        self.configure_camera()
+
+        print("\n[SimCamera] Connected (simulated).")
+
+    def configure_camera(self):
+        """No SDK-level configuration needed for a synthetic camera."""
+        pass
+
+    def close(self):
+        try:
+            self.stop_stream()
+        except Exception:
+            pass
+
+    # =========================================================
     # CONFIGURATION
     # =========================================================
 
@@ -84,8 +104,14 @@ class SimCamera:
         if self.microwave is None:
             return 0
 
-        # MW OFF
-        if getattr(self.microwave, "power", 0) == 0:
+        # MW OFF: ODMRExperiment signals "off" with a deeply attenuated
+        # power (-100 dBm) rather than exactly 0, and "on" with the
+        # configured power (typically -10..0 dBm). -50 dBm sits well below
+        # any realistic "on" power and well above the -100 dBm off
+        # convention, so it reliably separates the two.
+        power = getattr(self.microwave, "power", None)
+
+        if power is None or power <= -50:
             return 0
 
         f = self.microwave.frequency
@@ -159,6 +185,19 @@ class SimCamera:
             self.latest_frame = frame
 
         return frame
+
+    # =========================================================
+    # EXTERNAL TRIGGER SNAP
+    # =========================================================
+
+    def snap_external_trigger(self, timeout_ms=10000):
+        """External triggering is a hardware-timing concept that doesn't
+        apply to a synthetic frame source; behaves like snap()."""
+        return self.snap()
+
+    def snap_external_frames(self, nframes, timeout_ms=10000):
+
+        return [self.snap() for _ in range(nframes)]
 
     # =========================================================
     # STREAMING
