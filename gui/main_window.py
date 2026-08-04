@@ -5,10 +5,10 @@ from PyQt6.QtWidgets import ( # type: ignore
     QApplication, QMainWindow, QWidget,
     QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel,
-    QDoubleSpinBox, QSpinBox,
+    QDoubleSpinBox, QSpinBox, QGridLayout,
     QGroupBox, QMessageBox
 )
-from PyQt6.QtCore import QTimer # type: ignore
+from PyQt6.QtCore import QSignalBlocker, QTimer # type: ignore
 from gui.magnet_window import MagnetControlWindow
 from config.config_manager import ConfigManager
 from hardware.hardware_manager import HardwareManager
@@ -21,6 +21,7 @@ from framework.camera_ownership import (
     start_live_stream_if_available,
 )
 from framework.acquisition_state import AcquisitionState
+from framework.roi import validate_roi
 from gui.live_view_controller import LiveViewTimerController
 from utils.camera_diagnostics import log_event
 
@@ -59,6 +60,8 @@ class MainWindow(QMainWindow):
         # Full-sensor coordinates for camera acquisition.  Experiments receive
         # this value but never define a separate acquisition ROI of their own.
         self.acquisition_state = AcquisitionState()
+        self._sensor_dimensions = self._read_sensor_dimensions()
+        self._syncing_roi_controls = False
 
         # =====================================================
         # MAIN LAYOUT
@@ -148,6 +151,22 @@ class MainWindow(QMainWindow):
 
         self.roi_label = QLabel("Acquisition ROI: None")
         roi_layout.addWidget(self.roi_label)
+
+        coordinates_box = QGroupBox("ROI Coordinates")
+        coordinates_layout = QGridLayout(coordinates_box)
+        self.roi_coordinate_spins = {}
+        for row, coordinate in enumerate(("X", "Y", "Width", "Height")):
+            coordinates_layout.addWidget(QLabel(f"{coordinate}:"), row, 0)
+            spin = QSpinBox()
+            spin.setRange(
+                -1_000_000 if coordinate in ("X", "Y") else 0,
+                1_000_000,
+            )
+            spin.setKeyboardTracking(False)
+            spin.editingFinished.connect(self.apply_roi_coordinates)
+            coordinates_layout.addWidget(spin, row, 1)
+            self.roi_coordinate_spins[coordinate.lower()] = spin
+        roi_layout.addWidget(coordinates_box)
 
         self.reset_roi_button = QPushButton("Reset ROI")
         self.reset_roi_button.clicked.connect(self.reset_acquisition_roi)
@@ -294,7 +313,7 @@ class MainWindow(QMainWindow):
 
         self.image_view.addItem(self.roi)
         self.roi.sigRegionChanged.connect(self.update_roi_info)
-        self.update_roi_info()
+        self._sync_roi_controls()
 
         # =====================================================
         # LIVE VIEW TIMER
@@ -387,6 +406,7 @@ class MainWindow(QMainWindow):
         frame = self.camera.get_latest_frame()
 
         if frame is not None:
+            self._update_sensor_dimensions_from_full_frame(frame)
             log_event("gui_image_update", source="live stream", image_target="main live-view image")
             self.image_view.setImage(
                 frame.T,
@@ -418,24 +438,12 @@ class MainWindow(QMainWindow):
     # =========================================================
 
     def update_roi_info(self):
-
-        pos = self.roi.pos()
-        size = self.roi.size()
-
-        text = (
-            f"x={int(pos.x())}, "
-            f"y={int(pos.y())}, "
-            f"w={int(size.x())}, "
-            f"h={int(size.y())}"
+        """Apply a graphical ROI edit through the Main Window acquisition state."""
+        if self._syncing_roi_controls:
+            return
+        self._set_acquisition_roi(
+            self._roi_overlay_coordinates(), show_validation_error=False
         )
-
-        self.roi_label.setText(f"Acquisition ROI: {text}")
-        self.acquisition_state = AcquisitionState(
-            acquisition_roi=self._roi_overlay_coordinates(),
-            exposure_s=self.acquisition_state.exposure_s,
-            binning=self.acquisition_state.binning,
-        )
-        self.apply_acquisition_state()
 
     def _roi_overlay_coordinates(self):
 
@@ -448,6 +456,153 @@ class MainWindow(QMainWindow):
             int(pos.x() + size.x()),
             int(pos.y() + size.y())
         )
+
+    def apply_roi_coordinates(self):
+        """Convert the coordinate editor's origin and size into an AOI."""
+        x = self.roi_coordinate_spins["x"].value()
+        y = self.roi_coordinate_spins["y"].value()
+        width = self.roi_coordinate_spins["width"].value()
+        height = self.roi_coordinate_spins["height"].value()
+        if width <= 0 or height <= 0:
+            self._sync_roi_controls()
+            QMessageBox.warning(
+                self,
+                "Invalid ROI Coordinates",
+                "ROI Width and Height must both be greater than zero.",
+            )
+            return
+        self._set_acquisition_roi((x, y, x + width, y + height))
+
+    def _set_acquisition_roi(self, roi, show_validation_error=True):
+        """Apply one validated ROI without creating a second ROI state."""
+        try:
+            roi = self._validate_acquisition_roi(roi)
+        except ValueError as error:
+            self._sync_roi_controls()
+            if show_validation_error:
+                QMessageBox.warning(self, "Invalid ROI Coordinates", str(error))
+            return False
+
+        candidate_state = AcquisitionState(
+            acquisition_roi=roi,
+            exposure_s=self.acquisition_state.exposure_s,
+            binning=self.acquisition_state.binning,
+        )
+        try:
+            applied = apply_live_acquisition_state(
+                self.camera, lambda: candidate_state.apply_to(self.camera)
+            )
+        except Exception as error:
+            # Restore the current settings if the camera rejects an AOI rule.
+            try:
+                apply_live_acquisition_state(
+                    self.camera,
+                    lambda: self.acquisition_state.apply_to(self.camera),
+                )
+            except Exception:
+                pass
+            self._sync_roi_controls()
+            if show_validation_error:
+                QMessageBox.warning(
+                    self, "Invalid ROI Coordinates", f"Camera rejected ROI: {error}"
+                )
+            return False
+
+        if not applied:
+            self._sync_roi_controls()
+            if show_validation_error:
+                QMessageBox.warning(
+                    self,
+                    "ROI Not Applied",
+                    "The camera is currently owned by an experiment."
+                )
+            return False
+
+        self.acquisition_state = candidate_state
+        self._sync_roi_controls()
+        return True
+
+    def _validate_acquisition_roi(self, roi):
+        """Validate AOI coordinates against the sensor without clipping them."""
+        normalized_roi = validate_roi(roi)
+        if normalized_roi is None:
+            return None
+
+        x0, y0, x1, y1 = normalized_roi
+        sensor_dimensions = self._sensor_dimensions or self._read_sensor_dimensions()
+        if sensor_dimensions is None:
+            raise ValueError("Unable to determine sensor dimensions for ROI validation.")
+
+        sensor_width, sensor_height = sensor_dimensions
+        if x0 < 0 or y0 < 0:
+            raise ValueError("ROI X and Y must be greater than or equal to zero.")
+        if x1 > sensor_width or y1 > sensor_height:
+            raise ValueError(
+                "ROI must lie completely inside the sensor "
+                f"({sensor_width} x {sensor_height} pixels)."
+            )
+        return normalized_roi
+
+    def _read_sensor_dimensions(self):
+        """Read dimensions only from already exposed camera properties."""
+        image_shape = getattr(self.camera, "image_shape", None)
+        if image_shape is not None and len(image_shape) >= 2:
+            return int(image_shape[1]), int(image_shape[0])
+
+        sdk_camera = getattr(self.camera, "cam", None)
+        if sdk_camera is not None:
+            try:
+                return (
+                    int(sdk_camera.getInt("SensorWidth")),
+                    int(sdk_camera.getInt("SensorHeight")),
+                )
+            except Exception:
+                pass
+        return None
+
+    def _update_sensor_dimensions_from_full_frame(self, frame):
+        """Use a full-sensor live frame only when hardware dimensions are unavailable."""
+        if self._sensor_dimensions is not None or self.acquisition_state.acquisition_roi is not None:
+            return
+        if getattr(frame, "ndim", 0) >= 2:
+            self._sensor_dimensions = (int(frame.shape[1]), int(frame.shape[0]))
+            self._sync_roi_controls()
+
+    def _sync_roi_controls(self):
+        """Reflect the authoritative acquisition ROI in both editing interfaces."""
+        roi = self.acquisition_state.acquisition_roi
+        if roi is None:
+            sensor_dimensions = self._sensor_dimensions or self._read_sensor_dimensions()
+            if sensor_dimensions is None:
+                self.roi_label.setText("Acquisition ROI: Full sensor")
+                return
+            width, height = sensor_dimensions
+            coordinates = (0, 0, width, height)
+            overlay_roi = (0, 0, width, height)
+            self.roi_label.setText(
+                f"Acquisition ROI: x=0, y=0, w={width}, h={height}"
+            )
+        else:
+            x0, y0, x1, y1 = roi
+            coordinates = (x0, y0, x1 - x0, y1 - y0)
+            overlay_roi = roi
+            self.roi_label.setText(
+                f"Acquisition ROI: x={x0}, y={y0}, "
+                f"w={x1 - x0}, h={y1 - y0}"
+            )
+
+        for spin, value in zip(self.roi_coordinate_spins.values(), coordinates):
+            blocker = QSignalBlocker(spin)
+            spin.setValue(value)
+            del blocker
+
+        x0, y0, x1, y1 = overlay_roi
+        self._syncing_roi_controls = True
+        try:
+            self.roi.setPos((x0, y0), finish=False)
+            self.roi.setSize((x1 - x0, y1 - y0), finish=False)
+        finally:
+            self._syncing_roi_controls = False
 
     def get_acquisition_roi(self):
         """Return the Main Window acquisition ROI in full-sensor coordinates."""
@@ -469,13 +624,7 @@ class MainWindow(QMainWindow):
 
     def reset_acquisition_roi(self):
         """Return the user's acquisition configuration to full-sensor AOI."""
-        self.acquisition_state = AcquisitionState(
-            acquisition_roi=None,
-            exposure_s=self.acquisition_state.exposure_s,
-            binning=self.acquisition_state.binning,
-        )
-        self.roi_label.setText("Acquisition ROI: Full sensor")
-        self.apply_acquisition_state()
+        self._set_acquisition_roi(None)
 
     def get_current_roi(self):
         """Deprecated compatibility alias for :meth:`get_acquisition_roi`."""

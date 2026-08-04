@@ -1,6 +1,7 @@
 """Controls and live plot for a zero-field magnetic scan."""
 
 import pyqtgraph as pg
+import numpy as np
 
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -15,6 +16,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from gui.image_inspection import line_profile, pixel_value
 
 
 class ZeroFieldWidget(QWidget):
@@ -77,6 +80,40 @@ class ZeroFieldWidget(QWidget):
         camera_layout.addWidget(
             QLabel("ROI, exposure, and binning are controlled in the main window.")
         )
+        display_row = QHBoxLayout()
+        display_row.addWidget(QLabel("Image Display:"))
+        self.display_mode_combo = QComboBox()
+        self.display_mode_combo.addItems(["Raw Image", "Difference Image"])
+        display_row.addWidget(self.display_mode_combo)
+        camera_layout.addLayout(display_row)
+
+        scaling_row = QHBoxLayout()
+        scaling_row.addWidget(QLabel("Display Scaling:"))
+        self.display_scaling_combo = QComboBox()
+        self.display_scaling_combo.addItems(["Auto", "Manual"])
+        scaling_row.addWidget(self.display_scaling_combo)
+        camera_layout.addLayout(scaling_row)
+
+        self.display_min_spin = self._add_double(
+            camera_layout, "Minimum Intensity:", -1e12, 1e12, 4, 0.0
+        )
+        self.display_max_spin = self._add_double(
+            camera_layout, "Maximum Intensity:", -1e12, 1e12, 4, 1.0
+        )
+
+        colormap_row = QHBoxLayout()
+        colormap_row.addWidget(QLabel("Colormap:"))
+        self.colormap_combo = QComboBox()
+        self.colormap_combo.addItems(["Gray", "Viridis", "Plasma", "Inferno", "Magma"])
+        colormap_row.addWidget(self.colormap_combo)
+        camera_layout.addLayout(colormap_row)
+        self.display_scaling_combo.currentTextChanged.connect(
+            lambda mode: self._set_manual_display_controls_enabled(mode == "Manual")
+        )
+        self._set_manual_display_controls_enabled(False)
+
+        self.line_profile_check = QCheckBox("Enable Line Profile")
+        camera_layout.addWidget(self.line_profile_check)
 
         self.run_stop_button = QPushButton("Start Scan")
         self.run_stop_button.setStyleSheet(
@@ -114,6 +151,27 @@ class ZeroFieldWidget(QWidget):
         self.plot.showGrid(x=True, y=True)
         self.curve = self.plot.plot([], [], pen="y", symbol="o", symbolSize=6)
         plot_layout.addWidget(self.plot)
+
+        image_group = QGroupBox("Zero Field Image")
+        main_layout.addWidget(image_group, 4)
+        image_layout = QVBoxLayout(image_group)
+        self.image_view = pg.ImageView()
+        image_layout.addWidget(self.image_view)
+        self.pixel_inspector_label = QLabel("Pixel: --")
+        image_layout.addWidget(self.pixel_inspector_label)
+        self.line_profile_plot = pg.PlotWidget()
+        self.line_profile_plot.setLabel("left", "Intensity")
+        self.line_profile_plot.setLabel("bottom", "Distance (pixels)")
+        self.line_profile_curve = self.line_profile_plot.plot([], [], pen="c")
+        image_layout.addWidget(self.line_profile_plot)
+
+        self._displayed_image = None
+        self.line_roi = pg.LineSegmentROI([(10, 10), (100, 100)], pen="c")
+        self.image_view.getView().addItem(self.line_roi)
+        self.line_roi.setVisible(False)
+        self.line_roi.sigRegionChangeFinished.connect(self.update_line_profile)
+        self.line_profile_check.toggled.connect(self.set_line_profile_enabled)
+        self.image_view.getView().scene().sigMouseMoved.connect(self.update_pixel_inspector)
 
     def _add_double(self, layout, label, minimum, maximum, decimals, default):
         row = QHBoxLayout()
@@ -159,14 +217,63 @@ class ZeroFieldWidget(QWidget):
         self.current_signal_label.setText("Mean Fluorescence (counts/pixel): --")
 
     def update_live_data(self, fields, signals, current, total):
+        self.update_fluorescence_curve(fields, signals)
+        self.update_progress(current, total)
+
+    def update_fluorescence_curve(self, fields, signals):
+        """Render the raw mean fluorescence values acquired so far."""
         self.curve.setData(fields, signals)
-        self.progress_bar.setValue(int(100 * current / total) if total else 0)
-        self.progress_bar.setFormat(f"Progress: {current} / {total}")
-        self.current_point_label.setText(f"Current scan point: {current} / {total}")
         self.current_field_label.setText(f"Current magnetic field: {fields[-1]:.6g} G")
         self.current_signal_label.setText(
             f"Mean Fluorescence (counts/pixel): {signals[-1]:.6g}"
         )
+
+    def update_progress(self, current, total):
+        """Advance scan progress after the newest fluorescence point is displayed."""
+        self.progress_bar.setValue(int(100 * current / total) if total else 0)
+        self.progress_bar.setFormat(f"Progress: {current} / {total}")
+        self.current_point_label.setText(f"Current scan point: {current} / {total}")
+
+    def update_image(self, image, levels, colormap_name):
+        """Render the selected display representation of an acquired image."""
+        self._displayed_image = np.asarray(image)
+        colormap = pg.colormap.get(colormap_name.lower(), source="matplotlib")
+        self.image_view.setColorMap(colormap)
+        self.image_view.setImage(image.T, autoLevels=False, levels=levels)
+        self.update_line_profile()
+
+    def update_pixel_inspector(self, scene_position):
+        """Show a value from the cached display image under the mouse pointer."""
+        if self._displayed_image is None:
+            return
+        image_position = self.image_view.getImageItem().mapFromScene(scene_position)
+        x, y = int(image_position.x()), int(image_position.y())
+        value = pixel_value(self._displayed_image, x, y)
+        if value is None:
+            self.pixel_inspector_label.setText("Pixel: --")
+            return
+        self.pixel_inspector_label.setText(f"Pixel: x={x}, y={y}, intensity={value:.6g}")
+
+    def set_line_profile_enabled(self, enabled):
+        """Show or hide the interactive line without changing the display image."""
+        self.line_roi.setVisible(enabled)
+        if enabled:
+            self.update_line_profile()
+
+    def update_line_profile(self):
+        """Sample and plot the cached displayed image along the interactive line."""
+        if self._displayed_image is None or not self.line_profile_check.isChecked():
+            return
+        start, end = [
+            self.image_view.getImageItem().mapFromScene(handle.scenePos())
+            for handle in self.line_roi.endpoints
+        ]
+        distances, values = line_profile(
+            self._displayed_image,
+            (start.x(), start.y()),
+            (end.x(), end.y()),
+        )
+        self.line_profile_curve.setData(distances, values)
 
     def update_scan_progress(self, current, total):
         self.current_scan_label.setText(f"Current scan: {current} / {total}")
@@ -174,6 +281,10 @@ class ZeroFieldWidget(QWidget):
     def _set_averaging_controls_enabled(self, enabled):
         self.num_scans_spin.setEnabled(enabled)
         self.save_raw_scans_check.setEnabled(enabled)
+
+    def _set_manual_display_controls_enabled(self, enabled):
+        self.display_min_spin.setEnabled(enabled)
+        self.display_max_spin.setEnabled(enabled)
 
     def set_running_state(self, running):
         if running:

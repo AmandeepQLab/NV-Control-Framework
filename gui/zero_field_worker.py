@@ -17,6 +17,7 @@ class ZeroFieldWorker(QObject):
     """Run the existing experiment and forward its live-update callback."""
 
     live_update_signal = pyqtSignal(float, float, object)
+    fluorescence_update_signal = pyqtSignal(object, object)
     progress_signal = pyqtSignal(int, int)
     scan_started_signal = pyqtSignal(int, int)
     scan_completed_signal = pyqtSignal(object, int, int)
@@ -93,14 +94,22 @@ class ZeroFieldWorker(QObject):
             self.experiment.stop()
 
     def _on_live_update(self, field, image):
-        """Calculate the transient live-monitor signal outside acquisition."""
+        """Publish the newest stored image's raw fluorescence measurement."""
         # The camera has already applied the acquisition ROI.  Live analysis
         # therefore operates on the received image without software cropping.
-        signal = mean_fluorescence(image)
+        signal = self._compute_live_fluorescence(image)
         self._fields.append(field)
         self._signals.append(signal)
         self.live_update_signal.emit(float(field), float(signal), image)
+        self.fluorescence_update_signal.emit(
+            np.asarray(self._fields), np.asarray(self._signals)
+        )
         self.progress_signal.emit(len(self._fields), self.config["field_points"])
+
+    @staticmethod
+    def _compute_live_fluorescence(averaged_image):
+        """Return the raw mean fluorescence for one completed field point."""
+        return mean_fluorescence(averaged_image)
 
     def _on_scan_started(self, current, total):
         self._fields = []

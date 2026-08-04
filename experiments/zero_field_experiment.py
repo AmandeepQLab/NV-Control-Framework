@@ -2,6 +2,9 @@
 
 import copy
 import logging
+import time
+from datetime import datetime, timezone
+from collections.abc import Mapping
 
 import numpy as np
 
@@ -93,6 +96,7 @@ class ZeroFieldExperiment(ScanExperiment):
         self._configured_field_mT = None
         self.latest_field = None
         self.latest_image = None
+        self._acquisition_started_at = None
 
     def setup_scan(self):
         # Keep all supplies enabled for the full sweep.  In particular, the
@@ -104,6 +108,9 @@ class ZeroFieldExperiment(ScanExperiment):
             self.field_stop,
             self.field_points,
         )
+        if self._acquisition_started_at is None:
+            self._acquisition_started_at = datetime.now(timezone.utc).isoformat()
+        self._set_static_metadata()
         self.image_cube.scan_axis_name = self.scan_axis_name
         self.image_cube.scan_axis_unit = self.scan_axis_unit
         self.image_cube.scan_axis_values = self.scan_vector
@@ -118,6 +125,7 @@ class ZeroFieldExperiment(ScanExperiment):
         self.magnet.disable()
 
     def set_scan_point(self, value):
+        # Apply magnetic field/current for this measurement point.
         fields_mT = dict(self._configured_field_mT)
         fields_mT[self.field_axis.lower()] = value * 0.1
         self.magnet.set_vector(
@@ -127,6 +135,7 @@ class ZeroFieldExperiment(ScanExperiment):
         )
 
     def acquire_frame(self):
+        """Acquire and average all fluorescence frames at one field point."""
         frames = [self.camera.snap() for _ in range(self.averages)]
         return np.mean(np.stack(frames), axis=0)
 
@@ -157,8 +166,10 @@ class ZeroFieldExperiment(ScanExperiment):
                 if self.scan_started_callback is not None:
                     self.scan_started_callback(scan_index, scan_count)
 
-                super().run()
+                self._run_single_sweep()
                 acquired_cube = self.image_cube
+                self._finalize_image_cube_metadata(acquired_cube)
+                self._validate_image_cube(acquired_cube)
                 LOGGER.info("Scan %d/%d acquired.", scan_index, scan_count)
 
                 if acquired_cube.data is None:
@@ -201,8 +212,62 @@ class ZeroFieldExperiment(ScanExperiment):
 
             if averaged_cube is not None:
                 self._set_averaging_metadata(averaged_cube, completed_scans)
+                self._finalize_image_cube_metadata(averaged_cube)
+                self._validate_image_cube(averaged_cube)
                 self.image_cube = averaged_cube
         return self.image_cube
+
+    def _run_single_sweep(self):
+        """Acquire exactly one averaged fluorescence image per field value."""
+        self.state = self.RUNNING
+        self.start_time = time.time()
+        self.scan_signal = []
+        self.image_cube = ImageCube(
+            data=None,
+            scan_axis_name=self.scan_axis_name,
+            scan_axis_unit=self.scan_axis_unit,
+            scan_axis_values=[],
+        )
+
+        try:
+            self.setup_scan()
+
+            for field in self.scan_vector:
+                if self.stop_requested or not self.running:
+                    break
+
+                # Apply magnetic field/current.
+                self.set_scan_point(field)
+
+                # Wait for field stabilization.
+                if self.settling_time_ms > 0:
+                    time.sleep(self.settling_time_ms / 1000.0)
+
+                # Acquire averaged fluorescence image.
+                averaged_image = self.acquire_frame()
+
+                # Store measurement exactly once for this field value.
+                self.image_cube.add(averaged_image)
+
+                signal = self.process_frame(averaged_image)
+                self.scan_signal.append(signal)
+
+                # Update live display and progress once per stored image.
+                self.emit_live_update(field, signal)
+                self.emit_progress()
+
+            return self.scan_vector, np.asarray(self.scan_signal)
+
+        except Exception:
+            self.state = self.ERROR
+            raise
+
+        finally:
+            self.end_time = time.time()
+            try:
+                self.cleanup_scan()
+            finally:
+                self.cleanup()
 
     def _new_averaged_cube(self, acquired_cube):
         return ImageCube(
@@ -233,3 +298,93 @@ class ZeroFieldExperiment(ScanExperiment):
         if self.save_raw_scans:
             metadata["raw_scan_filenames"] = list(self.raw_scan_filenames)
         image_cube.metadata = metadata
+
+    def _set_static_metadata(self):
+        """Record the known conditions that define this field sweep."""
+        metadata = dict(self.metadata)
+        metadata.update(
+            {
+                "experiment_name": "Zero Field",
+                "acquisition_started_at_utc": self._acquisition_started_at,
+                "acquisition_roi": self.acquisition_roi,
+                "camera_exposure_s": self._camera_setting("exposure_time"),
+                "camera_binning": self._camera_setting("binning"),
+                "field_axis": self.field_axis,
+                "field_values_gauss": self.scan_vector.tolist(),
+                "field_point_count": self.field_points,
+                "field_start_gauss": self.field_start,
+                "field_stop_gauss": self.field_stop,
+                "settling_time_ms": self.settling_time_ms,
+                "averages_per_point": self.averages,
+                "camera_model": type(self.camera).__name__,
+            }
+        )
+        power_supply_models = self._power_supply_models()
+        if power_supply_models:
+            metadata["power_supply_models"] = power_supply_models
+        magnet_configuration = getattr(self.magnet, "config", None)
+        if isinstance(magnet_configuration, Mapping):
+            metadata["magnet_configuration"] = copy.deepcopy(magnet_configuration)
+        self.metadata = metadata
+
+    def _finalize_image_cube_metadata(self, image_cube):
+        """Add image descriptors after the acquired frame shape is known."""
+        data = np.asarray(image_cube.data)
+        metadata = dict(image_cube.metadata)
+        if data.ndim >= 3:
+            metadata.update(
+                {
+                    "image_height_px": int(data.shape[1]),
+                    "image_width_px": int(data.shape[2]),
+                    "image_dtype": str(data.dtype),
+                }
+            )
+        image_cube.metadata = metadata
+
+    def _validate_image_cube(self, image_cube):
+        """Reject incomplete or structurally inconsistent acquired datasets."""
+        data = image_cube.data
+        if not isinstance(data, np.ndarray) or data.ndim != 3:
+            raise ValueError(
+                "Zero Field ImageCube must contain a 3-D stack of acquired frames."
+            )
+
+        frame_count, height, width = data.shape
+        if frame_count != self.field_points:
+            raise ValueError(
+                "Zero Field ImageCube frame count "
+                f"({frame_count}) does not match field point count "
+                f"({self.field_points})."
+            )
+        if height < 1 or width < 1:
+            raise ValueError("Zero Field ImageCube frames must have non-zero dimensions.")
+
+        # The dense ImageCube stack guarantees one common shape and dtype;
+        # compare its recorded descriptors to detect metadata/data divergence.
+        metadata = image_cube.metadata
+        if len(metadata.get("field_values_gauss", [])) != frame_count:
+            raise ValueError(
+                "Zero Field metadata field vector length does not match the "
+                "number of stored frames."
+            )
+        if metadata.get("image_height_px") != height or metadata.get("image_width_px") != width:
+            raise ValueError(
+                "Zero Field image dimensions do not match ImageCube metadata."
+            )
+        if metadata.get("image_dtype") != str(data.dtype):
+            raise ValueError(
+                "Zero Field image dtype does not match ImageCube metadata."
+            )
+
+    def _camera_setting(self, attribute):
+        value = getattr(self.camera, attribute, None)
+        return value.item() if isinstance(value, np.generic) else value
+
+    def _power_supply_models(self):
+        supplies = getattr(self.magnet, "power_supplies", None)
+        if not isinstance(supplies, Mapping):
+            return {}
+        return {
+            str(axis): type(power_supply).__name__
+            for axis, power_supply in supplies.items()
+        }
