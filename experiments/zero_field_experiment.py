@@ -50,6 +50,7 @@ class ZeroFieldExperiment(ScanExperiment):
         raw_scan_saver=None,
         zero_other_axes=True,
         stream_scan_path=None,
+        stream_path_is_output=False,
     ):
         config = {
             "settling_time_ms": settling_time_ms,
@@ -104,6 +105,12 @@ class ZeroFieldExperiment(ScanExperiment):
         # needs random-access writes .npz has no equivalent for -- so the
         # caller (ZeroFieldWorker) only supplies this for an .h5 destination.
         self.stream_scan_path = stream_scan_path
+        # When True, stream_scan_path's file IS this run's final deliverable
+        # (a single-scan run streaming directly to the output path), not a
+        # disposable per-scan artifact -- it must never be unlinked below
+        # regardless of save_raw_scans, and isn't a "raw scan" in the
+        # multi-scan sense so it's excluded from raw_scan_filenames too.
+        self.stream_path_is_output = stream_path_is_output
         self._stream_writer = None
         # Path streaming last wrote to (or None), read by run() right after
         # _run_single_sweep() returns to decide whether the raw_scan_saver
@@ -268,7 +275,13 @@ class ZeroFieldExperiment(ScanExperiment):
                     )
                 LOGGER.info("Running average updated.")
 
-                if self.save_raw_scans:
+                if stream_path is not None and self.stream_path_is_output:
+                    # This file IS the run's deliverable (a single-scan run
+                    # streaming directly to the final output path) -- never
+                    # delete it, and it isn't a separate "raw scan" artifact
+                    # to record either, regardless of save_raw_scans.
+                    pass
+                elif self.save_raw_scans:
                     if stream_path is not None:
                         # Streaming already wrote and finalized this scan's
                         # file incrementally; re-saving it via raw_scan_saver
@@ -457,7 +470,13 @@ class ZeroFieldExperiment(ScanExperiment):
                 ],
             }
         )
-        if self.save_raw_scans:
+        # Omitted (not set to []) when stream_path_is_output: there are
+        # genuinely no separate raw-scan files in that case, and an empty
+        # list would be ambiguous with "raw scans weren't requested" -- the
+        # key is already absent in that latter case, so this keeps
+        # "key absent" meaning "no raw-scan-filenames concept applies here"
+        # consistent everywhere.
+        if self.save_raw_scans and not self.stream_path_is_output:
             metadata["raw_scan_filenames"] = list(self.raw_scan_filenames)
         image_cube.metadata = metadata
 

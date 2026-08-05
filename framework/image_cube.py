@@ -392,6 +392,34 @@ class ImageCube:
         )
 
 
+def merge_hdf5_metadata(path, metadata):
+    """Merge *metadata* into an existing streamed HDF5 file's metadata blob,
+    in place, without touching the ``data`` or ``scan_axis_values`` datasets.
+
+    Used when a single-scan run's streamed file is itself the deliverable:
+    the writer already closed (correctly marking ``scan_complete``/truncating
+    on a stop) before the experiment finishes computing metadata that
+    depends on the final in-memory cube (image dimensions, averaging_enabled,
+    experiment_complete, ...); this lets that metadata reach the file without
+    a second full pixel-data rewrite.
+
+    ``metadata_json`` is a scalar variable-length string dataset, so this
+    reassigns its value directly (``dset[()] = ...``) rather than deleting
+    and recreating the dataset. Confirmed empirically (grown and shrunk
+    in place, reopened with a fresh handle, no leftover datasets) that HDF5's
+    vlen storage -- a fixed-size heap pointer plus a separately-allocated
+    heap blob -- makes this a single write, unlike del-then-create which
+    would leave the file with no metadata dataset at all if the process died
+    in between. That matters here because, unlike a redundant raw-scan copy,
+    this file is the only copy of the data.
+    """
+    with h5py.File(path, "a") as handle:
+        existing = json.loads(handle[_HDF5_METADATA_JSON_KEY][()])
+        existing.update(metadata)
+        handle[_HDF5_METADATA_JSON_KEY][()] = json.dumps(existing)
+        handle.flush()
+
+
 class ImageCubeStreamWriter:
     """Incrementally writes an HDF5 ImageCube to disk as planes are acquired.
 

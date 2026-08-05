@@ -9,6 +9,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from experiments.zero_field_experiment import ZeroFieldExperiment
 from framework.fluorescence import mean_fluorescence
+from framework.image_cube import merge_hdf5_metadata
 
 
 LOGGER = logging.getLogger(__name__)
@@ -63,12 +64,23 @@ class ZeroFieldWorker(QObject):
         self.output_path = output_path
         self.experiment = None
         self._stop_requested = False
+        self._single_scan_direct = False
         self._fields = []
         self._signals = []
 
     def start(self):
         try:
             streaming = _is_hdf5_path(self.output_path)
+            scan_count = (
+                self.config.get("num_scans", 1)
+                if self.config.get("averaging_enabled", False)
+                else 1
+            )
+            # A single-scan run has nothing to average -- stream straight
+            # into the final output path instead of a disposable per-scan
+            # file, so there's no redundant second whole-cube write and no
+            # duplicate file left on disk.
+            self._single_scan_direct = streaming and scan_count == 1
             self.experiment = ZeroFieldExperiment(
                 hardware_manager=self.hardware_manager,
                 camera=self.camera,
@@ -92,13 +104,27 @@ class ZeroFieldWorker(QObject):
                 # can't do (see ImageCube.open_streaming_write). A non-.h5
                 # destination falls back to exactly today's behavior: no
                 # incremental writes anywhere, one save at the very end.
-                stream_scan_path=self._raw_scan_path if streaming else None,
+                stream_scan_path=(
+                    self._output_path_as_stream_target
+                    if self._single_scan_direct
+                    else self._raw_scan_path if streaming else None
+                ),
+                stream_path_is_output=self._single_scan_direct,
             )
             if self._stop_requested:
                 self.experiment.stop()
             cube = self.experiment.run()
             if cube.data is not None:
-                if streaming:
+                if self._single_scan_direct:
+                    # Pixel data (and scan_complete/planes_written/
+                    # stopped_by_user) already reached output_path
+                    # incrementally during acquisition; only the metadata
+                    # computed after the writer closed (image dimensions,
+                    # averaging_enabled, experiment_complete, ...) still
+                    # needs to land on disk, so patch it in rather than
+                    # rewriting the whole file a second time.
+                    merge_hdf5_metadata(self.output_path, dict(cube.metadata))
+                elif streaming:
                     _atomic_save_hdf5(cube, self.output_path)
                 else:
                     cube.save(self.output_path)
@@ -145,14 +171,20 @@ class ZeroFieldWorker(QObject):
         self.scan_started_signal.emit(current, total)
 
     def _on_scan_completed(self, image_cube, current, total):
-        if _is_hdf5_path(self.output_path):
+        if _is_hdf5_path(self.output_path) and not self._single_scan_direct:
             # Persist the running average after every completed scan, not
             # just once at the very end -- closes the gap where several
             # scans finish, then a crash loses all of them because nothing
-            # had reached disk yet.
+            # had reached disk yet. Not needed when streaming directly to
+            # the final path: that data is already durable on disk
+            # incrementally, and this scan is the whole run anyway.
             _atomic_save_hdf5(image_cube, self.output_path)
             LOGGER.info("Running average persisted: %s", self.output_path)
         self.scan_completed_signal.emit(image_cube, current, total)
+
+    def _output_path_as_stream_target(self, scan_index):
+        """Stream a single-scan run straight into its final output path."""
+        return self.output_path
 
     def _raw_scan_path(self, scan_index):
         return self.output_path.with_name(

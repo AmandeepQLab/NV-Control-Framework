@@ -145,9 +145,17 @@ class ZeroFieldWindow(QMainWindow):
             config["num_scans"] if config["averaging_enabled"] else 1
         )
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        self.output_path = (
-            self.output_directory / f"zero_field_{timestamp}_average{_OUTPUT_EXTENSION}"
-        )
+        if self.total_scans == 1:
+            # Nothing to average -- the single scan streams directly into
+            # this path, so it's the only file this run produces, not a
+            # companion to a separate per-scan file.
+            self.output_path = (
+                self.output_directory / f"zero_field_{timestamp}{_OUTPUT_EXTENSION}"
+            )
+        else:
+            self.output_path = (
+                self.output_directory / f"zero_field_{timestamp}_average{_OUTPUT_EXTENSION}"
+            )
         self.widget.save_button.setEnabled(False)
         self.widget.reset_scan(config["field_points"], self.total_scans)
         self.widget.set_running_state(True)

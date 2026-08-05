@@ -690,6 +690,43 @@ class ZeroFieldStreamingTests(unittest.TestCase):
             self.assertTrue(raw.metadata["scan_complete"])
             np.testing.assert_allclose(raw.data, cube.data)
 
+    def test_stream_path_is_output_prevents_deletion_regardless_of_save_raw_scans(self):
+        # stream_path_is_output=True means this stream file IS the run's own
+        # deliverable (the single-scan-direct-streaming case), so it must
+        # never be deleted even though save_raw_scans=False would normally
+        # trigger the unlink branch.
+        frames = [np.full((2, 2), 1.0), np.full((2, 2), 3.0)]
+        with tempfile.TemporaryDirectory() as directory:
+            stream_path = Path(directory) / "zero_field_test.h5"
+
+            cube, experiment = run_experiment(
+                frames,
+                save_raw_scans=False,
+                stream_scan_path=lambda _scan_index: stream_path,
+                stream_path_is_output=True,
+            )
+
+            self.assertTrue(stream_path.exists())
+            np.testing.assert_allclose(ImageCube.load(stream_path).data, cube.data)
+
+    def test_stream_path_is_output_omits_raw_scan_filenames(self):
+        # An empty list would be ambiguous with "raw scans weren't
+        # requested" -- since there is no separate raw-scan file in this
+        # mode, the key should be absent entirely, not [].
+        frames = [np.full((2, 2), 1.0), np.full((2, 2), 3.0)]
+        with tempfile.TemporaryDirectory() as directory:
+            stream_path = Path(directory) / "zero_field_test.h5"
+
+            cube, experiment = run_experiment(
+                frames,
+                save_raw_scans=True,
+                stream_scan_path=lambda _scan_index: stream_path,
+                stream_path_is_output=True,
+            )
+
+            self.assertNotIn("raw_scan_filenames", cube.metadata)
+            self.assertTrue(stream_path.exists())
+
     def test_worker_persists_running_average_after_each_scan_and_survives_a_crash(self):
         # Scan 1 completes; scan 2 fails mid-sweep. Exercises the whole
         # ZeroFieldWorker wiring, not just ZeroFieldExperiment directly.
@@ -857,6 +894,78 @@ class ZeroFieldCooperativeStopTests(unittest.TestCase):
         self.assertEqual(cube.metadata["completed_scans"], 1)
         self.assertTrue(cube.metadata["stopped_by_user"])
         self.assertFalse(cube.metadata["experiment_complete"])
+
+
+class SingleScanDirectStreamingTests(unittest.TestCase):
+    """A single-scan run (via ZeroFieldWorker, as the GUI drives it) streams
+    straight into its own output_path -- no _scan_001.h5 companion file, no
+    redundant whole-cube rewrite at the end, and the final metadata that
+    only becomes known after streaming closes still lands on disk."""
+
+    @staticmethod
+    def _config(**overrides):
+        config = {
+            "field_start": -1.0,
+            "field_stop": 1.0,
+            "field_points": 3,
+            "field_axis": "X",
+            "settling_time_ms": 0,
+            "averages": 1,
+            "averaging_enabled": False,
+            "num_scans": 1,
+            "save_raw_scans": False,
+        }
+        config.update(overrides)
+        return config
+
+    def test_completed_single_scan_streams_directly_with_no_duplicate_file(self):
+        frames = [np.full((2, 2), v) for v in (1.0, 2.0, 3.0)]
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "zero_field_test.h5"
+            worker = ZeroFieldWorker(
+                None, FakeCamera(frames), FakeMagnet(),
+                self._config(), None, {}, output_path,
+            )
+            worker.start()
+
+            self.assertEqual(list(Path(directory).glob("*.h5")), [output_path])
+            cube = ImageCube.load(output_path)
+            self.assertEqual(cube.data.shape, (3, 2, 2))
+            self.assertTrue(cube.metadata["scan_complete"])
+            self.assertEqual(cube.metadata["planes_written"], 3)
+            self.assertTrue(cube.metadata["experiment_complete"])
+            self.assertFalse(cube.metadata["stopped_by_user"])
+            self.assertEqual(cube.metadata["image_height_px"], 2)
+            self.assertEqual(cube.metadata["image_width_px"], 2)
+            self.assertFalse(cube.metadata["averaging_enabled"])
+            self.assertEqual(cube.metadata["num_scans"], 1)
+            self.assertEqual(cube.metadata["completed_scans"], 1)
+
+    def test_stopped_single_scan_streams_directly_and_truncates_in_place(self):
+        holder = {}
+        frames = [np.full((2, 2), v) for v in (1.0, 2.0, 3.0)]
+        camera = StoppingCamera(frames, stop_after=2, holder=holder)
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "zero_field_test.h5"
+            worker = ZeroFieldWorker(
+                None, camera, FakeMagnet(),
+                self._config(), None, {}, output_path,
+            )
+            # ZeroFieldWorker.stop() forwards to self.experiment.stop(),
+            # and self.experiment is already assigned by the time start()
+            # begins acquiring frames -- so the worker itself can stand in
+            # for the "holder" indirection StoppingCamera expects.
+            holder["experiment"] = worker
+            worker.start()
+
+            self.assertEqual(list(Path(directory).glob("*.h5")), [output_path])
+            cube = ImageCube.load(output_path)
+            self.assertEqual(cube.data.shape, (2, 2, 2))
+            self.assertEqual(len(cube.scan_axis_values), 2)
+            self.assertFalse(cube.metadata["scan_complete"])
+            self.assertEqual(cube.metadata["planes_written"], 2)
+            self.assertFalse(cube.metadata["experiment_complete"])
+            self.assertTrue(cube.metadata["stopped_by_user"])
 
 
 if __name__ == "__main__":
