@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QProgressBar,
     QSpinBox,
@@ -31,6 +32,15 @@ class ZeroFieldWidget(QWidget):
         controls = QGroupBox("Zero Field Parameters")
         main_layout.addWidget(controls, 1)
         control_layout = QVBoxLayout(controls)
+
+        output_group = QGroupBox("Output Directory")
+        output_layout = QHBoxLayout(output_group)
+        control_layout.addWidget(output_group)
+        self.output_directory_edit = QLineEdit()
+        self.output_directory_edit.setReadOnly(True)
+        output_layout.addWidget(self.output_directory_edit)
+        self.browse_output_button = QPushButton("Browse…")
+        output_layout.addWidget(self.browse_output_button)
 
         field_group = QGroupBox("Magnetic Field")
         field_layout = QVBoxLayout(field_group)
@@ -193,6 +203,9 @@ class ZeroFieldWidget(QWidget):
         row.addWidget(spin)
         layout.addLayout(row)
         return spin
+
+    def set_output_directory(self, path):
+        self.output_directory_edit.setText(str(path))
 
     def get_config(self):
         return {

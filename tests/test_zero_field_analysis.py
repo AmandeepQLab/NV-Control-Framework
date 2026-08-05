@@ -1,5 +1,6 @@
 """Unit tests for reusable Zero Field ImageCube analysis."""
 
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -206,6 +207,95 @@ class ImageCubeHDF5Tests(unittest.TestCase):
                 cube.save(Path(directory) / "empty.h5")
             with self.assertRaises(ValueError):
                 cube.save(Path(directory) / "empty.npz")
+
+
+class ImageCubeStreamingTests(unittest.TestCase):
+    """ImageCube.open_streaming_write(): incremental, crash-safe HDF5 writes."""
+
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.directory, ignore_errors=True)
+        self.path = self.directory / "stream.h5"
+        self.planes = [
+            np.full((2, 3), 1.0),
+            np.full((2, 3), 2.0),
+            np.full((2, 3), 3.0),
+        ]
+
+    def test_open_streaming_write_rejects_npz(self):
+        with self.assertRaises(NotImplementedError):
+            ImageCube.open_streaming_write(self.directory / "stream.npz", 3)
+
+    def test_interrupted_write_is_loadable_and_marked_incomplete(self):
+        # Simulates a crash or forced quit partway through a scan: the
+        # writer is closed directly, without ever calling finalize().
+        writer = ImageCube.open_streaming_write(
+            self.path,
+            num_planes=3,
+            scan_axis_name="Magnetic Field",
+            scan_axis_unit="G",
+            scan_axis_values=[-1.0, 0.0, 1.0],
+            metadata={"experiment_name": "Zero Field"},
+        )
+        writer.write_plane(0, self.planes[0])
+        writer.write_plane(1, self.planes[1])
+        writer.close()
+
+        cube = ImageCube.load(self.path)
+
+        self.assertFalse(cube.metadata["scan_complete"])
+        self.assertEqual(cube.metadata["planes_written"], 2)
+        self.assertEqual(cube.metadata["experiment_name"], "Zero Field")
+        np.testing.assert_array_equal(cube.data[0], self.planes[0])
+        np.testing.assert_array_equal(cube.data[1], self.planes[1])
+        # Plane 2 was never written -- HDF5 never allocates that chunk, so
+        # it reads back as zero-fill, not as a signal that anything failed.
+        np.testing.assert_array_equal(cube.data[2], np.zeros((2, 3)))
+        self.assertEqual(cube.data.shape, (3, 2, 3))
+
+    def test_finalize_marks_complete_and_merges_final_metadata(self):
+        writer = ImageCube.open_streaming_write(
+            self.path, num_planes=3, metadata={"completed_scans": 0}
+        )
+        for index, plane in enumerate(self.planes):
+            writer.write_plane(index, plane)
+        writer.finalize({"completed_scans": 1, "experiment_complete": True})
+
+        cube = ImageCube.load(self.path)
+
+        self.assertTrue(cube.metadata["scan_complete"])
+        self.assertEqual(cube.metadata["planes_written"], 3)
+        self.assertEqual(cube.metadata["completed_scans"], 1)
+        self.assertTrue(cube.metadata["experiment_complete"])
+        for index, plane in enumerate(self.planes):
+            np.testing.assert_array_equal(cube.data[index], plane)
+
+    def test_write_plane_rejects_inconsistent_shape(self):
+        writer = ImageCube.open_streaming_write(self.path, num_planes=2)
+        writer.write_plane(0, np.zeros((2, 3)))
+
+        with self.assertRaises(ValueError):
+            writer.write_plane(1, np.zeros((4, 5)))
+
+        writer.close()
+
+    def test_write_plane_rejects_out_of_range_index(self):
+        writer = ImageCube.open_streaming_write(self.path, num_planes=2)
+
+        with self.assertRaises(ValueError):
+            writer.write_plane(5, np.zeros((2, 3)))
+
+        writer.close()
+
+    def test_context_manager_leaves_scan_complete_false_without_finalize(self):
+        with ImageCube.open_streaming_write(self.path, num_planes=2) as writer:
+            writer.write_plane(0, np.zeros((2, 3)))
+            # Exiting the with-block does not imply completion -- only an
+            # explicit finalize() call does.
+
+        cube = ImageCube.load(self.path)
+        self.assertFalse(cube.metadata["scan_complete"])
+        self.assertEqual(cube.metadata["planes_written"], 1)
 
 
 if __name__ == "__main__":

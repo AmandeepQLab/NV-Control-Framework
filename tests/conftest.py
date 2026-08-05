@@ -17,6 +17,7 @@ ALLOWED_FILES = frozenset(
         "test_acquisition_state.py",
         "test_camera_ownership.py",
         "test_odmr_acquisition_roi.py",
+        "test_paths.py",
         "test_roi.py",
         "test_streaming_controller.py",
         "test_zero_field_analysis.py",

@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import logging
+import shutil
 from datetime import datetime
 
 import numpy as np
@@ -12,6 +13,7 @@ from PyQt6.QtWidgets import QFileDialog, QMainWindow, QMessageBox
 from gui.widgets.zero_field_widget import ZeroFieldWidget
 from gui.zero_field_worker import ZeroFieldWorker
 from framework.analysis.zero_field import mean_fluorescence_vs_field
+from framework.paths import ensure_writable_directory
 from utils.camera_diagnostics import log_event
 
 
@@ -21,6 +23,11 @@ LOGGER = logging.getLogger(__name__)
 # per-scan filenames from output_path.suffix, so changing this one constant
 # is sufficient to switch both the averaged cube and raw scans to HDF5.
 _OUTPUT_EXTENSION = ".h5"
+
+# Default zero-field output directory when config/setupInfo.json has no
+# dataOutput.zeroFieldDirectory key (older configs) -- the same directory
+# this window always used before that key existed.
+_DEFAULT_OUTPUT_DIRECTORY = Path(__file__).resolve().parents[1] / "data"
 
 
 class ZeroFieldWindow(QMainWindow):
@@ -51,7 +58,7 @@ class ZeroFieldWindow(QMainWindow):
         self.scan_signals = []
         self.field_point_count = 0
         self.total_scans = 1
-        self.output_directory = Path(__file__).resolve().parents[1] / "data"
+        self.output_directory = self._resolve_default_output_directory()
         self.output_path = None
         self._reference_image = None
         self._latest_averaged_image = None
@@ -59,8 +66,10 @@ class ZeroFieldWindow(QMainWindow):
 
         self.widget = ZeroFieldWidget()
         self.setCentralWidget(self.widget)
+        self.widget.set_output_directory(self.output_directory)
         self.widget.run_stop_button.clicked.connect(self.toggle_scan)
         self.widget.save_button.clicked.connect(self.save_data)
+        self.widget.browse_output_button.clicked.connect(self.browse_output_directory)
         self.widget.display_mode_combo.currentTextChanged.connect(
             self.handle_display_mode_changed
         )
@@ -76,9 +85,30 @@ class ZeroFieldWindow(QMainWindow):
         self.widget.colormap_combo.currentTextChanged.connect(
             self.handle_display_settings_changed
         )
-        # Before acquisition this existing control selects an optional output
-        # directory.  The automatic timestamped filename remains unchanged.
-        self.widget.save_button.setEnabled(True)
+        # "Save Data" copies the already-written result file to a
+        # user-chosen location; there's nothing to copy until a scan has
+        # produced one.
+        self.widget.save_button.setEnabled(False)
+
+    def _resolve_default_output_directory(self):
+        """Read the configured default zero-field output directory.
+
+        Falls back to the directory this window always used before the
+        dataOutput.zeroFieldDirectory config key existed, for configs that
+        predate it -- a missing key is not an error, just an old config.
+        """
+        cfg = getattr(self.hardware_manager, "cfg", None)
+        if cfg is not None:
+            try:
+                configured = cfg.get("dataOutput", "zeroFieldDirectory")
+            except (KeyError, TypeError):
+                configured = None
+            if configured:
+                path = Path(configured)
+                if not path.is_absolute():
+                    path = Path(__file__).resolve().parents[1] / path
+                return path
+        return _DEFAULT_OUTPUT_DIRECTORY
 
     def toggle_scan(self):
         if self.zero_field_running:
@@ -87,6 +117,18 @@ class ZeroFieldWindow(QMainWindow):
             self.start_scan()
 
     def start_scan(self):
+        # Checked before anything else -- no hardware is touched and no
+        # worker/thread is created until the destination is confirmed usable.
+        try:
+            ensure_writable_directory(self.output_directory)
+        except OSError as error:
+            QMessageBox.critical(
+                self,
+                "Zero Field Error",
+                f"Output directory is not usable: {self.output_directory}\n{error}",
+            )
+            return
+
         config = self.widget.get_config()
         acquisition_state = self.acquisition_state_getter()
         acquisition_roi = acquisition_state.acquisition_roi
@@ -103,7 +145,6 @@ class ZeroFieldWindow(QMainWindow):
             config["num_scans"] if config["averaging_enabled"] else 1
         )
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        self.output_directory.mkdir(parents=True, exist_ok=True)
         self.output_path = (
             self.output_directory / f"zero_field_{timestamp}_average{_OUTPUT_EXTENSION}"
         )
@@ -284,7 +325,9 @@ class ZeroFieldWindow(QMainWindow):
         self.widget.status_label.setText(
             "Status: Stopped" if stopped else "Status: Complete"
         )
-        self.widget.save_button.setEnabled(False)
+        # Enabled exactly when the worker actually wrote self.output_path
+        # (cube.data is not None), so "Save Data" always has something to copy.
+        self.widget.save_button.setEnabled(image_cube.data is not None)
         if self.output_path is not None:
             self.widget.status_label.setText(
                 f"Status: {'Stopped' if stopped else 'Complete'} — saved {self.output_path.name}"
@@ -296,20 +339,62 @@ class ZeroFieldWindow(QMainWindow):
         self.widget.status_label.setText("Status: Error")
         QMessageBox.critical(self, "Zero Field Error", message)
 
+    def browse_output_directory(self):
+        """Pick the destination for future scans; rejects unusable choices
+        immediately rather than deferring the error to scan start."""
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Choose Zero Field Output Directory",
+            str(self.output_directory),
+        )
+        if not directory:
+            return
+        try:
+            ensure_writable_directory(directory)
+        except OSError as error:
+            QMessageBox.critical(
+                self, "Zero Field Error", f"Directory is not usable: {directory}\n{error}"
+            )
+            return
+        self.output_directory = Path(directory)
+        self.widget.set_output_directory(self.output_directory)
+        self.widget.status_label.setText(
+            f"Status: Output directory set to {self.output_directory}"
+        )
+
     def save_data(self):
-        if self.image_cube is not None or self.zero_field_running:
+        """Copy the already-written result file to a chosen location.
+
+        Streaming (or, for a legacy .npz destination, the worker's final
+        save) already wrote self.output_path in full by the time this
+        button is enabled, so this is a plain file copy, not a re-save.
+        """
+        if self.zero_field_running or self.output_path is None:
+            return
+        if not self.output_path.exists():
+            QMessageBox.critical(
+                self, "Zero Field Error",
+                f"Nothing to save -- {self.output_path} does not exist.",
+            )
             return
 
         directory = QFileDialog.getExistingDirectory(
             self,
-            "Choose Zero Field Data Directory",
+            "Choose Destination for a Copy of the Zero Field Data",
             str(self.output_directory),
         )
-        if directory:
-            self.output_directory = Path(directory)
-            self.widget.status_label.setText(
-                f"Status: Output directory set to {self.output_directory}"
+        if not directory:
+            return
+
+        destination = Path(directory) / self.output_path.name
+        try:
+            shutil.copy2(self.output_path, destination)
+        except OSError as error:
+            QMessageBox.critical(
+                self, "Zero Field Error", f"Could not save a copy: {error}"
             )
+            return
+        self.widget.status_label.setText(f"Status: Saved a copy to {destination}")
 
     def closeEvent(self, event):
         if self.zero_field_running:

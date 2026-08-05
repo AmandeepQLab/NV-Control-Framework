@@ -2,6 +2,9 @@
 	"debugMode": false,
 	"showEvents": false,
 	"setupNumber": "2",
+	"dataOutput": {
+		"zeroFieldDirectory": "data"
+	},
 	"niDaq": {
 		"dummy": true,
 		"deviceName": "dev1"

@@ -252,7 +252,13 @@ class ImageCube:
     @staticmethod
     def _load_hdf5(filename):
         with h5py.File(filename, "r") as handle:
-            data = handle[_HDF5_DATA_KEY][()]
+            # A streaming writer (see ImageCubeStreamWriter) creates the
+            # data dataset lazily, on its first write_plane() call, since
+            # only the first acquired frame reveals the per-plane shape.  A
+            # file interrupted before that call has no dataset at all yet --
+            # a legitimate partial state, matching ImageCube(data=None, ...)
+            # elsewhere in this class -- not a corrupt file.
+            data = handle[_HDF5_DATA_KEY][()] if _HDF5_DATA_KEY in handle else None
             scan_axis_values = (
                 None if handle.attrs.get("scan_axis_values_is_none", False)
                 else handle[_HDF5_SCAN_AXIS_VALUES_KEY][()].tolist()
@@ -285,6 +291,46 @@ class ImageCube:
             scan_axis_name=scan_axis_name,
             scan_axis_unit=scan_axis_unit,
             scan_axis_values=scan_axis_values,
+        )
+
+    # =====================================================
+    # STREAMING WRITE (incremental, crash-safe -- HDF5 only)
+    # =====================================================
+
+    @staticmethod
+    def open_streaming_write(
+        filename,
+        num_planes,
+        axes=None,
+        metadata=None,
+        experiment_type="Unknown",
+        scan_axis_name=None,
+        scan_axis_unit=None,
+        scan_axis_values=None,
+        dtype=None,
+    ):
+        """Open *filename* for incremental, crash-safe plane-by-plane writes.
+
+        HDF5 only -- see :class:`ImageCubeStreamWriter`. Everything passed
+        here is written immediately; the returned writer's ``write_plane()``
+        fills in frame data as it's acquired, and ``finalize()`` merges any
+        metadata only known once the scan ends and marks the file complete.
+        """
+        if not _is_hdf5_path(filename):
+            raise NotImplementedError(
+                "Streaming writes are only supported for HDF5 (.h5/.hdf5) "
+                "files; .npz has no incremental write path."
+            )
+        return ImageCubeStreamWriter(
+            filename,
+            num_planes,
+            axes=axes,
+            metadata=metadata,
+            experiment_type=experiment_type,
+            scan_axis_name=scan_axis_name,
+            scan_axis_unit=scan_axis_unit,
+            scan_axis_values=scan_axis_values,
+            dtype=dtype,
         )
 
     # =====================================================
@@ -344,3 +390,190 @@ class ImageCube:
             f"shape={self.shape}"
             ")"
         )
+
+
+class ImageCubeStreamWriter:
+    """Incrementally writes an HDF5 ImageCube to disk as planes are acquired.
+
+    Created via :meth:`ImageCube.open_streaming_write`, not directly. The
+    data dataset is pre-allocated to ``(num_planes, *frame_shape)`` once the
+    first :meth:`write_plane` call reveals ``frame_shape`` -- only the
+    camera/ROI determine that, not anything known before acquisition starts,
+    matching how :meth:`ImageCube.add` also discovers shape lazily.
+
+    ``metadata`` is a live, growing dict, not a fixed pre-declared list:
+    every :meth:`write_plane` call bumps ``metadata["planes_written"]`` and
+    rewrites the metadata JSON blob, so a reader can always tell how many
+    leading planes are trustworthy versus HDF5's zero-fill for the rest (a
+    partially-written file always has the full ``(num_planes, *frame_shape)``
+    dataset shape -- HDF5 never allocates unwritten chunks -- so shape alone
+    can't distinguish a partial file from a complete one).
+
+    ``metadata["scan_complete"]`` is the authoritative completion flag: it
+    starts, and stays, ``False`` until :meth:`finalize` is called, so a file
+    left behind by a crash, a forced quit, or a caller that simply forgot to
+    finalize is unambiguously marked incomplete rather than requiring a
+    reader to infer completeness from plane count, file age, or a clean
+    process exit.
+
+    :meth:`write_plane` calls ``flush()`` after every plane (and after the
+    metadata rewrite that follows it), which pushes HDF5's internal buffers
+    to the OS -- durable against the writing process being killed, but not
+    against a power loss or OS crash, which would additionally need
+    ``os.fsync()`` at real per-point I/O cost.
+    """
+
+    def __init__(
+        self,
+        filename,
+        num_planes,
+        axes=None,
+        metadata=None,
+        experiment_type="Unknown",
+        scan_axis_name=None,
+        scan_axis_unit=None,
+        scan_axis_values=None,
+        dtype=None,
+    ):
+        if num_planes < 1:
+            raise ValueError("num_planes must be at least 1.")
+
+        self.filename = filename
+        self.num_planes = num_planes
+        self.dtype = None if dtype is None else np.dtype(dtype)
+        self.axes = {} if axes is None else axes
+        self.metadata = dict({} if metadata is None else metadata)
+        self.metadata.setdefault("planes_written", 0)
+        self.metadata["scan_complete"] = False
+        self.experiment_type = experiment_type
+        self.scan_axis_name = scan_axis_name
+        self.scan_axis_unit = scan_axis_unit
+        self.scan_axis_values = (
+            [] if scan_axis_values is None else scan_axis_values
+        )
+
+        self._dataset = None
+        self._frame_shape = None
+        self._closed = False
+        self._handle = h5py.File(filename, "w")
+
+        scan_axis_values_is_none = self.scan_axis_values is None
+        scan_axis_values_array = np.asarray(
+            [] if scan_axis_values_is_none else self.scan_axis_values,
+            dtype=np.float64,
+        )
+        self._handle.create_dataset(
+            _HDF5_SCAN_AXIS_VALUES_KEY, data=scan_axis_values_array
+        )
+        self._handle.attrs["scan_axis_values_is_none"] = scan_axis_values_is_none
+
+        self._handle.create_dataset(
+            _HDF5_AXES_JSON_KEY,
+            data=json.dumps(self.axes),
+            dtype=h5py.string_dtype(encoding="utf-8"),
+        )
+
+        self._handle.attrs["experiment_type_is_none"] = self.experiment_type is None
+        self._handle.attrs["experiment_type"] = self.experiment_type or ""
+        self._handle.attrs["scan_axis_name_is_none"] = self.scan_axis_name is None
+        self._handle.attrs["scan_axis_name"] = self.scan_axis_name or ""
+        self._handle.attrs["scan_axis_unit_is_none"] = self.scan_axis_unit is None
+        self._handle.attrs["scan_axis_unit"] = self.scan_axis_unit or ""
+
+        self._write_metadata_json()
+        self._handle.flush()
+
+    def _write_metadata_json(self):
+        if _HDF5_METADATA_JSON_KEY in self._handle:
+            del self._handle[_HDF5_METADATA_JSON_KEY]
+        self._handle.create_dataset(
+            _HDF5_METADATA_JSON_KEY,
+            data=json.dumps(self.metadata),
+            dtype=h5py.string_dtype(encoding="utf-8"),
+        )
+
+    def write_plane(self, index, frame):
+        """Write one acquired frame at *index* and flush it durably to disk."""
+        if self._closed:
+            raise ValueError("Cannot write to a closed ImageCubeStreamWriter.")
+        if not 0 <= index < self.num_planes:
+            raise ValueError(
+                f"Plane index {index} is out of range for {self.num_planes} planes."
+            )
+
+        frame = np.asarray(frame)
+        if self._dataset is None:
+            if self.dtype is None:
+                self.dtype = frame.dtype
+            else:
+                frame = frame.astype(self.dtype, copy=False)
+            chunk_shape = (1,) + frame.shape
+            self._dataset = self._handle.create_dataset(
+                _HDF5_DATA_KEY,
+                shape=(self.num_planes,) + frame.shape,
+                dtype=self.dtype,
+                chunks=chunk_shape,
+                compression="gzip",
+                compression_opts=4,
+                shuffle=True,
+            )
+            self._frame_shape = frame.shape
+        else:
+            frame = frame.astype(self.dtype, copy=False)
+            if frame.shape != self._frame_shape:
+                raise ValueError(
+                    "All streamed planes must have the same shape "
+                    f"(expected {self._frame_shape}, got {frame.shape})."
+                )
+
+        self._dataset[index] = frame
+        self._handle.flush()
+
+        self.metadata["planes_written"] = max(
+            self.metadata.get("planes_written", 0), index + 1
+        )
+        self._write_metadata_json()
+        self._handle.flush()
+
+    def update_metadata(self, metadata):
+        """Merge *metadata* into the file's metadata without touching
+        ``scan_complete`` -- for bookkeeping only known partway through a
+        scan (e.g. whether it was stopped by the user).
+        """
+        if self._closed:
+            raise ValueError("Cannot update a closed ImageCubeStreamWriter.")
+        self.metadata.update(metadata)
+        self._write_metadata_json()
+        self._handle.flush()
+
+    def finalize(self, metadata=None):
+        """Merge any final metadata, mark the file complete, and close it.
+
+        This is the only method that sets ``scan_complete = True``. A file
+        that never reaches this call -- because the process was killed, an
+        exception propagated, or a caller simply forgot -- stays marked
+        incomplete: completion is never inferred from a clean exit, only
+        recorded explicitly.
+        """
+        if self._closed:
+            raise ValueError("Cannot finalize a closed ImageCubeStreamWriter.")
+        if metadata:
+            self.metadata.update(metadata)
+        self.metadata["scan_complete"] = True
+        self._write_metadata_json()
+        self.close()
+
+    def close(self):
+        """Flush and close the file as-is, without changing scan_complete."""
+        if self._closed:
+            return
+        self._handle.flush()
+        self._handle.close()
+        self._closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+        return False

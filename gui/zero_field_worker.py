@@ -1,6 +1,7 @@
 """Background worker for the ZeroFieldExperiment."""
 
 import logging
+from pathlib import Path
 
 import numpy as np
 
@@ -11,6 +12,24 @@ from framework.fluorescence import mean_fluorescence
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _is_hdf5_path(filename):
+    return Path(filename).suffix.lower() in (".h5", ".hdf5")
+
+
+def _atomic_save_hdf5(cube, path):
+    """Save *cube* to *path* via a temp-file-then-rename so a crash exactly
+    mid-write can't corrupt whatever was already durably there before.
+
+    The temp name inserts ``.partial`` before the suffix (``avg.partial.h5``,
+    not ``avg.h5.partial``) so it still ends in ``.h5`` -- ImageCube.save()
+    dispatches on suffix, and a name ending in ``.partial`` would silently
+    route through the .npz writer instead.
+    """
+    partial_path = path.with_name(f"{path.stem}.partial{path.suffix}")
+    cube.save(partial_path)
+    partial_path.replace(path)
 
 
 class ZeroFieldWorker(QObject):
@@ -49,6 +68,7 @@ class ZeroFieldWorker(QObject):
 
     def start(self):
         try:
+            streaming = _is_hdf5_path(self.output_path)
             self.experiment = ZeroFieldExperiment(
                 hardware_manager=self.hardware_manager,
                 camera=self.camera,
@@ -68,12 +88,20 @@ class ZeroFieldWorker(QObject):
                 num_scans=self.config.get("num_scans", 1),
                 save_raw_scans=self.config.get("save_raw_scans", False),
                 raw_scan_saver=self._save_raw_scan,
+                # HDF5 only -- streaming needs random-access writes .npz
+                # can't do (see ImageCube.open_streaming_write). A non-.h5
+                # destination falls back to exactly today's behavior: no
+                # incremental writes anywhere, one save at the very end.
+                stream_scan_path=self._raw_scan_path if streaming else None,
             )
             if self._stop_requested:
                 self.experiment.stop()
             cube = self.experiment.run()
             if cube.data is not None:
-                cube.save(self.output_path)
+                if streaming:
+                    _atomic_save_hdf5(cube, self.output_path)
+                else:
+                    cube.save(self.output_path)
                 LOGGER.info("Average ImageCube saved: %s", self.output_path)
             self.finished_signal.emit(
                 cube,
@@ -117,12 +145,22 @@ class ZeroFieldWorker(QObject):
         self.scan_started_signal.emit(current, total)
 
     def _on_scan_completed(self, image_cube, current, total):
+        if _is_hdf5_path(self.output_path):
+            # Persist the running average after every completed scan, not
+            # just once at the very end -- closes the gap where several
+            # scans finish, then a crash loses all of them because nothing
+            # had reached disk yet.
+            _atomic_save_hdf5(image_cube, self.output_path)
+            LOGGER.info("Running average persisted: %s", self.output_path)
         self.scan_completed_signal.emit(image_cube, current, total)
 
-    def _save_raw_scan(self, scan_index, image_cube):
-        raw_path = self.output_path.with_name(
+    def _raw_scan_path(self, scan_index):
+        return self.output_path.with_name(
             f"{self.output_path.stem.rsplit('_average', 1)[0]}"
             f"_scan_{scan_index:03d}{self.output_path.suffix}"
         )
+
+    def _save_raw_scan(self, scan_index, image_cube):
+        raw_path = self._raw_scan_path(scan_index)
         image_cube.save(raw_path)
         return raw_path.name

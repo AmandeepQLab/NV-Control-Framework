@@ -49,6 +49,7 @@ class ZeroFieldExperiment(ScanExperiment):
         save_raw_scans=False,
         raw_scan_saver=None,
         zero_other_axes=True,
+        stream_scan_path=None,
     ):
         config = {
             "settling_time_ms": settling_time_ms,
@@ -97,6 +98,18 @@ class ZeroFieldExperiment(ScanExperiment):
         self.raw_scan_saver = raw_scan_saver
         self.raw_scan_filenames = []
         self.zero_other_axes = zero_other_axes
+        # Optional callable: scan_index -> Path (or None to skip streaming
+        # for that scan). When set, each scan's frames are written to disk
+        # incrementally as they're acquired -- HDF5 only, since streaming
+        # needs random-access writes .npz has no equivalent for -- so the
+        # caller (ZeroFieldWorker) only supplies this for an .h5 destination.
+        self.stream_scan_path = stream_scan_path
+        self._stream_writer = None
+        # Path streaming last wrote to (or None), read by run() right after
+        # _run_single_sweep() returns to decide whether the raw_scan_saver
+        # callback would be a redundant, riskier rewrite of an already
+        # safely-written file.
+        self._last_scan_stream_path = None
         self._configured_field_mT = None
         self._resolved_non_swept_field_mT = None
         # Captured once, from the first scan of a run: what the magnet was
@@ -220,8 +233,9 @@ class ZeroFieldExperiment(ScanExperiment):
                 if self.scan_started_callback is not None:
                     self.scan_started_callback(scan_index, scan_count)
 
-                self._run_single_sweep()
+                self._run_single_sweep(scan_index)
                 acquired_cube = self.image_cube
+                stream_path = self._last_scan_stream_path
                 self._finalize_image_cube_metadata(acquired_cube)
                 self._validate_image_cube(acquired_cube)
                 LOGGER.info("Scan %d/%d acquired.", scan_index, scan_count)
@@ -245,13 +259,28 @@ class ZeroFieldExperiment(ScanExperiment):
                 LOGGER.info("Running average updated.")
 
                 if self.save_raw_scans:
-                    if self.raw_scan_saver is None:
+                    if stream_path is not None:
+                        # Streaming already wrote and finalized this scan's
+                        # file incrementally; re-saving it via raw_scan_saver
+                        # would be a redundant whole-cube rewrite that could
+                        # corrupt a file streaming just safely finished.
+                        filename = stream_path.name
+                    elif self.raw_scan_saver is not None:
+                        filename = self.raw_scan_saver(scan_index, acquired_cube)
+                    else:
                         raise RuntimeError(
                             "Saving raw Zero Field scans requires a raw scan saver."
                         )
-                    filename = self.raw_scan_saver(scan_index, acquired_cube)
                     self.raw_scan_filenames.append(str(filename))
                     LOGGER.info("Raw scan saved: %s", filename)
+                elif stream_path is not None:
+                    # Streaming always writes a per-scan file for crash
+                    # safety regardless of save_raw_scans; if the user
+                    # didn't ask to keep it, remove it now that its data is
+                    # safely folded into the running average -- matching
+                    # the existing contract of no permanent per-scan file
+                    # unless requested.
+                    stream_path.unlink(missing_ok=True)
 
                 self._set_averaging_metadata(averaged_cube, completed_scans)
                 if self.scan_completed_callback is not None:
@@ -271,7 +300,7 @@ class ZeroFieldExperiment(ScanExperiment):
                 self.image_cube = averaged_cube
         return self.image_cube
 
-    def _run_single_sweep(self):
+    def _run_single_sweep(self, scan_index):
         """Acquire exactly one averaged fluorescence image per field value."""
         self.state = self.RUNNING
         self.start_time = time.time()
@@ -282,11 +311,26 @@ class ZeroFieldExperiment(ScanExperiment):
             scan_axis_unit=self.scan_axis_unit,
             scan_axis_values=[],
         )
+        self._stream_writer = None
+        self._last_scan_stream_path = None
 
         try:
             self.setup_scan()
 
-            for field in self.scan_vector:
+            if self.stream_scan_path is not None:
+                stream_path = self.stream_scan_path(scan_index)
+                if stream_path is not None:
+                    self._stream_writer = ImageCube.open_streaming_write(
+                        stream_path,
+                        self.field_points,
+                        scan_axis_name=self.scan_axis_name,
+                        scan_axis_unit=self.scan_axis_unit,
+                        scan_axis_values=self.scan_vector,
+                        metadata=dict(self.metadata),
+                    )
+                    self._last_scan_stream_path = stream_path
+
+            for point_index, field in enumerate(self.scan_vector):
                 if self.stop_requested or not self.running:
                     break
 
@@ -302,6 +346,8 @@ class ZeroFieldExperiment(ScanExperiment):
 
                 # Store measurement exactly once for this field value.
                 self.image_cube.add(averaged_image)
+                if self._stream_writer is not None:
+                    self._stream_writer.write_plane(point_index, averaged_image)
 
                 signal = self.process_frame(averaged_image)
                 self.scan_signal.append(signal)
@@ -318,6 +364,18 @@ class ZeroFieldExperiment(ScanExperiment):
 
         finally:
             self.end_time = time.time()
+            if self._stream_writer is not None:
+                writer = self._stream_writer
+                self._stream_writer = None
+                # scan_complete only means "every field point was written";
+                # a cooperative stop and a crash both leave it False, so
+                # stopped_by_user is what distinguishes intent from failure.
+                swept_fully = len(self.scan_signal) == len(self.scan_vector)
+                writer.update_metadata({"stopped_by_user": bool(self.stop_requested)})
+                if swept_fully:
+                    writer.finalize()
+                else:
+                    writer.close()
             try:
                 self.cleanup_scan()
             finally:
@@ -341,12 +399,23 @@ class ZeroFieldExperiment(ScanExperiment):
 
     def _set_averaging_metadata(self, image_cube, completed_scans):
         metadata = dict(image_cube.metadata)
+        scan_count = self.num_scans if self.averaging_enabled else 1
         metadata.update(
             {
                 "averaging_enabled": self.averaging_enabled,
                 "num_scans": self.num_scans,
                 "save_raw_scans": self.save_raw_scans,
                 "completed_scans": completed_scans,
+                # True only once every requested scan has completed --
+                # distinct from a single scan's own scan_complete (written
+                # by the streaming writer), which just means that one
+                # sweep reached its last field point.
+                "experiment_complete": completed_scans == scan_count,
+                # A stop that arrives after everything already finished
+                # doesn't make the result incomplete -- experiment_complete
+                # is purely data-driven -- but it's still worth recording
+                # that a stop was requested at some point during the run.
+                "stopped_by_user": bool(self.stop_requested),
                 # Re-read fresh on every call (like the accumulator above),
                 # not written once by _set_static_metadata(): a flat key
                 # there would freeze at scan 1's value once _new_averaged_cube()

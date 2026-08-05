@@ -9,6 +9,7 @@ import numpy as np
 from experiments.zero_field_experiment import ZeroFieldExperiment
 from framework.analysis.zero_field import mean_fluorescence_vs_field
 from framework.camera_ownership import register_camera_state_restorer
+from framework.image_cube import ImageCube
 from gui.zero_field_window import ZeroFieldWindow
 from gui.zero_field_worker import ZeroFieldWorker
 from gui.image_inspection import line_profile, pixel_value
@@ -590,6 +591,151 @@ class ZeroFieldAveragingTests(unittest.TestCase):
             cube.metadata["initial_magnet_vector_mT"],
             {"x": 0.0, "y": 0.0, "z": 0.0},
         )
+
+
+class ZeroFieldStreamingTests(unittest.TestCase):
+    """stream_scan_path: incremental per-scan writes, gated to .h5 destinations."""
+
+    def test_streaming_matches_non_streaming_regression(self):
+        def make_frames():
+            return [
+                np.full((2, 2), 1.0), np.full((2, 2), 3.0),
+                np.full((2, 2), 5.0), np.full((2, 2), 7.0),
+            ]
+
+        baseline_cube, _ = run_experiment(
+            make_frames(), averaging_enabled=True, num_scans=2,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            def stream_path(scan_index):
+                return Path(directory) / f"scan_{scan_index:03d}.h5"
+
+            streamed_cube, _ = run_experiment(
+                make_frames(), averaging_enabled=True, num_scans=2,
+                stream_scan_path=stream_path,
+            )
+
+        np.testing.assert_allclose(streamed_cube.data, baseline_cube.data)
+        self.assertEqual(
+            streamed_cube.metadata["completed_scans"],
+            baseline_cube.metadata["completed_scans"],
+        )
+
+    def test_interrupted_scan_leaves_correct_per_scan_streaming_state(self):
+        # Scan 1 completes both points; scan 2 acquires one point, then the
+        # camera fails -- simulating a crash partway through the second scan
+        # of a multi-scan average.
+        frames = [
+            np.full((2, 2), 1.0), np.full((2, 2), 2.0),
+            np.full((2, 2), 3.0), RuntimeError("camera failed"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            def stream_path(scan_index):
+                return Path(directory) / f"scan_{scan_index:03d}.h5"
+
+            experiment = ZeroFieldExperiment(
+                hardware_manager=None,
+                camera=FakeCamera(frames),
+                magnet=FakeMagnet(),
+                field_start=-1.0,
+                field_stop=1.0,
+                field_points=2,
+                field_axis="X",
+                settling_time_ms=0,
+                averages=1,
+                averaging_enabled=True,
+                num_scans=3,
+                save_raw_scans=True,
+                stream_scan_path=stream_path,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "camera failed"):
+                experiment.run()
+
+            # Scan 1 completed and was recorded; scan 2 never got that far.
+            self.assertEqual(experiment.raw_scan_filenames, ["scan_001.h5"])
+
+            scan1 = ImageCube.load(Path(directory) / "scan_001.h5")
+            self.assertTrue(scan1.metadata["scan_complete"])
+            self.assertEqual(scan1.metadata["planes_written"], 2)
+
+            scan2 = ImageCube.load(Path(directory) / "scan_002.h5")
+            self.assertFalse(scan2.metadata["scan_complete"])
+            self.assertEqual(scan2.metadata["planes_written"], 1)
+            np.testing.assert_array_equal(scan2.data[0], np.full((2, 2), 3.0))
+
+    def test_save_raw_scans_false_deletes_streamed_file_after_folding_in(self):
+        frames = [np.full((2, 2), 1.0), np.full((2, 2), 3.0)]
+        with tempfile.TemporaryDirectory() as directory:
+            def stream_path(scan_index):
+                return Path(directory) / f"scan_{scan_index:03d}.h5"
+
+            run_experiment(frames, stream_scan_path=stream_path)
+
+            self.assertFalse((Path(directory) / "scan_001.h5").exists())
+
+    def test_save_raw_scans_true_keeps_streamed_file(self):
+        frames = [np.full((2, 2), 1.0), np.full((2, 2), 3.0)]
+        with tempfile.TemporaryDirectory() as directory:
+            def stream_path(scan_index):
+                return Path(directory) / f"scan_{scan_index:03d}.h5"
+
+            cube, experiment = run_experiment(
+                frames, save_raw_scans=True, stream_scan_path=stream_path,
+            )
+
+            self.assertEqual(experiment.raw_scan_filenames, ["scan_001.h5"])
+            raw = ImageCube.load(Path(directory) / "scan_001.h5")
+            self.assertTrue(raw.metadata["scan_complete"])
+            np.testing.assert_allclose(raw.data, cube.data)
+
+    def test_worker_persists_running_average_after_each_scan_and_survives_a_crash(self):
+        # Scan 1 completes; scan 2 fails mid-sweep. Exercises the whole
+        # ZeroFieldWorker wiring, not just ZeroFieldExperiment directly.
+        frames = [
+            np.full((2, 2), 1.0), np.full((2, 2), 2.0),
+            np.full((2, 2), 3.0), RuntimeError("camera failed"),
+        ]
+        config = {
+            "field_start": -1.0,
+            "field_stop": 1.0,
+            "field_points": 2,
+            "field_axis": "X",
+            "settling_time_ms": 0,
+            "averages": 1,
+            "averaging_enabled": True,
+            "num_scans": 3,
+            "save_raw_scans": False,
+        }
+        errors = []
+
+        with tempfile.TemporaryDirectory() as directory:
+            average_path = Path(directory) / "zero_field_test_average.h5"
+            worker = ZeroFieldWorker(
+                None, FakeCamera(frames), FakeMagnet(), config, None, {}, average_path,
+            )
+            worker.error_signal.connect(errors.append)
+            worker.start()
+
+            self.assertEqual(len(errors), 1)
+            self.assertIn("camera failed", errors[0])
+
+            self.assertTrue(average_path.exists())
+            persisted = ImageCube.load(average_path)
+            self.assertEqual(persisted.metadata["completed_scans"], 1)
+            self.assertFalse(persisted.metadata["experiment_complete"])
+            np.testing.assert_allclose(
+                persisted.data,
+                np.stack([np.full((2, 2), 1.0), np.full((2, 2), 2.0)]),
+            )
+
+            # save_raw_scans is False: scan 1 completed and folded into the
+            # average, so its streamed file (not requested to be kept) is
+            # gone; scan 2 never completed, so its file -- the crash-safety
+            # artifact -- survives.
+            self.assertFalse((Path(directory) / "zero_field_test_scan_001.h5").exists())
+            self.assertTrue((Path(directory) / "zero_field_test_scan_002.h5").exists())
 
 
 if __name__ == "__main__":
