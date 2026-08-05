@@ -78,6 +78,33 @@ def _decode(value):
     return value.decode("utf-8") if isinstance(value, bytes) else value
 
 
+def _reject_incomplete_hdf5(path, metadata, allow_partial_scans):
+    """Refuse a streamed .h5 scan whose scan_complete metadata is False.
+
+    Its data dataset is pre-allocated to the full configured plane count;
+    any planes beyond what was actually acquired are HDF5 fill-value
+    placeholders (0 for a float dataset), byte-indistinguishable from real
+    frames to code that only looks at shape. Averaging them in would
+    silently corrupt the result.
+
+    metadata.get("scan_complete", True) defaults to trusting the file when
+    the key is absent -- not because absence is assumed harmless, but
+    because it specifically means this file was never written by
+    ImageCubeStreamWriter. A plain ImageCube.save() (the only other way an
+    .h5 file gets created) is a single atomic whole-cube write with no
+    partial-write window and never sets this key at all, so "key absent" is
+    a positive signal ("this is not a streamed file"), not an unknown.
+    """
+    if not allow_partial_scans and not metadata.get("scan_complete", True):
+        raise ValueError(
+            f"{path}: scan_complete is False in this file's metadata -- it "
+            "was left by an interrupted or stopped scan, and any frames "
+            "past its planes_written count are HDF5 fill-value "
+            "placeholders, not real data. Pass allow_partial_scans=True to "
+            "use it anyway."
+        )
+
+
 def _atomic_save_npy(path, array):
     """Write *array* to *path* so a completed file is never truncated.
 
@@ -139,11 +166,13 @@ class _NpzPlaneSource:
 class _Hdf5PlaneSource:
     """Streams planes from an ``.h5``/``.hdf5`` scan file via ImageCube."""
 
-    def __init__(self, path):
+    def __init__(self, path, allow_partial_scans=False):
         self.path = Path(path)
         self.shape = ImageCube.peek_shape(self.path)
         with h5py.File(self.path, "r") as handle:
             self.dtype = handle["data"].dtype
+            metadata = json.loads(_decode(handle["metadata_json"][()]))
+        _reject_incomplete_hdf5(self.path, metadata, allow_partial_scans)
 
     def read_plane(self, index):
         return np.asarray(ImageCube.load_plane(self.path, index))
@@ -152,16 +181,22 @@ class _Hdf5PlaneSource:
         pass  # ImageCube.load_plane opens and closes its own handle.
 
 
-def _open_plane_source(path):
+def _open_plane_source(path, allow_partial_scans=False):
     path = Path(path)
-    return _Hdf5PlaneSource(path) if _is_hdf5_path(path) else _NpzPlaneSource(path)
+    return (
+        _Hdf5PlaneSource(path, allow_partial_scans=allow_partial_scans)
+        if _is_hdf5_path(path) else _NpzPlaneSource(path)
+    )
 
 
-def _open_sources(scan_paths):
+def _open_sources(scan_paths, allow_partial_scans=False):
     scan_paths = [Path(path) for path in scan_paths]
     if not scan_paths:
         raise ValueError("No scan files were supplied.")
-    sources = [_open_plane_source(path) for path in scan_paths]
+    sources = [
+        _open_plane_source(path, allow_partial_scans=allow_partial_scans)
+        for path in scan_paths
+    ]
     shapes = {source.shape for source in sources}
     dtypes = {source.dtype for source in sources}
     if len(shapes) != 1 or len(dtypes) != 1:
@@ -213,9 +248,10 @@ def _read_npz_static_members(path):
     }
 
 
-def _read_hdf5_static_members(path):
+def _read_hdf5_static_members(path, allow_partial_scans=False):
     with h5py.File(path, "r") as handle:
         metadata = json.loads(_decode(handle["metadata_json"][()]))
+        _reject_incomplete_hdf5(path, metadata, allow_partial_scans)
         axes = json.loads(_decode(handle["axes_json"][()]))
         experiment_type = (
             None if handle.attrs.get("experiment_type_is_none", False)
@@ -243,11 +279,11 @@ def _read_hdf5_static_members(path):
     }
 
 
-def _read_static_members(path):
+def _read_static_members(path, allow_partial_scans=False):
     path = Path(path)
     return (
-        _read_hdf5_static_members(path) if _is_hdf5_path(path)
-        else _read_npz_static_members(path)
+        _read_hdf5_static_members(path, allow_partial_scans=allow_partial_scans)
+        if _is_hdf5_path(path) else _read_npz_static_members(path)
     )
 
 
@@ -273,22 +309,29 @@ def _frame_mean(plane, roi):
 # Stage 1: single-pass streaming average + ROI report
 # ---------------------------------------------------------------------
 
-def average_scans(scan_paths, output_path, report_path, *, roi=None):
+def average_scans(scan_paths, output_path, report_path, *, roi=None, allow_partial_scans=False):
     """Average *scan_paths* incrementally and write the cube and ROI report.
 
     *roi* overrides the ROI used for the report's fluorescence numbers; if
     omitted it is read from the first scan's ``metadata["acquisition_roi"]``,
     raising if that key is absent.
+
+    *allow_partial_scans*, if not set, refuses any ``.h5`` input whose
+    ``scan_complete`` metadata is False (left by an interrupted or stopped
+    scan) -- its data past ``planes_written`` is HDF5 fill-value, not real
+    frames, so averaging it in would silently corrupt the result.
     """
     output_path = Path(output_path)
     _reject_hdf5_output(output_path)
     report_path = Path(report_path)
-    scan_paths, sources, shape, dtype = _open_sources(scan_paths)
+    scan_paths, sources, shape, dtype = _open_sources(
+        scan_paths, allow_partial_scans=allow_partial_scans
+    )
     try:
         if dtype != np.dtype("float64"):
             raise ValueError(f"Expected float64 scan data, received {dtype}.")
 
-        static = _read_static_members(scan_paths[0])
+        static = _read_static_members(scan_paths[0], allow_partial_scans=allow_partial_scans)
         metadata = dict(static["metadata"])
         metadata.update(
             {
@@ -367,15 +410,19 @@ def average_scans(scan_paths, output_path, report_path, *, roi=None):
 # Stage 2: checkpointed, resumable plane-range averaging
 # ---------------------------------------------------------------------
 
-def average_plane_range(scan_paths, planes_dir, start, count):
+def average_plane_range(scan_paths, planes_dir, start, count, *, allow_partial_scans=False):
     """Average field points ``[start, start + count)`` into standalone
     per-plane ``.npy`` files under *planes_dir*, skipping points already
     completed by a prior invocation. Each plane is written atomically, so a
     file existing at the final name always means it was fully written.
+
+    *allow_partial_scans*: see :func:`average_scans`.
     """
     planes_dir = Path(planes_dir)
     planes_dir.mkdir(parents=True, exist_ok=True)
-    scan_paths, sources, shape, dtype = _open_sources(scan_paths)
+    scan_paths, sources, shape, dtype = _open_sources(
+        scan_paths, allow_partial_scans=allow_partial_scans
+    )
     try:
         stop = min(start + count, shape[0])
         for point in range(start, stop):
@@ -401,7 +448,10 @@ def average_plane_range(scan_paths, planes_dir, start, count):
 # Stage 3: package checkpointed planes into one cube (+ optional report)
 # ---------------------------------------------------------------------
 
-def package_averaged_planes(scan_paths, planes_dir, output_path, report_dir=None, *, roi=None):
+def package_averaged_planes(
+    scan_paths, planes_dir, output_path, report_dir=None, *,
+    roi=None, allow_partial_scans=False,
+):
     """Assemble checkpointed per-plane ``.npy`` files into one averaged cube.
 
     *scan_paths* supplies axes/metadata/scan-axis info (read from the first
@@ -412,6 +462,11 @@ def package_averaged_planes(scan_paths, planes_dir, output_path, report_dir=None
     images, symmetry analysis, integrity checklist). *roi*, if given, crops
     the report's fluorescence numbers to that region; the default (``None``)
     uses the full frame mean, matching the original packaging script.
+
+    *allow_partial_scans*: see :func:`average_scans`. Applies to
+    *scan_paths[0]* here, since that's the only one read (for metadata/
+    axes/scan-axis values, which determine the expected plane count below)
+    -- the actual averaged data comes from *planes_dir*, not *scan_paths*.
     """
     scan_paths = [Path(path) for path in scan_paths]
     planes_dir = Path(planes_dir)
@@ -420,7 +475,7 @@ def package_averaged_planes(scan_paths, planes_dir, output_path, report_dir=None
     if not scan_paths:
         raise ValueError("No scan files were supplied.")
 
-    static = _read_static_members(scan_paths[0])
+    static = _read_static_members(scan_paths[0], allow_partial_scans=allow_partial_scans)
     fields = np.asarray(static["scan_axis_values"], dtype=float)
 
     plane_paths = [planes_dir / f"plane_{index:03d}.npy" for index in range(len(fields))]

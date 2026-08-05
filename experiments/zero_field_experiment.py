@@ -240,7 +240,17 @@ class ZeroFieldExperiment(ScanExperiment):
                 self._validate_image_cube(acquired_cube)
                 LOGGER.info("Scan %d/%d acquired.", scan_index, scan_count)
 
-                if acquired_cube.data is None:
+                # A cooperative stop can leave acquired_cube with some but
+                # not all field_points frames -- that's an intentional
+                # partial result (see _validate_image_cube), not a fault,
+                # but it must never be folded into the multi-scan average:
+                # _new_averaged_cube/_update_running_average both assume
+                # every acquired_cube they touch is full-shape.
+                incomplete_sweep = (
+                    acquired_cube.data is None
+                    or acquired_cube.data.shape[0] != self.field_points
+                )
+                if incomplete_sweep:
                     if averaged_cube is None:
                         averaged_cube = acquired_cube
                     break
@@ -364,6 +374,28 @@ class ZeroFieldExperiment(ScanExperiment):
 
         finally:
             self.end_time = time.time()
+            # A cooperative stop (or an exception, though that propagates
+            # out before anything downstream reads this cube) can leave
+            # fewer frames than field_points configured. scan_axis_values
+            # and field_values_gauss are written in full at the start of
+            # setup_scan(), before any point is acquired, and never
+            # revisited -- keep them describing only the frames actually
+            # stored, not the full configured sweep. An ImageCube whose
+            # scan-axis length disagrees with its own frame count is
+            # invalid input to downstream analysis (mean_fluorescence_vs_field
+            # requires len(scan_axis_values) == len(data)) regardless of why
+            # acquisition stopped early.
+            frame_count = (
+                0 if self.image_cube.data is None else self.image_cube.data.shape[0]
+            )
+            if frame_count != len(self.scan_vector):
+                self.image_cube.scan_axis_values = self.scan_vector[:frame_count]
+                metadata = dict(self.image_cube.metadata)
+                if "field_values_gauss" in metadata:
+                    metadata["field_values_gauss"] = list(
+                        metadata["field_values_gauss"]
+                    )[:frame_count]
+                self.image_cube.metadata = metadata
             if self._stream_writer is not None:
                 writer = self._stream_writer
                 self._stream_writer = None
@@ -479,15 +511,28 @@ class ZeroFieldExperiment(ScanExperiment):
         image_cube.metadata = metadata
 
     def _validate_image_cube(self, image_cube):
-        """Reject incomplete or structurally inconsistent acquired datasets."""
+        """Reject incomplete or structurally inconsistent acquired datasets.
+
+        A cooperative stop deliberately yields fewer than field_points
+        frames -- that's the correct, intentional result, not a fault -- so
+        the frame-count-vs-field_points cardinality check is skipped in that
+        case. Everything else (structural type, non-zero dimensions, and
+        the data/metadata consistency checks below) stays unconditional:
+        those catch real bugs regardless of why acquisition stopped, and
+        the field_values_gauss length check in particular naturally stays
+        satisfied because _run_single_sweep already truncates
+        scan_axis_values/field_values_gauss to the actual acquired count.
+        """
         data = image_cube.data
+        if self.stop_requested and data is None:
+            return
         if not isinstance(data, np.ndarray) or data.ndim != 3:
             raise ValueError(
                 "Zero Field ImageCube must contain a 3-D stack of acquired frames."
             )
 
         frame_count, height, width = data.shape
-        if frame_count != self.field_points:
+        if not self.stop_requested and frame_count != self.field_points:
             raise ValueError(
                 "Zero Field ImageCube frame count "
                 f"({frame_count}) does not match field point count "

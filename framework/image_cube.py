@@ -557,6 +557,19 @@ class ImageCubeStreamWriter:
         """
         if self._closed:
             raise ValueError("Cannot finalize a closed ImageCubeStreamWriter.")
+        planes_written = self.metadata.get("planes_written", 0)
+        if planes_written != self.num_planes:
+            # Guards the same invariant this whole class exists to protect:
+            # scan_complete must never be claimed for a file that doesn't
+            # actually hold num_planes real frames. Today's only caller
+            # (ZeroFieldExperiment) already only calls finalize() once every
+            # point has been written, so this should never fire in
+            # practice -- it's here to catch a caller bug loudly instead of
+            # letting a mismatched "complete" file reach disk.
+            raise ValueError(
+                f"Cannot finalize: only {planes_written} of {self.num_planes} "
+                "planes were written. Call close() instead for a partial scan."
+            )
         if metadata:
             self.metadata.update(metadata)
         self.metadata["scan_complete"] = True
@@ -564,12 +577,45 @@ class ImageCubeStreamWriter:
         self.close()
 
     def close(self):
-        """Flush and close the file as-is, without changing scan_complete."""
+        """Flush and close the file, without changing scan_complete.
+
+        If the writer is closing incomplete (scan_complete is still False),
+        truncates the data and scan_axis_values datasets to exactly the
+        planes actually written first. Without this, a partial file's data
+        dataset stays pre-allocated to num_planes -- HDF5 fills unwritten
+        chunks with a fill value (0 for a float dataset) that is byte-
+        indistinguishable from real acquired data to any reader that
+        doesn't separately check planes_written/scan_complete. A partial
+        file must contain only real data, not fabricated frames.
+        """
         if self._closed:
             return
+        if not self.metadata.get("scan_complete", False):
+            self._truncate_to_planes_written()
         self._handle.flush()
         self._handle.close()
         self._closed = True
+
+    def _truncate_to_planes_written(self):
+        planes_written = self.metadata.get("planes_written", 0)
+        if self._dataset is None or planes_written == self.num_planes:
+            # Nothing written yet (no dataset was ever created), or already
+            # full -- nothing to truncate either way.
+            return
+        # The data dataset is chunked, which is all resize() requires --
+        # h5py defaults maxshape to the initial shape when not given
+        # explicitly, and that default already permits shrinking (it only
+        # blocks growing beyond it), confirmed empirically against this
+        # exact creation pattern before relying on it here.
+        self._dataset.resize((planes_written,) + self._frame_shape)
+        # scan_axis_values is written in full at open time (the complete
+        # planned sweep is known upfront) as a plain, non-chunked dataset,
+        # so it isn't resizable -- recreate it truncated instead.
+        existing = self._handle[_HDF5_SCAN_AXIS_VALUES_KEY][()]
+        del self._handle[_HDF5_SCAN_AXIS_VALUES_KEY]
+        self._handle.create_dataset(
+            _HDF5_SCAN_AXIS_VALUES_KEY, data=existing[:planes_written]
+        )
 
     def __enter__(self):
         return self

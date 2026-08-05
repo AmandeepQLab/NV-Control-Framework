@@ -246,12 +246,25 @@ class ImageCubeStreamingTests(unittest.TestCase):
         self.assertFalse(cube.metadata["scan_complete"])
         self.assertEqual(cube.metadata["planes_written"], 2)
         self.assertEqual(cube.metadata["experiment_name"], "Zero Field")
+        # close() truncates data and scan_axis_values to the planes actually
+        # written -- a partial file must contain only real data, never an
+        # HDF5 fill-value plane indistinguishable from a genuine frame.
+        self.assertEqual(cube.data.shape, (2, 2, 3))
         np.testing.assert_array_equal(cube.data[0], self.planes[0])
         np.testing.assert_array_equal(cube.data[1], self.planes[1])
-        # Plane 2 was never written -- HDF5 never allocates that chunk, so
-        # it reads back as zero-fill, not as a signal that anything failed.
-        np.testing.assert_array_equal(cube.data[2], np.zeros((2, 3)))
-        self.assertEqual(cube.data.shape, (3, 2, 3))
+        self.assertEqual(list(cube.scan_axis_values), [-1.0, 0.0])
+
+    def test_finalize_rejects_a_writer_that_never_reached_num_planes(self):
+        writer = ImageCube.open_streaming_write(self.path, num_planes=3)
+        writer.write_plane(0, self.planes[0])
+
+        with self.assertRaises(ValueError):
+            writer.finalize()
+
+        writer.close()
+        cube = ImageCube.load(self.path)
+        self.assertFalse(cube.metadata["scan_complete"])
+        self.assertEqual(cube.data.shape, (1, 2, 3))
 
     def test_finalize_marks_complete_and_merges_final_metadata(self):
         writer = ImageCube.open_streaming_write(

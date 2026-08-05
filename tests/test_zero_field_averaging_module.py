@@ -267,5 +267,84 @@ class PackageAveragedPlanesTests(unittest.TestCase):
         self.assertFalse((self.directory / "packaged.h5.partial").exists())
 
 
+def _make_partial_h5_scan(path, num_planes=3, planes_written=2):
+    """A streamed .h5 scan left incomplete (scan_complete=False): closed
+    without finalize() after fewer than num_planes were written."""
+    writer = ImageCube.open_streaming_write(
+        path,
+        num_planes,
+        scan_axis_name="Magnetic Field",
+        scan_axis_unit="G",
+        scan_axis_values=[-1.0, 0.0, 1.0][:num_planes],
+        metadata={
+            "acquisition_roi": (0, 0, 2, 2),
+            "scan_parameters": {"field_axis": "Y"},
+        },
+        experiment_type="Zero Field",
+    )
+    for index in range(planes_written):
+        writer.write_plane(index, np.full((2, 2), float(index + 1)))
+    writer.close()
+    return path
+
+
+class AllowPartialScansTests(unittest.TestCase):
+    """scan_complete=False .h5 scans must be refused by default, across all
+    three entry points, and only usable when explicitly opted in."""
+
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.directory, ignore_errors=True)
+
+    def test_average_scans_rejects_partial_input_by_default(self):
+        partial = _make_partial_h5_scan(self.directory / "partial.h5")
+
+        with self.assertRaises(ValueError):
+            average_scans(
+                [partial], self.directory / "avg.npz", self.directory / "report.txt"
+            )
+
+    def test_average_scans_accepts_partial_input_when_allowed(self):
+        # Two scans, each stopped after the same 2-of-3 planes -- once
+        # truncated on close(), both are genuinely shape-(2,2,2) files, so
+        # this exercises allow_partial_scans specifically, not just a
+        # shape mismatch _open_sources would already catch on its own.
+        first = _make_partial_h5_scan(self.directory / "scan_001.h5")
+        second = _make_partial_h5_scan(self.directory / "scan_002.h5")
+        output_path = self.directory / "avg.npz"
+        report_path = self.directory / "report.txt"
+
+        average_scans(
+            [first, second], output_path, report_path,
+            roi=(0, 0, 2, 2), allow_partial_scans=True,
+        )
+
+        loaded = ImageCube.load(output_path)
+        self.assertEqual(loaded.data.shape[0], 2)
+        np.testing.assert_allclose(
+            loaded.data, [np.full((2, 2), 1.0), np.full((2, 2), 2.0)]
+        )
+
+    def test_average_plane_range_rejects_partial_input_by_default(self):
+        partial = _make_partial_h5_scan(self.directory / "partial.h5")
+
+        with self.assertRaises(ValueError):
+            average_plane_range(
+                [partial], self.directory / "planes", start=0, count=10
+            )
+
+    def test_package_averaged_planes_rejects_partial_reference_scan_by_default(self):
+        partial = _make_partial_h5_scan(self.directory / "partial.h5")
+        planes_dir = self.directory / "planes"
+        planes_dir.mkdir()
+        for index in range(2):
+            np.save(planes_dir / f"plane_{index:03d}.npy", np.full((2, 2), float(index)))
+
+        with self.assertRaises(ValueError):
+            package_averaged_planes(
+                [partial], planes_dir, self.directory / "packaged.npz"
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -63,7 +63,7 @@ class ZeroFieldWidget(QWidget):
         field_layout.addLayout(axis_row)
 
         self.settling_time_spin = self._add_int(
-            field_layout, "Settling Time (ms):", 0, 600000, 500
+            field_layout, "Settling Time (ms):", 0, 600000, 100
         )
         self.averages_spin = self._add_int(
             field_layout, "Number of Averages:", 1, 100000, 1

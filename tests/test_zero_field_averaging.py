@@ -738,5 +738,126 @@ class ZeroFieldStreamingTests(unittest.TestCase):
             self.assertTrue((Path(directory) / "zero_field_test_scan_002.h5").exists())
 
 
+class StoppingCamera(FakeCamera):
+    """Calls .stop() on the experiment placed in holder["experiment"] after
+    supplying stop_after frames -- simulates a GUI Stop click landing
+    mid-sweep without a real thread. The holder indirection exists because
+    the camera must be constructed before the experiment that owns it."""
+
+    def __init__(self, frames, stop_after, holder):
+        super().__init__(frames)
+        self.stop_after = stop_after
+        self.holder = holder
+        self.snap_count = 0
+
+    def snap(self):
+        self.snap_count += 1
+        frame = super().snap()
+        if self.snap_count == self.stop_after:
+            self.holder["experiment"].stop()
+        return frame
+
+
+class ZeroFieldCooperativeStopTests(unittest.TestCase):
+    """A cooperative stop must end the run cleanly with a correctly-shaped
+    partial cube, not raise -- and must not corrupt a multi-scan average."""
+
+    def test_mid_sweep_stop_returns_partial_cube_without_raising(self):
+        holder = {}
+        frames = [np.full((2, 2), value) for value in (1, 2, 3, 4, 5)]
+        camera = StoppingCamera(frames, stop_after=3, holder=holder)
+        experiment = ZeroFieldExperiment(
+            hardware_manager=None,
+            camera=camera,
+            magnet=FakeMagnet(),
+            field_start=0.0,
+            field_stop=4.0,
+            field_points=5,
+            field_axis="X",
+            settling_time_ms=0,
+            averages=1,
+        )
+        holder["experiment"] = experiment
+
+        cube = experiment.run()
+
+        self.assertEqual(cube.data.shape[0], 3)
+        np.testing.assert_allclose(
+            cube.data, [np.full((2, 2), v) for v in (1, 2, 3)]
+        )
+        self.assertEqual(len(cube.scan_axis_values), 3)
+        self.assertEqual(len(cube.metadata["field_values_gauss"]), 3)
+        self.assertTrue(cube.metadata["stopped_by_user"])
+        self.assertFalse(cube.metadata["experiment_complete"])
+
+        # The actual GUI-facing regression this bug produces: analysis must
+        # not crash on a cube whose scan-axis length matches its (partial)
+        # data length.
+        fields, signals = mean_fluorescence_vs_field(cube)
+        self.assertEqual(len(fields), 3)
+        self.assertEqual(len(signals), 3)
+
+    def test_stop_before_any_frame_completes_without_raising(self):
+        holder = {}
+        experiment = ZeroFieldExperiment(
+            hardware_manager=None,
+            camera=FakeCamera([np.ones((2, 2))] * 5),
+            magnet=FakeMagnet(),
+            field_start=0.0,
+            field_stop=4.0,
+            field_points=5,
+            field_axis="X",
+            settling_time_ms=0,
+            averages=1,
+            # Fires after setup_scan() but before the first frame is
+            # captured -- the "started but zero frames" case.
+            scan_started_callback=lambda *_: holder["experiment"].stop(),
+        )
+        holder["experiment"] = experiment
+
+        cube = experiment.run()
+
+        self.assertIsNone(cube.data)
+        self.assertTrue(cube.metadata["stopped_by_user"])
+        self.assertFalse(cube.metadata["experiment_complete"])
+
+    def test_mid_sweep_stop_on_later_scan_does_not_corrupt_completed_average(self):
+        # Scan 1 completes both points; scan 2 stops after its first point.
+        # Regression test for the merge-into-average bug: without the
+        # incomplete_sweep guard in run(), this either assigns a
+        # wrong-shaped averaged_cube or crashes with a raw numpy broadcast
+        # error inside _update_running_average.
+        holder = {}
+        frames = [
+            np.full((2, 2), 1.0), np.full((2, 2), 2.0),  # scan 1 (complete)
+            np.full((2, 2), 9.0),                         # scan 2, point 1 only
+        ]
+        camera = StoppingCamera(frames, stop_after=3, holder=holder)
+        experiment = ZeroFieldExperiment(
+            hardware_manager=None,
+            camera=camera,
+            magnet=FakeMagnet(),
+            field_start=-1.0,
+            field_stop=1.0,
+            field_points=2,
+            field_axis="X",
+            settling_time_ms=0,
+            averages=1,
+            averaging_enabled=True,
+            num_scans=3,
+        )
+        holder["experiment"] = experiment
+
+        cube = experiment.run()
+
+        self.assertEqual(cube.data.shape[0], 2)
+        np.testing.assert_allclose(
+            cube.data, [np.full((2, 2), 1.0), np.full((2, 2), 2.0)]
+        )
+        self.assertEqual(cube.metadata["completed_scans"], 1)
+        self.assertTrue(cube.metadata["stopped_by_user"])
+        self.assertFalse(cube.metadata["experiment_complete"])
+
+
 if __name__ == "__main__":
     unittest.main()
