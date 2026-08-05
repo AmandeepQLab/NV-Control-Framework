@@ -21,6 +21,7 @@ ALLOWED_FILES = frozenset(
         "test_streaming_controller.py",
         "test_zero_field_analysis.py",
         "test_zero_field_averaging.py",
+        "test_zero_field_averaging_module.py",
     }
 )
 
