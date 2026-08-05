@@ -121,6 +121,17 @@ class AverageScansTests(unittest.TestCase):
         text = report_path.read_text(encoding="utf-8")
         self.assertIn("ROI used for fluorescence calculation: (1, 1, 3, 3)", text)
 
+    def test_rejects_hdf5_output_path(self):
+        paths = self._save_scans(".npz")
+
+        with self.assertRaises(ValueError):
+            average_scans(
+                paths, self.directory / "average.h5", self.directory / "report.txt"
+            )
+
+        self.assertFalse((self.directory / "average.h5").exists())
+        self.assertFalse((self.directory / "average.h5.partial").exists())
+
 
 class AtomicSaveNpyTests(unittest.TestCase):
     def test_failure_never_leaves_a_file_at_the_final_path(self):
@@ -245,6 +256,15 @@ class PackageAveragedPlanesTests(unittest.TestCase):
         self.assertIn(
             "Mean fluorescence was computed over the ROI (0, 0, 2, 2)", text
         )
+
+    def test_rejects_hdf5_output_path(self):
+        with self.assertRaises(ValueError):
+            package_averaged_planes(
+                self.paths, self.planes_dir, self.directory / "packaged.h5"
+            )
+
+        self.assertFalse((self.directory / "packaged.h5").exists())
+        self.assertFalse((self.directory / "packaged.h5.partial").exists())
 
 
 if __name__ == "__main__":

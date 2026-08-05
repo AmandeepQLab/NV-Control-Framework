@@ -17,6 +17,11 @@ from utils.camera_diagnostics import log_event
 
 LOGGER = logging.getLogger(__name__)
 
+# ImageCube.save() dispatches on this suffix; ZeroFieldWorker derives raw
+# per-scan filenames from output_path.suffix, so changing this one constant
+# is sufficient to switch both the averaged cube and raw scans to HDF5.
+_OUTPUT_EXTENSION = ".h5"
+
 
 class ZeroFieldWindow(QMainWindow):
     """Configure, run, monitor, and save a ZeroFieldExperiment."""
@@ -99,7 +104,9 @@ class ZeroFieldWindow(QMainWindow):
         )
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         self.output_directory.mkdir(parents=True, exist_ok=True)
-        self.output_path = self.output_directory / f"zero_field_{timestamp}_average.npz"
+        self.output_path = (
+            self.output_directory / f"zero_field_{timestamp}_average{_OUTPUT_EXTENSION}"
+        )
         self.widget.save_button.setEnabled(False)
         self.widget.reset_scan(config["field_points"], self.total_scans)
         self.widget.set_running_state(True)

@@ -50,6 +50,24 @@ def _is_hdf5_path(filename):
     return Path(filename).suffix.lower() in (".h5", ".hdf5")
 
 
+def _reject_hdf5_output(output_path):
+    """Fail loudly instead of writing a zip archive under a .h5 name.
+
+    average_scans() and package_averaged_planes() build their output via
+    zipfile.ZipFile unconditionally -- they never branch on output_path's
+    suffix. Reading .h5 scan inputs (via ImageCube) is supported, but
+    writing HDF5 output is not implemented; without this guard, an
+    output_path ending in .h5/.hdf5 would silently produce a .npz-format
+    zip archive wearing a misleading extension.
+    """
+    if _is_hdf5_path(output_path):
+        raise ValueError(
+            f"{output_path}: this module writes .npz output only "
+            "(HDF5 scan inputs are supported, but HDF5 output is not "
+            "implemented). Use a .npz output path."
+        )
+
+
 def _npy_bytes(value):
     buffer = io.BytesIO()
     np.save(buffer, value, allow_pickle=True)
@@ -263,6 +281,7 @@ def average_scans(scan_paths, output_path, report_path, *, roi=None):
     raising if that key is absent.
     """
     output_path = Path(output_path)
+    _reject_hdf5_output(output_path)
     report_path = Path(report_path)
     scan_paths, sources, shape, dtype = _open_sources(scan_paths)
     try:
@@ -397,6 +416,7 @@ def package_averaged_planes(scan_paths, planes_dir, output_path, report_dir=None
     scan_paths = [Path(path) for path in scan_paths]
     planes_dir = Path(planes_dir)
     output_path = Path(output_path)
+    _reject_hdf5_output(output_path)
     if not scan_paths:
         raise ValueError("No scan files were supplied.")
 
