@@ -1,4 +1,4 @@
-from pulsestreamer import PulseStreamer
+from pulsestreamer import PulseStreamer, OutputState
 
 
 class SwabianPulseStreamer:
@@ -71,7 +71,30 @@ class SwabianPulseStreamer:
 
         return compiled
 
-    def run(self):
+    def run(self, n_runs=None, final=None):
+        """Stream the loaded sequence to hardware.
+
+        n_runs is passed through to PulseStreamer.stream() only when given
+        explicitly; omitting it preserves today's behavior exactly (the
+        vendor SDK's own default, REPEAT_INFINITELY -- the sequence loops
+        until replaced by the next stream() call). ODMR's single
+        triggered-frame call site passes n_runs=1 so exactly one gate
+        fires per frame. reset_outputs()/sync_outputs() and any other
+        caller are deliberately left on the unchanged default -- they are
+        not part of this change.
+
+        final defaults to the *current* persistent_outputs state (not the
+        SDK's own OutputState.ZERO() default) regardless of n_runs. Under
+        looping this is never reached (the sequence never "finishes" in
+        the firmware's sense), so it costs nothing there. It matters once
+        a finite n_runs is requested: without it, every digital channel --
+        including the magnet polarity relay's flip_channel, which shares
+        this same persistent_outputs dict and this same PulseStreamer
+        instance -- would be zeroed the instant the sequence completes,
+        regardless of what it was actually last commanded to. Mirrors
+        exactly what compile_sequence()'s own trailing tail segment
+        already holds each channel at while the sequence is playing.
+        """
         compiled = self.compile_sequence()
 
         seq = self.ps.createSequence()
@@ -79,7 +102,15 @@ class SwabianPulseStreamer:
         for ch, pattern in compiled.items():
             seq.setDigital(ch, pattern)
 
-        self.ps.stream(seq)
+        if final is None:
+            final = OutputState(
+                digi=[ch for ch, state in self.persistent_outputs.items() if state]
+            )
+
+        if n_runs is None:
+            self.ps.stream(seq, final=final)
+        else:
+            self.ps.stream(seq, n_runs=n_runs, final=final)
 
         print("[Swabian] Sequence streamed to hardware")
 

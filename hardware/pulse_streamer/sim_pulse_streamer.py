@@ -40,7 +40,12 @@ class SimPulseStreamer:
 
         return events
 
-    def run(self):
+    def run(self, n_runs=None, final=None):
+        """Accepts the same n_runs/final keywords as SwabianPulseStreamer.run()
+        so the live ODMR call site (which now passes n_runs=1) works
+        unchanged in sim mode. Sim has no real device-side looping to
+        control, so both are accepted and ignored -- run() always just
+        plays the sequence once, printed, as it always has."""
 
         events = self.compile_sequence()
 

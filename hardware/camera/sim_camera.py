@@ -117,12 +117,35 @@ class SimCamera:
                 "grab_external_frame() called without an open acquisition; "
                 "call begin_external_acquisition() first."
             )
-        t0 = time.perf_counter() if self._timing_enabled else None
+
+        # Timed unconditionally, mirroring AndorNeoAndor3.grab_external_frame
+        # -- see that method for the derivation of the 0.5x floor. Always
+        # >= exposure_time here since _acquire_and_store_frame() genuinely
+        # sleeps for it; this exists so a subclass simulating a stale/
+        # pre-filled buffer (an implausibly fast return) exercises the
+        # same rejection path sim-side that the real driver has.
+        wait_t0 = time.perf_counter()
         frame = self._acquire_and_store_frame()
+        wait_duration_s = time.perf_counter() - wait_t0
+
         if self._timing_enabled:
             self._timing_log.append(
-                ("wait_buffer", self._acquisition_frames_served, time.perf_counter() - t0)
+                ("wait_buffer", self._acquisition_frames_served, wait_duration_s)
             )
+
+        min_plausible_s = 0.5 * self.exposure_time
+        if wait_duration_s < min_plausible_s:
+            raise RuntimeError(
+                f"grab_external_frame() returned in "
+                f"{wait_duration_s * 1000:.3f} ms, faster than the "
+                f"{min_plausible_s * 1000:.3f} ms floor implied by the "
+                f"{self.exposure_time * 1000:.3f} ms configured exposure. "
+                "This buffer was very likely already filled before this "
+                "call started waiting -- i.e. a stray camera gate, not the "
+                "one belonging to this frame -- and has been rejected "
+                "rather than returned as if it were fresh."
+            )
+
         self._acquisition_frames_served += 1
         return frame
 

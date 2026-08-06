@@ -70,6 +70,13 @@ class AndorAcquisitionContractTests(unittest.TestCase):
     def _make_camera(self, **kwargs):
         camera = AndorNeoAndor3()
         camera.cam = FakeSDKCam(**kwargs)
+        # FakeSDKCam.waitBuffer() returns instantly (no simulated exposure
+        # delay); exposure_time=0 keeps the stale-buffer plausibility
+        # guard (see grab_external_frame(), and
+        # tests/test_pulse_streamer_single_shot.py::StaleBufferGuardTests
+        # for its dedicated coverage) from firing on tests that aren't
+        # about that guard.
+        camera.exposure_time = 0.0
         return camera
 
     def test_begin_is_idempotent(self):

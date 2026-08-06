@@ -138,18 +138,17 @@ class AndorNeoAndor3:
 
         timing = self._timing_enabled
 
+        # Timed unconditionally (not just under the timing-diagnostics
+        # flag): the stale-buffer plausibility check below needs this
+        # duration on every call, not just when NV_ODMR_TIMING=1.
+        wait_t0 = time.perf_counter()
         try:
-            t0 = time.perf_counter() if timing else None
             # requeue=True re-arms the same buffer for the next trigger;
             # copy=True is required alongside it (SDK wrapper's own
             # docstring) -- without it the returned array is a live view
             # into a buffer the SDK is free to overwrite as soon as it's
             # requeued, which happens before waitBuffer() even returns.
             raw = self.cam.waitBuffer(timeout_ms, copy=True, requeue=True)
-            if timing:
-                self._timing_log.append(
-                    ("wait_buffer", self._acquisition_frames_served, time.perf_counter() - t0)
-                )
         except Exception as error:
             if self._acquisition_frames_served > 0:
                 raise RuntimeError(
@@ -166,6 +165,38 @@ class AndorNeoAndor3:
                     "per scan)."
                 ) from error
             raise
+        wait_duration_s = time.perf_counter() - wait_t0
+
+        if timing:
+            self._timing_log.append(
+                ("wait_buffer", self._acquisition_frames_served, wait_duration_s)
+            )
+
+        # A genuine frame cannot complete faster than its own exposure
+        # time: the sensor must integrate for exposure_time regardless of
+        # trigger-wait or readout, both of which only add to that floor.
+        # A stale/pre-filled buffer (a stray gate -- e.g. a leftover
+        # repetition of a looping sequence -- fills a buffer between
+        # grab_external_frame() calls) returns near-instantly instead,
+        # since waitBuffer() only has to notice a buffer already marked
+        # complete, not actually wait for one. 0.5x exposure_time is a
+        # conservative floor: a real frame is physically incapable of
+        # landing below 1.0x, so this leaves a 2x margin against
+        # timing/measurement jitter alone, while still rejecting the
+        # observed bug (~0.7 ms against an ~186 ms expectation) with
+        # roughly another order of magnitude of margin beyond that.
+        min_plausible_s = 0.5 * self.exposure_time
+        if wait_duration_s < min_plausible_s:
+            raise RuntimeError(
+                f"grab_external_frame() returned in "
+                f"{wait_duration_s * 1000:.3f} ms, faster than the "
+                f"{min_plausible_s * 1000:.3f} ms floor implied by the "
+                f"{self.exposure_time * 1000:.3f} ms configured exposure. "
+                "This buffer was very likely already filled before this "
+                "call started waiting -- i.e. a stray camera gate, not the "
+                "one belonging to this frame -- and has been rejected "
+                "rather than returned as if it were fresh."
+            )
 
         t0 = time.perf_counter() if timing else None
         frame = self._buffer_to_image(raw)

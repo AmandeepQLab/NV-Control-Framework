@@ -458,7 +458,12 @@ class ODMRExperiment(ScanExperiment):
             if timing:
                 fire_timing["fire_delay_sleep"] = (ft0, time.perf_counter() - ft0)
             ft0 = time.perf_counter() if timing else None
-            pulse.run()
+            # Exactly one gate per triggered frame -- see
+            # SwabianPulseStreamer.run() for why n_runs=1 is required now
+            # that the camera is armed for the whole scan (a looping
+            # sequence's stray repetition can otherwise fill an
+            # already-armed buffer between frames).
+            pulse.run(n_runs=1)
             if timing:
                 fire_timing["pulse_run"] = (ft0, time.perf_counter() - ft0)
 
