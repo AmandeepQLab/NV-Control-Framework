@@ -1,6 +1,7 @@
 import numpy as np
 import threading
 import time
+from contextlib import contextmanager
 
 from hardware.camera.streaming import StreamController
 from utils.camera_diagnostics import log_camera_snap, log_event
@@ -43,6 +44,24 @@ class SimCamera:
         self._stream_controller = StreamController()
         self.stream_shutdown_timeout_s = stream_shutdown_timeout_s
 
+        # Interface parity with AndorNeoAndor3's temporary timing
+        # diagnostics (see that class). There are no real SDK stages to
+        # split here, so this is a single lumped entry per frame -- enough
+        # to exercise the ODMR-side instrumentation in sim without crashing.
+        self._timing_enabled = False
+        self._timing_log = []
+
+        # Interface parity with AndorNeoAndor3's held-open external
+        # acquisition (see that class for the real semantics). There's no
+        # real SDK arm/disarm cost to simulate, but the same state machine
+        # and defensive self-heal calls are mirrored here so ODMR's new
+        # call path -- and the exception/stop-safety tests -- exercise
+        # identical logic against sim as against real hardware.
+        self._acquisition_open = False
+        self._acquisition_frames_served = 0
+        self._acquisition_start_count = 0
+        self._acquisition_stop_count = 0
+
         # =====================================================
         # ODMR PHYSICS PARAMETERS
         # =====================================================
@@ -60,6 +79,70 @@ class SimCamera:
         return self._stream_controller.is_streaming
 
     # =========================================================
+    # TIMING DIAGNOSTICS (parity stub; see AndorNeoAndor3)
+    # =========================================================
+
+    def enable_timing_diagnostics(self, enabled):
+        self._timing_enabled = bool(enabled)
+        self._timing_log = []
+
+    def pop_timing_log(self):
+        log = self._timing_log
+        self._timing_log = []
+        return log
+
+    def reset_acquisition_counts(self):
+        self._acquisition_start_count = 0
+        self._acquisition_stop_count = 0
+
+    def get_acquisition_counts(self):
+        return (self._acquisition_start_count, self._acquisition_stop_count)
+
+    # =========================================================
+    # HELD-OPEN EXTERNAL ACQUISITION (parity stub; see AndorNeoAndor3)
+    # =========================================================
+
+    def begin_external_acquisition(self):
+        if self._acquisition_open:
+            return
+        self._acquisition_open = True
+        self._acquisition_frames_served = 0
+        self._acquisition_start_count += 1
+        if self._timing_enabled:
+            self._timing_log.append(("acquisition_start", None, 0.0))
+
+    def grab_external_frame(self, timeout_ms=10000):
+        if not self._acquisition_open:
+            raise RuntimeError(
+                "grab_external_frame() called without an open acquisition; "
+                "call begin_external_acquisition() first."
+            )
+        t0 = time.perf_counter() if self._timing_enabled else None
+        frame = self._acquire_and_store_frame()
+        if self._timing_enabled:
+            self._timing_log.append(
+                ("wait_buffer", self._acquisition_frames_served, time.perf_counter() - t0)
+            )
+        self._acquisition_frames_served += 1
+        return frame
+
+    def end_external_acquisition(self):
+        if not self._acquisition_open:
+            return
+        self._acquisition_open = False
+        self._acquisition_stop_count += 1
+        if self._timing_enabled:
+            self._timing_log.append(("acquisition_stop", None, 0.0))
+
+    @contextmanager
+    def external_acquisition(self):
+        self.begin_external_acquisition()
+        try:
+            yield
+        finally:
+            self.end_external_acquisition()
+
+    # =========================================================
     # CONNECTION
     # =========================================================
 
@@ -74,6 +157,8 @@ class SimCamera:
         pass
 
     def close(self):
+        if self._acquisition_open:
+            self.end_external_acquisition()
         try:
             self.stop_stream()
         except Exception:
@@ -85,13 +170,22 @@ class SimCamera:
 
     def set_exposure(self, exposure_s):
 
+        if self._acquisition_open:
+            self.end_external_acquisition()
+
         self.exposure_time = exposure_s
 
     def set_roi(self, roi):
 
+        if self._acquisition_open:
+            self.end_external_acquisition()
+
         self.roi = roi
 
     def set_binning(self, binning):
+
+        if self._acquisition_open:
+            self.end_external_acquisition()
 
         self.binning = binning
 
@@ -174,7 +268,17 @@ class SimCamera:
 
     def snap(self):
 
+        if self._acquisition_open:
+            self.end_external_acquisition()
+
         log_camera_snap(type(self).__name__)
+
+        return self._acquire_and_store_frame()
+
+    def _acquire_and_store_frame(self):
+        """Shared by snap() and grab_external_frame(). Kept separate from
+        snap() so grab_external_frame() (called while _acquisition_open is
+        True, by design) doesn't trip snap()'s own defensive self-heal."""
 
         time.sleep(self.exposure_time)
 
@@ -192,18 +296,31 @@ class SimCamera:
 
     def snap_external_trigger(self, timeout_ms=10000):
         """External triggering is a hardware-timing concept that doesn't
-        apply to a synthetic frame source; behaves like snap()."""
-        return self.snap()
+        apply to a synthetic frame source; behaves like snap().
+
+        Routed through snap_external_frames() (rather than calling snap()
+        directly) so it exercises the same call path as the real driver's
+        snap_external_trigger() -> snap_external_frames().
+        """
+        return self.snap_external_frames(nframes=1, timeout_ms=timeout_ms)[0]
 
     def snap_external_frames(self, nframes, timeout_ms=10000):
+        """Arm, grab nframes, disarm -- mirrors AndorNeoAndor3's
+        composition on top of begin_/grab_/end_external_acquisition."""
 
-        return [self.snap() for _ in range(nframes)]
+        frames = []
+        with self.external_acquisition():
+            for _ in range(nframes):
+                frames.append(self.grab_external_frame(timeout_ms))
+        return frames
 
     # =========================================================
     # STREAMING
     # =========================================================
 
     def start_stream(self):
+        if self._acquisition_open:
+            self.end_external_acquisition()
         log_event("start_stream", source="live stream", camera_type=type(self).__name__)
         self._stream_controller.start(self._stream_loop)
 

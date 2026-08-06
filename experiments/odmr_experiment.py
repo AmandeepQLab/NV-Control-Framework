@@ -2,6 +2,7 @@ import numpy as np
 import time
 import threading
 import logging
+import os
 
 from framework.scan_experiment import ScanExperiment
 from framework.camera_ownership import exclusive_camera_access
@@ -30,6 +31,24 @@ class ODMRExperiment(ScanExperiment):
                 config["steps"],
             )
 
+        # =====================================================
+        # TIMING DIAGNOSTICS (off by default; temporary instrumentation)
+        # =====================================================
+        # Enabled via config["timing_diagnostics"] or the NV_ODMR_TIMING=1
+        # environment variable. Never set by the GUI panel itself.
+        self._timing = bool(config.get("timing_diagnostics", False)) or (
+            os.environ.get("NV_ODMR_TIMING") == "1"
+        )
+        self._timing_log = []
+        self._timing_epoch = time.perf_counter()
+
+        # Whether a scan-wide held-open camera acquisition is currently
+        # active (see begin_camera_acquisition/end_camera_acquisition
+        # below). acquire_triggered_frame() checks this to decide whether
+        # to pull a frame from the already-armed camera or fall back to
+        # the camera's own self-contained per-call snap_external_trigger().
+        self._acquisition_open = False
+
     # =====================================================
     # SETUP
     # =====================================================
@@ -47,6 +66,126 @@ class ODMRExperiment(ScanExperiment):
     def configure_acquisition(self):
         """Apply this experiment's temporary camera AOI while it is borrowed."""
         self.hw["camera"].set_roi(self.acquisition_roi)
+
+    # =====================================================
+    # TIMING DIAGNOSTICS
+    # =====================================================
+    # Off by default (see __init__). When disabled, every call site below
+    # is a single cached-bool check -- no perf_counter() call, no list
+    # append, no allocation. Temporary instrumentation; not a permanent
+    # feature.
+
+    def timing_enabled(self):
+        return self._timing
+
+    def reset_timing(self):
+        """Start a fresh timing epoch and log. Call once at scan start."""
+        self._timing_log = []
+        self._timing_epoch = time.perf_counter()
+
+    def pop_timing_log(self):
+        """Return and clear accumulated timing records (bounds growth)."""
+        log = self._timing_log
+        self._timing_log = []
+        return log
+
+    def set_camera_timing(self, enabled):
+        """Enable/disable the camera driver's own stage-level timing.
+
+        Only ODMR calls camera.snap_external_frames(); live view and Zero
+        Field use camera.snap(), which this never touches. Disabling here
+        also clears the camera-side log (see AndorNeoAndor3.
+        enable_timing_diagnostics), so nothing lingers after a scan ends.
+        """
+        camera = self.hw["camera"]
+        if hasattr(camera, "enable_timing_diagnostics"):
+            camera.enable_timing_diagnostics(enabled)
+
+    def pop_camera_timing_log(self):
+        camera = self.hw["camera"]
+        if hasattr(camera, "pop_timing_log"):
+            return camera.pop_timing_log()
+        return []
+
+    def _record_timing(self, repeat_index, frame_label, stage, t0):
+        if not self._timing:
+            return
+        self._timing_log.append({
+            "repeat_index": repeat_index,
+            "frame": frame_label,
+            "stage": stage,
+            "t_start_rel_s": t0 - self._timing_epoch,
+            "duration_s": time.perf_counter() - t0,
+        })
+
+    def _merge_camera_log(self, repeat_index, frame_label, start_rel):
+        """Pop the camera's own per-stage log and fold it into ours.
+
+        Camera-side entries only carry a duration, not an absolute
+        timestamp, so their t_start_rel_s is reconstructed by walking
+        forward from start_rel in call order -- correct as long as the
+        caller pops right after the call whose stages it wants to
+        attribute (both acquire_triggered_frame and begin_/end_
+        camera_acquisition below do this immediately).
+        """
+        if not self._timing:
+            return
+        running_t = start_rel
+        for stage, frame_idx, duration in self.pop_camera_timing_log():
+            label = f"camera.{stage}" if frame_idx is None else f"camera.{stage}[{frame_idx}]"
+            self._timing_log.append({
+                "repeat_index": repeat_index,
+                "frame": frame_label,
+                "stage": label,
+                "t_start_rel_s": running_t,
+                "duration_s": duration,
+            })
+            running_t += duration
+
+    # =====================================================
+    # HELD-OPEN CAMERA ACQUISITION (scan-wide arm/disarm)
+    # =====================================================
+
+    def begin_camera_acquisition(self):
+        """Arm the camera once for the whole scan, if it supports it.
+
+        hasattr-guarded so a camera/test-double lacking the new driver
+        API (e.g. an older sim, or a fake used only for set_roi()) simply
+        never gets the held-open path -- acquire_triggered_frame() then
+        falls back to the camera's own self-contained per-frame method.
+        """
+        camera = self.hw["camera"]
+        if not hasattr(camera, "begin_external_acquisition"):
+            return
+        t0 = time.perf_counter() if self._timing else None
+        camera.begin_external_acquisition()
+        self._acquisition_open = True
+        if self._timing:
+            self._merge_camera_log(None, None, t0 - self._timing_epoch)
+
+    def end_camera_acquisition(self):
+        """Disarm the camera. Safe to call even if begin_ was never
+        called, or if the camera lacks the new API -- always leaves
+        self._acquisition_open False."""
+        camera = self.hw["camera"]
+        self._acquisition_open = False
+        if not hasattr(camera, "end_external_acquisition"):
+            return
+        t0 = time.perf_counter() if self._timing else None
+        camera.end_external_acquisition()
+        if self._timing:
+            self._merge_camera_log(None, None, t0 - self._timing_epoch)
+
+    def reset_acquisition_counts(self):
+        camera = self.hw["camera"]
+        if hasattr(camera, "reset_acquisition_counts"):
+            camera.reset_acquisition_counts()
+
+    def get_acquisition_counts(self):
+        camera = self.hw["camera"]
+        if hasattr(camera, "get_acquisition_counts"):
+            return camera.get_acquisition_counts()
+        return (None, None)
 
     def run(self):
         """Run a scan under one exclusive camera lease."""
@@ -288,33 +427,75 @@ class ODMRExperiment(ScanExperiment):
     # TRIGGERED FRAME ACQUISITION
     # =====================================================
 
-    def acquire_triggered_frame(self, pulse, seq):
+    def acquire_triggered_frame(self, pulse, seq, repeat_index=None, frame_label=None):
 
         camera = self.hw["camera"]
-
-        pulse.load_sequence(seq)
+        timing = self._timing
 
         t0 = time.time()
 
+        tt0 = time.perf_counter() if timing else None
+        pulse.load_sequence(seq)
+        self._record_timing(repeat_index, frame_label, "load_sequence", tt0)
+
+        tt0 = time.perf_counter() if timing else None
         pulse.reset_outputs()
-        time.sleep(0.005)
+        self._record_timing(repeat_index, frame_label, "reset_outputs", tt0)
+
+        reset_delay_s = self.config.get("reset_delay_s", 0.005)
+        tt0 = time.perf_counter() if timing else None
+        time.sleep(reset_delay_s)
+        self._record_timing(repeat_index, frame_label, "reset_delay_sleep", tt0)
 
         t1 = time.time()
 
+        fire_timing = {} if timing else None
+
         def fire():
-            time.sleep(0.005)
+            fire_delay_s = self.config.get("fire_delay_s", 0.005)
+            ft0 = time.perf_counter() if timing else None
+            time.sleep(fire_delay_s)
+            if timing:
+                fire_timing["fire_delay_sleep"] = (ft0, time.perf_counter() - ft0)
+            ft0 = time.perf_counter() if timing else None
             pulse.run()
+            if timing:
+                fire_timing["pulse_run"] = (ft0, time.perf_counter() - ft0)
 
         trigger_thread = threading.Thread(target=fire, daemon=True)
         trigger_thread.start()
 
         t2 = time.time()
 
-        frame = camera.snap_external_trigger()
+        tt0 = time.perf_counter() if timing else None
+        if self._acquisition_open and hasattr(camera, "grab_external_frame"):
+            # Camera already armed for the whole scan (see
+            # begin_camera_acquisition) -- just wait for the next
+            # trigger, no per-frame arm/disarm.
+            frame = camera.grab_external_frame(timeout_ms=10000)
+            self._record_timing(repeat_index, frame_label, "grab_external_frame", tt0)
+        else:
+            frame = camera.snap_external_trigger()
+            self._record_timing(repeat_index, frame_label, "snap_external_trigger", tt0)
+        snap_t_start_rel = (tt0 - self._timing_epoch) if timing else None
 
         t3 = time.time()
 
+        tt0 = time.perf_counter() if timing else None
         trigger_thread.join()
+        self._record_timing(repeat_index, frame_label, "trigger_thread_join", tt0)
+
+        if timing:
+            for stage, (fstart, fdur) in fire_timing.items():
+                self._timing_log.append({
+                    "repeat_index": repeat_index,
+                    "frame": frame_label,
+                    "stage": stage,
+                    "t_start_rel_s": fstart - self._timing_epoch,
+                    "duration_s": fdur,
+                })
+
+            self._merge_camera_log(repeat_index, frame_label, snap_t_start_rel)
 
         LOGGER.debug(
             "Triggered frame timings: reset=%.3fs, thread=%.3fs, "
@@ -332,8 +513,11 @@ class ODMRExperiment(ScanExperiment):
 
     def set_scan_point(self, frequency):
         mw = self.hw["microwave"]
+        timing = self._timing
 
+        t0 = time.perf_counter() if timing else None
         mw.set_frequency(frequency)
+        self._record_timing(None, None, "visa_set_frequency", t0)
 
         mw_settle_s = self.config.get("mw_settle_s", 0.0)
         time.sleep(mw_settle_s)
@@ -341,15 +525,20 @@ class ODMRExperiment(ScanExperiment):
         power_dbm = self.config.get("mw_power_dbm", -10)
 
         if hasattr(mw, "set_power"):
+            t0 = time.perf_counter() if timing else None
             mw.set_power(power_dbm)
+            self._record_timing(None, None, "visa_set_power_initial", t0)
 
         if hasattr(mw, "rf_on"):
+            t0 = time.perf_counter() if timing else None
             mw.rf_on()
+            self._record_timing(None, None, "visa_rf_on", t0)
 
     def acquire_frame(self):
         """Acquire the OFF/ON camera-frame pairs for one configured point."""
         mw = self.hw["microwave"]
         pulse = self.hw["pulse_streamer"]
+        timing = self._timing
 
         power_dbm = self.config.get("mw_power_dbm", -10)
         repeats = self.config.get("repeats", 1)
@@ -357,18 +546,25 @@ class ODMRExperiment(ScanExperiment):
 
         for r in range(repeats):
 
+            repeat_t0 = time.perf_counter() if timing else None
+
             # ==========================================
             # MW OFF FRAME
             # ==========================================
 
             if hasattr(mw, "set_power"):
+                t0 = time.perf_counter() if timing else None
                 mw.set_power(-100)
+                self._record_timing(r, "off", "visa_set_power_off", t0)
 
             seq_off = self.build_sequence()
 
+            off_t0 = time.perf_counter() if timing else None
             frame_off = self.acquire_triggered_frame(
                 pulse,
-                seq_off
+                seq_off,
+                repeat_index=r,
+                frame_label="off",
             )
 
             # ==========================================
@@ -376,14 +572,35 @@ class ODMRExperiment(ScanExperiment):
             # ==========================================
 
             if hasattr(mw, "set_power"):
+                t0 = time.perf_counter() if timing else None
                 mw.set_power(power_dbm)
+                self._record_timing(r, "on", "visa_set_power_on", t0)
 
             seq_on = self.build_sequence()
 
+            on_t0 = time.perf_counter() if timing else None
             frame_on = self.acquire_triggered_frame(
                 pulse,
-                seq_on
+                seq_on,
+                repeat_index=r,
+                frame_label="on",
             )
+
+            if timing:
+                self._timing_log.append({
+                    "repeat_index": r,
+                    "frame": None,
+                    "stage": "off_on_gap",
+                    "t_start_rel_s": off_t0 - self._timing_epoch,
+                    "duration_s": on_t0 - off_t0,
+                })
+                self._timing_log.append({
+                    "repeat_index": r,
+                    "frame": None,
+                    "stage": "repeat_total",
+                    "t_start_rel_s": repeat_t0 - self._timing_epoch,
+                    "duration_s": time.perf_counter() - repeat_t0,
+                })
 
             frames.append(np.stack((frame_off, frame_on)))
 

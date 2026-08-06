@@ -2,6 +2,7 @@ import numpy as np
 import threading
 import time
 import logging
+from contextlib import contextmanager
 
 from andor3 import Andor3
 from hardware.camera.streaming import StreamController
@@ -27,9 +28,193 @@ class AndorNeoAndor3:
         self._stream_controller = StreamController()
         self.stream_shutdown_timeout_s = stream_shutdown_timeout_s
 
+        # Temporary diagnostic instrumentation, off by default. Only
+        # snap_external_frames() (ODMR's external-trigger path) is ever
+        # instrumented -- snap() (live view, Zero Field) never touches
+        # this, so a live-view session cannot grow this log regardless of
+        # the flag. enable_timing_diagnostics() also clears the log, so
+        # nothing lingers past the scan that turned it on.
+        self._timing_enabled = False
+        self._timing_log = []
+
+        # Held-open external acquisition state. See begin_external_acquisition
+        # / grab_external_frame / end_external_acquisition below. Any method
+        # that touches camera features outside this trio defensively closes
+        # an open acquisition first (see each method) so a caller that never
+        # learned about this API -- live view's snap(), Zero Field, a future
+        # script -- can't be broken by one left open.
+        self._acquisition_open = False
+        self._acquisition_frames_served = 0
+        self._acquisition_start_count = 0
+        self._acquisition_stop_count = 0
+
     @property
     def streaming(self):
         return self._stream_controller.is_streaming
+
+    # =====================================================
+    # TIMING DIAGNOSTICS (temporary; off by default)
+    # =====================================================
+
+    def enable_timing_diagnostics(self, enabled):
+        """Turn per-stage timing of snap_external_frames() on/off.
+
+        Always clears the accumulated log, whether enabling or disabling,
+        so growth is bounded to at most one in-flight scan's worth of
+        entries and nothing survives being turned off.
+        """
+        self._timing_enabled = bool(enabled)
+        self._timing_log = []
+
+    def pop_timing_log(self):
+        """Return and clear the accumulated per-stage timing log."""
+        log = self._timing_log
+        self._timing_log = []
+        return log
+
+    def reset_acquisition_counts(self):
+        """Zero the AcquisitionStart/Stop counters (call once per scan)."""
+        self._acquisition_start_count = 0
+        self._acquisition_stop_count = 0
+
+    def get_acquisition_counts(self):
+        """Return (acquisition_start_count, acquisition_stop_count) since
+        the last reset_acquisition_counts() call -- how many times the
+        camera was actually armed/disarmed, for verifying a scan armed
+        once rather than once per frame."""
+        return (self._acquisition_start_count, self._acquisition_stop_count)
+
+    # =====================================================
+    # HELD-OPEN EXTERNAL ACQUISITION
+    # =====================================================
+    # Arm once (begin_external_acquisition), pull many frames from the
+    # single armed acquisition (grab_external_frame), disarm once
+    # (end_external_acquisition). snap_external_frames() below is
+    # reimplemented on top of this trio, so existing callers are
+    # unaffected; ODMR's scan loop calls the trio directly to avoid
+    # re-arming per frame.
+
+    def begin_external_acquisition(self):
+        if self.cam is None:
+            raise RuntimeError("Camera is not connected")
+        if self._acquisition_open:
+            return
+
+        timing = self._timing_enabled
+
+        t0 = time.perf_counter() if timing else None
+        self.cam.setEnumIndex("TriggerMode", 6)  # External
+        if timing:
+            self._timing_log.append(("trigger_mode_set", None, time.perf_counter() - t0))
+
+        try:
+            t0 = time.perf_counter() if timing else None
+            self.cam.flush()
+            if timing:
+                self._timing_log.append(("flush_pre", None, time.perf_counter() - t0))
+        except Exception:
+            pass
+
+        t0 = time.perf_counter() if timing else None
+        self.cam.queueBuffer(1)
+        if timing:
+            self._timing_log.append(("queue_buffer", None, time.perf_counter() - t0))
+
+        t0 = time.perf_counter() if timing else None
+        self.cam.command("AcquisitionStart")
+        self._acquisition_start_count += 1
+        if timing:
+            self._timing_log.append(("acquisition_start", None, time.perf_counter() - t0))
+
+        self._acquisition_open = True
+        self._acquisition_frames_served = 0
+
+    def grab_external_frame(self, timeout_ms=10000):
+        if not self._acquisition_open:
+            raise RuntimeError(
+                "grab_external_frame() called without an open acquisition; "
+                "call begin_external_acquisition() first."
+            )
+
+        timing = self._timing_enabled
+
+        try:
+            t0 = time.perf_counter() if timing else None
+            # requeue=True re-arms the same buffer for the next trigger;
+            # copy=True is required alongside it (SDK wrapper's own
+            # docstring) -- without it the returned array is a live view
+            # into a buffer the SDK is free to overwrite as soon as it's
+            # requeued, which happens before waitBuffer() even returns.
+            raw = self.cam.waitBuffer(timeout_ms, copy=True, requeue=True)
+            if timing:
+                self._timing_log.append(
+                    ("wait_buffer", self._acquisition_frames_served, time.perf_counter() - t0)
+                )
+        except Exception as error:
+            if self._acquisition_frames_served > 0:
+                raise RuntimeError(
+                    f"grab_external_frame() failed after "
+                    f"{self._acquisition_frames_served} frame(s) were already "
+                    "served under this AcquisitionStart. The camera stopped "
+                    "responding to external triggers partway through a "
+                    "held-open acquisition -- either a genuine trigger "
+                    "timeout, or the CycleMode='Continuous' assumption "
+                    "(that one AcquisitionStart can serve many sequential "
+                    "external triggers) is not holding on this camera/SDK. "
+                    "If this recurs, fall back to per-point acquisition "
+                    "scope (arm once per frequency point instead of once "
+                    "per scan)."
+                ) from error
+            raise
+
+        t0 = time.perf_counter() if timing else None
+        frame = self._buffer_to_image(raw)
+        if timing:
+            self._timing_log.append(
+                ("buffer_to_image", self._acquisition_frames_served, time.perf_counter() - t0)
+            )
+
+        self._acquisition_frames_served += 1
+
+        with self._lock:
+            self.latest_frame = frame
+
+        return frame
+
+    def end_external_acquisition(self):
+        if not self._acquisition_open:
+            return
+
+        # Cleared first: a raise below must not leave the flag falsely
+        # True (that would block the defensive self-heal in snap() etc.
+        # from ever trying again).
+        self._acquisition_open = False
+        timing = self._timing_enabled
+
+        try:
+            t0 = time.perf_counter() if timing else None
+            self.cam.command("AcquisitionStop")
+            self._acquisition_stop_count += 1
+            if timing:
+                self._timing_log.append(("acquisition_stop", None, time.perf_counter() - t0))
+        except Exception:
+            pass
+
+        try:
+            t0 = time.perf_counter() if timing else None
+            self.cam.flush()
+            if timing:
+                self._timing_log.append(("flush_post", None, time.perf_counter() - t0))
+        except Exception:
+            pass
+
+    @contextmanager
+    def external_acquisition(self):
+        self.begin_external_acquisition()
+        try:
+            yield
+        finally:
+            self.end_external_acquisition()
 
     # =====================================================
     # CONNECT
@@ -108,6 +293,9 @@ class AndorNeoAndor3:
     # =====================================================
     def set_exposure(self, exposure_s):
 
+        if self._acquisition_open:
+            self.end_external_acquisition()
+
         self.exposure_time = exposure_s
 
         if self.cam is not None:
@@ -130,6 +318,9 @@ class AndorNeoAndor3:
 
         where x1 and y1 are exclusive.
         """
+
+        if self._acquisition_open:
+            self.end_external_acquisition()
 
         self.roi = roi
 
@@ -164,6 +355,9 @@ class AndorNeoAndor3:
         self.cam.setInt("AOITop", y0 + 1)
     def set_binning(self, binning):
 
+        if self._acquisition_open:
+            self.end_external_acquisition()
+
         self.binning = binning
 
         if self.cam is None:
@@ -193,6 +387,9 @@ class AndorNeoAndor3:
     # =====================================================
 
     def snap(self):
+
+        if self._acquisition_open:
+            self.end_external_acquisition()
 
         log_camera_snap(type(self).__name__)
 
@@ -256,39 +453,18 @@ class AndorNeoAndor3:
 
 
     def snap_external_frames(self, nframes, timeout_ms=10000):
+        """Arm, grab nframes, disarm. Unchanged signature/behavior for
+        existing callers -- internally composed from begin_/grab_/
+        end_external_acquisition so there is only one arm/disarm
+        implementation to maintain."""
 
         if self.cam is None:
             raise RuntimeError("Camera is not connected")
 
         frames = []
-
-        try:
-            self.cam.setEnumIndex("TriggerMode", 6)  # External
-
-            try:
-                self.cam.flush()
-            except Exception:
-                pass
-
-            self.cam.queueBuffer(nframes)
-            self.cam.command("AcquisitionStart")
-
+        with self.external_acquisition():
             for _ in range(nframes):
-                raw = self.cam.waitBuffer(timeout_ms)
-                frame = self._buffer_to_image(raw)
-                frames.append(frame)
-               # print(f"Received frame {len(frames)}/{nframes}") #comment out to see the recived frames.
-
-        finally:
-            try:
-                self.cam.command("AcquisitionStop")
-            except Exception:
-                pass
-
-            try:
-                self.cam.flush()
-            except Exception:
-                pass
+                frames.append(self.grab_external_frame(timeout_ms))
 
         if len(frames) > 0:
             with self._lock:
@@ -301,6 +477,8 @@ class AndorNeoAndor3:
     # =====================================================
 
     def start_stream(self):
+        if self._acquisition_open:
+            self.end_external_acquisition()
         log_event("start_stream", source="live stream", camera_type=type(self).__name__)
         self._stream_controller.start(self._stream_loop)
 
@@ -349,6 +527,9 @@ class AndorNeoAndor3:
     # =====================================================
 
     def close(self):
+
+        if self._acquisition_open:
+            self.end_external_acquisition()
 
         try:
             self.stop_stream()

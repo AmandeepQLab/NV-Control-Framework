@@ -139,6 +139,7 @@ class ODMRWindow(QMainWindow):
             self.hardware,
             config,
             acquisition_roi=acquisition_roi,
+            estimated_s=estimated_s,
         )
 
         self.odmr_worker.moveToThread(self.odmr_thread)
