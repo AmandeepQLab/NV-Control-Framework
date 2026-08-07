@@ -122,6 +122,7 @@ class ODMRWorker(QObject):
             self._camera_lease = exclusive_camera_access(self.hardware["camera"])
             self._camera_lease.__enter__()
             self.experiment.configure_acquisition()
+            self.experiment.check_mw_power_settling_margin()
 
             if self._timing:
                 self.experiment.reset_timing()
@@ -328,13 +329,9 @@ class ODMRWorker(QObject):
                 f"# exposure_s={exposure_s}",
                 f"# camera_gate_s={self.config.get('camera_gate_s', exposure_s)}",
                 f"# mw_settle_s={self.config.get('mw_settle_s', 0.0)}",
+                f"# mw_power_settle_s={self.config.get('mw_power_settle_s', 0.0)}",
                 f"# pulse_lead_s={self.config.get('pulse_lead_s', 0.002)}",
                 f"# pulse_tail_s={self.config.get('pulse_tail_s', 0.002)}",
-                "# frame_gap_s="
-                f"{self.config.get('frame_gap_s', 0.05)} "
-                "(NOT used by the real acquisition path -- only by the "
-                "pulse-sequence preview and the GUI time estimate; "
-                "recorded here for reference only)",
                 f"# camera_overhead_s={self.config.get('camera_overhead_s', 0.35)} "
                 "(GUI time-estimate fudge factor, not read by the "
                 "acquisition path)",

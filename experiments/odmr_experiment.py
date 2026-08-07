@@ -13,6 +13,13 @@ from sequencing.pulse_sequence import PulseSequence
 
 LOGGER = logging.getLogger(__name__)
 
+# SG386 manual: amplitude switching settles to within 1 ppm in under this
+# long. Used only to decide whether to warn that the accumulated delay
+# between an MW power write and the camera gate opening (see
+# check_mw_power_settling_margin) has fallen below spec -- not itself a
+# delay applied anywhere.
+SG386_AMPLITUDE_SETTLE_S = 0.008
+
 
 class ODMRExperiment(ScanExperiment):
 
@@ -56,6 +63,48 @@ class ODMRExperiment(ScanExperiment):
     def setup(self):
 
         super().setup()
+
+    def check_mw_power_settling_margin(self):
+        """Warn if the accumulated delay before the MW/laser gate opens has
+        fallen below the SG386's amplitude-settling spec.
+
+        Sums every delay that elapses between an mw.set_power() write in
+        acquire_frame() and the gate actually opening (see acquire_frame/
+        acquire_triggered_frame/build_sequence for the derivation of this
+        chain): reset_delay_s, fire_delay_s, trigger_delay_s, pulse_lead_s,
+        and mw_power_settle_s itself. At today's defaults this margin is
+        accidental (none of the first four exist for MW-settling reasons),
+        so this check -- not a larger default -- is what catches it
+        shrinking below spec if any of those are tuned down later.
+        """
+        reset_delay_s = self.config.get("reset_delay_s", 0.005)
+        fire_delay_s = self.config.get("fire_delay_s", 0.005)
+        trigger_delay_s = self.config.get("trigger_delay_s", 0.05)
+        pulse_lead_s = self.config.get("pulse_lead_s", 0.002)
+        mw_power_settle_s = self.config.get("mw_power_settle_s", 0.0)
+
+        margin_s = (
+            reset_delay_s + fire_delay_s + trigger_delay_s
+            + pulse_lead_s + mw_power_settle_s
+        )
+
+        if margin_s < SG386_AMPLITUDE_SETTLE_S:
+            LOGGER.warning(
+                "MW power settling margin is %.3f ms, below the SG386's "
+                "%.1f ms amplitude-settling spec (<1 ppm). Contributing "
+                "delays: reset_delay_s=%.3f ms, fire_delay_s=%.3f ms, "
+                "trigger_delay_s=%.3f ms, pulse_lead_s=%.3f ms, "
+                "mw_power_settle_s=%.3f ms. ODMR contrast may include an "
+                "RF settling transient. Raise mw_power_settle_s (or one of "
+                "the other contributing delays) to restore margin.",
+                margin_s * 1000,
+                SG386_AMPLITUDE_SETTLE_S * 1000,
+                reset_delay_s * 1000,
+                fire_delay_s * 1000,
+                trigger_delay_s * 1000,
+                pulse_lead_s * 1000,
+                mw_power_settle_s * 1000,
+            )
 
     def setup_scan(self):
         self.configure_acquisition()
@@ -277,7 +326,18 @@ class ODMRExperiment(ScanExperiment):
         camera_gate_s = self.config.get("camera_gate_s", exposure_s)
         camera_gate_ns = int(camera_gate_s * 1e9)
 
-        frame_gap_s = self.config.get("frame_gap_s", 0.05)
+        # frame_gap_s doesn't exist in the real acquisition path -- each
+        # frame there is fired by its own acquire_triggered_frame() call,
+        # separated by reset_delay_s + fire_delay_s (the real dead time
+        # between one frame's gate and the next one's dispatch beginning).
+        # Reused here purely as this preview's inter-frame spacing so
+        # frames render visibly apart; this is still a fabricated combined
+        # sequence the hardware never actually runs (see acquire_frame(),
+        # which fires two independent single-shot sequences instead).
+        frame_gap_s = (
+            self.config.get("reset_delay_s", 0.005)
+            + self.config.get("fire_delay_s", 0.005)
+        )
         frame_gap_ns = int(frame_gap_s * 1e9)
 
         pulse_lead_s = self.config.get("pulse_lead_s", 0.002)
@@ -547,6 +607,7 @@ class ODMRExperiment(ScanExperiment):
 
         power_dbm = self.config.get("mw_power_dbm", -10)
         repeats = self.config.get("repeats", 1)
+        mw_power_settle_s = self.config.get("mw_power_settle_s", 0.0)
         frames = []
 
         for r in range(repeats):
@@ -561,6 +622,15 @@ class ODMRExperiment(ScanExperiment):
                 t0 = time.perf_counter() if timing else None
                 mw.set_power(-100)
                 self._record_timing(r, "off", "visa_set_power_off", t0)
+
+                # Settles the SG386's amplitude step before the gate opens.
+                # Zero by default -- see check_mw_power_settling_margin,
+                # which warns if the delays that already elapse before the
+                # gate (independent of this one) fall below the spec this
+                # exists to cover.
+                t0 = time.perf_counter() if timing else None
+                time.sleep(mw_power_settle_s)
+                self._record_timing(r, "off", "mw_power_settle_sleep", t0)
 
             seq_off = self.build_sequence()
 
@@ -580,6 +650,10 @@ class ODMRExperiment(ScanExperiment):
                 t0 = time.perf_counter() if timing else None
                 mw.set_power(power_dbm)
                 self._record_timing(r, "on", "visa_set_power_on", t0)
+
+                t0 = time.perf_counter() if timing else None
+                time.sleep(mw_power_settle_s)
+                self._record_timing(r, "on", "mw_power_settle_sleep", t0)
 
             seq_on = self.build_sequence()
 

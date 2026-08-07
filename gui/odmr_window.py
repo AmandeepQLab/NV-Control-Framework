@@ -231,10 +231,10 @@ class ODMRWindow(QMainWindow):
 
         exposure_s = config.get("exposure_s", 0.02)
         trigger_delay_s = config.get("trigger_delay_s", 0.05)
-        frame_gap_s = config.get("frame_gap_s", 0.05)
         fire_delay_s = config.get("fire_delay_s", 0.005)
         reset_delay_s = config.get("reset_delay_s", 0.005)
         mw_settle_s = config.get("mw_settle_s", 0.0)
+        mw_power_settle_s = config.get("mw_power_settle_s", 0.0)
         pulse_lead_s = config.get("pulse_lead_s", 0.002)
         pulse_tail_s = config.get("pulse_tail_s", 0.002)
 
@@ -242,7 +242,7 @@ class ODMRWindow(QMainWindow):
             trigger_delay_s
             + repeats * (
                 2 * (exposure_s + pulse_lead_s + pulse_tail_s)
-                + 2 * frame_gap_s
+                + 2 * mw_power_settle_s
             )
         )
 

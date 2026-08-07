@@ -85,20 +85,12 @@ class ODMRPanel(QWidget):
         odmr_layout.addWidget(self.delays_group)
 
         self.trigger_delay_spin = self._add_double(
-            delays_layout, "Camera Trigger Delay (s):", 0.0, 10.0, 4, 0.05
+            delays_layout, "Camera Trigger Delay (s):", 0.0, 10.0, 4, 0.02
         )
         self.trigger_delay_spin.setToolTip(
             "Delay before the first camera trigger pulse.\n"
-            "Recommended: 0.05 s.\n"
-            "Reducing below 0.05 s caused ESR contrast to disappear."
-        )
-
-        self.frame_gap_spin = self._add_double(
-            delays_layout, "Frame Gap (s):", 0.0, 10.0, 4, 0.05
-        )
-        self.frame_gap_spin.setToolTip(
-            "Delay between OFF and ON camera frames inside one frequency point.\n"
-            "Recommended: 0.05 s. Below 0.05 s was unstable for full-frame Andor readout."
+            "Recommended: 0.02 s.\n"
+            "Reducing below 0.02 s may decrease in ESR contrast."
         )
 
         self.fire_delay_spin = self._add_double(
@@ -123,6 +115,20 @@ class ODMRPanel(QWidget):
         self.mw_settle_spin.setToolTip(
             "Delay after setting MW frequency before acquisition.\n"
             "Recommended: 0.0 s currently. Use 0.05–0.1 s only if ESR disappears after frequency jumps."
+        )
+
+        self.mw_power_settle_spin = self._add_double(
+            delays_layout, "MW Power Settle (s):", 0.0, 10.0, 4, 0.0
+        )
+        self.mw_power_settle_spin.setToolTip(
+            "Delay after each OFF/ON MW power write before the camera gate.\n"
+            "SG386 spec: amplitude settles to within 1 ppm in <8 ms.\n"
+            "Recommended: 0.0 s -- at default delay settings, "
+            "reset_delay_s + fire_delay_s + trigger_delay_s + pulse_lead_s "
+            "already provide more than 8 ms of margin before the gate opens.\n"
+            "Raise this if trigger_delay_s, reset_delay_s, or fire_delay_s "
+            "are reduced enough that margin drops below 8 ms (a startup "
+            "warning is logged if this happens)."
         )
 
         self.pulse_lead_spin = self._add_double(
@@ -302,10 +308,10 @@ class ODMRPanel(QWidget):
             "dense2_width": self.dense2_width_spin.value() * 1e6,
             "dense2_steps": self.dense2_steps_spin.value(),
 
-            "frame_gap_s": self.frame_gap_spin.value(),
             "fire_delay_s": self.fire_delay_spin.value(),
             "reset_delay_s": self.reset_delay_spin.value(),
             "mw_settle_s": self.mw_settle_spin.value(),
+            "mw_power_settle_s": self.mw_power_settle_spin.value(),
             "pulse_lead_s": self.pulse_lead_spin.value(),
             "pulse_tail_s": self.pulse_tail_spin.value(),
             "camera_overhead_s": self.camera_overhead_spin.value(),
