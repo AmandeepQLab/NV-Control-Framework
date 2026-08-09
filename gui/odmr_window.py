@@ -103,6 +103,7 @@ class ODMRWindow(QMainWindow):
 
         config = self.panel.get_config()
         config["exposure_s"] = acquisition_state.exposure_s
+        config["baseline_counts"] = acquisition_state.baseline_counts
 
         self.current_config = config.copy()
 

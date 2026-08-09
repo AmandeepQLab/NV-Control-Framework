@@ -15,6 +15,7 @@ class AcquisitionState:
     acquisition_roi: tuple[int, int, int, int] | None = None
     exposure_s: float = 0.02
     binning: int = 1
+    baseline_counts: float = 0.0
 
     def apply_to(self, camera):
         """Apply this complete state while the camera is idle."""

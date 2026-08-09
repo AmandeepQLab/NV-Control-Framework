@@ -15,6 +15,7 @@ TESTS_DIR = pathlib.Path(__file__).parent.resolve()
 ALLOWED_FILES = frozenset(
     {
         "test_acquisition_state.py",
+        "test_baseline_correction.py",
         "test_camera_ownership.py",
         "test_odmr_acquisition_roi.py",
         "test_mw_power_settling.py",

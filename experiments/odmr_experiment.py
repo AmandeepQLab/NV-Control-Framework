@@ -56,6 +56,10 @@ class ODMRExperiment(ScanExperiment):
         # the camera's own self-contained per-call snap_external_trigger().
         self._acquisition_open = False
 
+        # Whether the once-per-scan baseline-margin warning (see
+        # process_frame) has already fired for the current scan.
+        self._baseline_margin_warned = False
+
     # =====================================================
     # SETUP
     # =====================================================
@@ -105,6 +109,12 @@ class ODMRExperiment(ScanExperiment):
                 pulse_lead_s * 1000,
                 mw_power_settle_s * 1000,
             )
+
+    def reset_baseline_warning_state(self):
+        """Call once at scan start so the once-per-scan baseline-margin
+        warning (see process_frame) can fire again for a new scan, rather
+        than staying silenced from a previous one."""
+        self._baseline_margin_warned = False
 
     def setup_scan(self):
         self.configure_acquisition()
@@ -462,6 +472,8 @@ class ODMRExperiment(ScanExperiment):
         i_on_list = []
         signals = []
 
+        baseline = self.config.get("baseline_counts", 0.0)
+
         for r, pair in enumerate(pairs):
             I_off = self._mean_fluorescence(pair[0])
             I_on = self._mean_fluorescence(pair[1])
@@ -474,11 +486,52 @@ class ODMRExperiment(ScanExperiment):
             i_off_list.append(I_off)
             i_on_list.append(I_on)
 
-            if I_on != 0:
-                signals.append(100.0 * I_on / I_off)
-            else:
-                signals.append(0)
+            S_off = I_off - baseline
+            S_on = I_on - baseline
 
+            if S_off <= 0:
+                raise RuntimeError(
+                    f"Repeat {r + 1}: off-resonance signal ({I_off:.2f} counts) "
+                    f"is at or below the configured camera baseline "
+                    f"({baseline:.2f} counts) -- contrast cannot be computed. "
+                    "Check the baseline value (Main Window > Camera Baseline) "
+                    "against a fresh dark measurement, and confirm the "
+                    "laser/MW state is what this point expects."
+                )
+
+            # Below this, the correction subtracts a value comparable to or
+            # larger than what's left -- the corrected signal's reliability
+            # is then dominated by how well the baseline itself was
+            # measured, not by the real optical signal. Once per scan, not
+            # per point, so a whole scan under marginal conditions logs
+            # once rather than flooding the log.
+            if S_off < baseline and not self._baseline_margin_warned:
+                self._baseline_margin_warned = True
+                LOGGER.warning(
+                    "Baseline-corrected off-resonance signal (%.2f counts) is "
+                    "below the baseline itself (%.2f counts) at repeat %d -- "
+                    "the correction's result is only as reliable as the "
+                    "baseline measurement.",
+                    S_off, baseline, r + 1,
+                )
+
+            if S_on <= 0:
+                LOGGER.warning(
+                    "Repeat %d: on-resonance signal (%.2f counts) at or below "
+                    "the camera baseline (%.2f counts) after correction; "
+                    "contrast for this repeat may be negative or unreliable.",
+                    r + 1, I_on, baseline,
+                )
+
+            signals.append(100.0 * S_on / S_off)
+
+        # Raw means, deliberately NOT baseline-corrected -- unlike the
+        # contrast in `signals` above. Kept raw because return_raw=True
+        # callers, the live "Mean I_on / I_off" plot mode, and saved
+        # metadata are meant to show what the camera actually measured.
+        # This means the plotted I_on/I_off traces and the plotted
+        # contrast are computed from different quantities once a baseline
+        # is set -- by design, not an oversight.
         self._last_i_off = np.mean(i_off_list)
         self._last_i_on = np.mean(i_on_list)
         return np.mean(signals)

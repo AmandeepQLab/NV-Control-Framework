@@ -141,6 +141,32 @@ class MainWindow(QMainWindow):
         camera_layout.addLayout(binning_layout)
 
         # -----------------------------
+        # Camera baseline (dark-count offset)
+        # -----------------------------
+
+        baseline_layout = QHBoxLayout()
+        baseline_layout.addWidget(QLabel("Camera Baseline (counts):"))
+
+        self.baseline_spin = QDoubleSpinBox()
+        self.baseline_spin.setRange(0.0, 65535.0)
+        self.baseline_spin.setDecimals(1)
+        self.baseline_spin.setValue(0.0)
+        self.baseline_spin.setToolTip(
+            "Camera dark-count offset, subtracted from ROI means before ODMR "
+            "contrast is computed.\n"
+            "Typically ~100 counts on an Andor Neo sCMOS.\n"
+            "Measure by blocking the laser at your working exposure and "
+            "entering the resulting ROI mean.\n"
+            "0 disables the correction.\n"
+            "The raw I_on/I_off traces are not baseline-corrected; only the "
+            "contrast is."
+        )
+        self.baseline_spin.valueChanged.connect(self.set_baseline_counts)
+
+        baseline_layout.addWidget(self.baseline_spin)
+        camera_layout.addLayout(baseline_layout)
+
+        # -----------------------------
         # ROI
         # -----------------------------
 
@@ -423,6 +449,7 @@ class MainWindow(QMainWindow):
             acquisition_roi=self.acquisition_state.acquisition_roi,
             exposure_s=value,
             binning=self.acquisition_state.binning,
+            baseline_counts=self.acquisition_state.baseline_counts,
         )
         self.apply_acquisition_state()
 
@@ -431,8 +458,21 @@ class MainWindow(QMainWindow):
             acquisition_roi=self.acquisition_state.acquisition_roi,
             exposure_s=self.acquisition_state.exposure_s,
             binning=value,
+            baseline_counts=self.acquisition_state.baseline_counts,
         )
         self.apply_acquisition_state()
+
+    def set_baseline_counts(self, value):
+        """Update the camera dark-count offset. Never touches the camera --
+        this is a pure software correction applied later in ODMR's
+        process_frame(), not a hardware setting, so unlike set_exposure()/
+        set_binning() this does not call apply_acquisition_state()."""
+        self.acquisition_state = AcquisitionState(
+            acquisition_roi=self.acquisition_state.acquisition_roi,
+            exposure_s=self.acquisition_state.exposure_s,
+            binning=self.acquisition_state.binning,
+            baseline_counts=value,
+        )
 
     # =========================================================
     # ROI
@@ -488,6 +528,7 @@ class MainWindow(QMainWindow):
             acquisition_roi=roi,
             exposure_s=self.acquisition_state.exposure_s,
             binning=self.acquisition_state.binning,
+            baseline_counts=self.acquisition_state.baseline_counts,
         )
         try:
             applied = apply_live_acquisition_state(

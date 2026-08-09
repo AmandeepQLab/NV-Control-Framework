@@ -123,6 +123,7 @@ class ODMRWorker(QObject):
             self._camera_lease.__enter__()
             self.experiment.configure_acquisition()
             self.experiment.check_mw_power_settling_margin()
+            self.experiment.reset_baseline_warning_state()
 
             if self._timing:
                 self.experiment.reset_timing()
