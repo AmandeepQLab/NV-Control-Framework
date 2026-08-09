@@ -15,11 +15,13 @@ from pulsestreamer import Sequence, OutputState
 from PyQt6.QtCore import QCoreApplication, QTimer  # type: ignore
 
 from hardware.pulse_streamer.swabian_pulse_streamer import SwabianPulseStreamer
+from hardware.pulse_streamer.sim_pulse_streamer import SimPulseStreamer
 from hardware.camera.andor_neo_andor3 import AndorNeoAndor3
 from hardware.camera.sim_camera import SimCamera
 from hardware.microwave.sim_microwave import SimMicrowave
 from hardware.magnet.magnet import Magnet, POSITIVE, NEGATIVE
 from sequencing.pulse_sequence import PulseSequence
+from experiments.odmr_experiment import ODMRExperiment
 from gui.odmr_worker import ODMRWorker
 
 
@@ -45,12 +47,19 @@ class FakePS:
 
     def __init__(self):
         self.stream_calls = []
+        # (seq, kwargs) for every stream() call, in chronological order --
+        # additive alongside stream_calls so existing kwargs-only
+        # assertions are unaffected. Lets a test walk everything ever
+        # dispatched to the device and inspect each sequence's own
+        # per-channel content, not just the top-level stream() arguments.
+        self.streamed = []
 
     def createSequence(self):
         return Sequence()
 
     def stream(self, seq, **kwargs):
         self.stream_calls.append(kwargs)
+        self.streamed.append((seq, kwargs))
 
 
 def _make_streamer():
@@ -117,6 +126,91 @@ class RunArgumentPassingTests(unittest.TestCase):
         custom = OutputState(digi=[CHANNEL_MAP["MW"]])
         streamer.run(n_runs=1, final=custom)
         self.assertIs(streamer.ps.stream_calls[-1]["final"], custom)
+
+
+# =====================================================
+# reset_outputs() preserves persistent_outputs (the relay) instead of
+# unconditionally zeroing every known channel -- the bug this task fixes
+# =====================================================
+
+def _channel_pattern(seq, channel):
+    """The exact (duration, state) list passed to Sequence.setDigital()
+    for one channel -- read back via the real vendor Sequence.getDigital(),
+    not the merged/unioned timeline, so each channel's own segments are
+    unambiguous."""
+    return seq.getDigital()[channel][0]
+
+
+class ResetOutputsPreservesRelayTests(unittest.TestCase):
+    def test_reset_outputs_preserves_set_relay_channel(self):
+        streamer = _make_streamer()
+        streamer.set_digital_output(CHANNEL_MAP["flipMF"], True)
+
+        streamer.reset_outputs()
+
+        seq, kwargs = streamer.ps.streamed[-1]
+        self.assertEqual(kwargs, {})  # n_runs/final still untouched
+
+        relay_pattern = _channel_pattern(seq, CHANNEL_MAP["flipMF"])
+        self.assertTrue(all(state == 1 for _, state in relay_pattern))
+
+        for name, ch in CHANNEL_MAP.items():
+            if name == "flipMF":
+                continue
+            pattern = _channel_pattern(seq, ch)
+            self.assertTrue(
+                all(state == 0 for _, state in pattern),
+                f"{name} (channel {ch}) should still be forced LOW",
+            )
+
+    def test_reset_outputs_matches_old_behavior_when_nothing_is_set(self):
+        streamer = _make_streamer()  # persistent_outputs all False
+
+        streamer.reset_outputs()
+
+        seq, _ = streamer.ps.streamed[-1]
+        for ch in CHANNEL_MAP.values():
+            pattern = _channel_pattern(seq, ch)
+            self.assertTrue(all(state == 0 for _, state in pattern))
+
+    def test_close_de_energizes_relay_regardless_of_persistent_state(self):
+        streamer = _make_streamer()
+        streamer.set_digital_output(CHANNEL_MAP["flipMF"], True)
+
+        streamer.close()
+
+        seq, kwargs = streamer.ps.streamed[-1]
+        self.assertEqual(kwargs, {})
+        for ch in CHANNEL_MAP.values():
+            pattern = _channel_pattern(seq, ch)
+            self.assertTrue(
+                all(state == 0 for _, state in pattern),
+                f"channel {ch} should be de-energized at shutdown",
+            )
+
+    def test_sim_pulse_streamer_reset_outputs_preserves_relay(self):
+        """SimPulseStreamer parity -- see CLAUDE.md: sim classes must have
+        full method parity, not just currently-called methods."""
+        streamer = SimPulseStreamer(channel_map=dict(CHANNEL_MAP))
+        streamer.set_digital_output(CHANNEL_MAP["flipMF"], True)
+
+        streamer.reset_outputs()
+
+        self.assertEqual(streamer.last_reset_channels[CHANNEL_MAP["flipMF"]], 1)
+        for name, ch in CHANNEL_MAP.items():
+            if name == "flipMF":
+                continue
+            self.assertEqual(streamer.last_reset_channels[ch], 0, name)
+
+    def test_sim_pulse_streamer_close_de_energizes_relay(self):
+        streamer = SimPulseStreamer(channel_map=dict(CHANNEL_MAP))
+        streamer.set_digital_output(CHANNEL_MAP["flipMF"], True)
+
+        streamer.close()
+
+        self.assertTrue(
+            all(state == 0 for state in streamer.last_reset_channels.values())
+        )
 
 
 # =====================================================
@@ -190,6 +284,63 @@ class MagnetSharedStreamerTests(unittest.TestCase):
         # device in still asserts the relay channel.
         digi_mask, _, _ = streamer.ps.stream_calls[-1]["final"].getData()
         self.assertTrue(digi_mask & (1 << CHANNEL_MAP["flipMF"]))
+
+    def test_relay_asserted_in_every_streamed_sequence_during_a_scan(self):
+        """The scenario this task exists to prevent, checked as a gap
+        analysis rather than only at the reset_outputs() calls: the
+        failure mode is the relay dropping LOW between one run() finishing
+        and the next reset_outputs() arriving, so every sequence ever
+        streamed to the device during the scan -- the sync_outputs() call
+        that set the relay, every frame's reset_outputs(), and every
+        frame's run() -- must assert flip_channel throughout its own
+        playback, and (for run() calls, which carry one) in its final
+        state too. If any single one drops it, that's the exact streamed
+        call that would let the relay glitch on real hardware.
+        """
+        streamer = _make_streamer()
+        magnet = _make_bare_magnet(streamer)
+        magnet.set_polarity(NEGATIVE)  # flip_channel -> True; one sync_outputs() call
+
+        mw = SimMicrowave()
+        mw.connect()
+        camera = SimCamera(image_shape=(4, 4))
+        hardware = {
+            "camera": camera,
+            "microwave": mw,
+            "pulse_streamer": streamer,
+            "channels": CHANNEL_MAP,
+        }
+        config = {
+            "mw_power_dbm": -10,
+            "repeats": 3,
+            "exposure_s": 0.001,
+            "trigger_delay_s": 0.001,
+            "fire_delay_s": 0.001,
+            "reset_delay_s": 0.001,
+            "pulse_lead_s": 0.0005,
+            "pulse_tail_s": 0.0005,
+        }
+        experiment = ODMRExperiment(hardware, config)
+
+        experiment.acquire_frame()
+
+        flip_channel = CHANNEL_MAP["flipMF"]
+        # 1 sync_outputs() + repeats * 2 frames * (reset_outputs + run)
+        self.assertEqual(len(streamer.ps.streamed), 1 + 3 * 2 * 2)
+
+        for i, (seq, kwargs) in enumerate(streamer.ps.streamed):
+            pattern = _channel_pattern(seq, flip_channel)
+            self.assertTrue(
+                all(state == 1 for _, state in pattern),
+                f"streamed call #{i} (kwargs={kwargs}) dropped flip_channel "
+                f"during its own playback: pattern={pattern}",
+            )
+            if "final" in kwargs:
+                digi_mask, _, _ = kwargs["final"].getData()
+                self.assertTrue(
+                    digi_mask & (1 << flip_channel),
+                    f"streamed call #{i} left flip_channel LOW in its final state",
+                )
 
     def test_sync_positive_polarity_never_calls_run_or_reset_outputs(self):
         streamer = _make_streamer()

@@ -15,6 +15,7 @@ class SimPulseStreamer:
             channel: False
             for channel in self.channel_map.values()
         }
+        self.last_reset_channels = {}
 
     def connect(self):
         self.connected = True
@@ -62,11 +63,32 @@ class SimPulseStreamer:
 
         print("[Sim Pulse Streamer END]\n")
 
-    def reset_outputs(self, duration_ns=1000):
+    def reset_outputs(self, duration_ns=1000, preserve_persistent=True):
         """
-        Temporarily reset all known outputs to LOW (simulated).
+        Force a clean baseline on every known output (simulated).
+
+        Mirrors SwabianPulseStreamer.reset_outputs() -- see that method's
+        docstring for the preserve_persistent distinction. Tracks the
+        resulting per-channel state on self.last_reset_channels (there's
+        no real device to hold it) so sim-mode tests can verify parity.
         """
-        print(f"[Sim Pulse Streamer] reset_outputs(duration_ns={duration_ns}) (simulated)")
+        channels = set(self.persistent_outputs)
+
+        if self.channel_map:
+            channels.update(self.channel_map.values())
+
+        if self.sequence is not None:
+            for p in self.sequence.digital_pulses:
+                channels.add(p.channel)
+
+        self.last_reset_channels = {
+            ch: (int(self.get_digital_output(ch)) if preserve_persistent else 0)
+            for ch in channels
+        }
+
+        print(f"[Sim Pulse Streamer] reset_outputs(duration_ns={duration_ns}, "
+              f"preserve_persistent={preserve_persistent}) -> "
+              f"{self.last_reset_channels} (simulated)")
 
     def set_digital_output(self, channel, state):
         """
@@ -88,6 +110,6 @@ class SimPulseStreamer:
 
     def close(self):
         try:
-            self.reset_outputs()
+            self.reset_outputs(preserve_persistent=False)
         except Exception:
             pass

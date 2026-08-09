@@ -114,9 +114,29 @@ class SwabianPulseStreamer:
 
         print("[Swabian] Sequence streamed to hardware")
 
-    def reset_outputs(self, duration_ns=1000):
+    def reset_outputs(self, duration_ns=1000, preserve_persistent=True):
         """
-        Temporarily reset all known physical digital outputs to LOW.
+        Force a clean baseline on every known digital output.
+
+        preserve_persistent=True (default, used by every per-frame caller)
+        holds each channel at its persistent_outputs value rather than
+        hardcoding LOW -- channels nothing has ever called
+        set_digital_output() for (greenLaser/MW/detector/detector2) are
+        always False there, so this is behaviorally identical to the old
+        unconditional-LOW behavior for them. It matters for a channel that
+        IS commanded, like the magnet polarity relay (flip_channel): this
+        method is called once per triggered ODMR frame, and forcing that
+        channel LOW here every time -- ignoring what it was actually
+        commanded to -- was the bug (mirrors the same fix already applied
+        to run()'s final state; see that method's docstring). Mirrors
+        compile_sequence()'s own baseline-state logic, which already reads
+        get_digital_output(ch) for any channel not touched by the loaded
+        sequence's own pulses.
+
+        preserve_persistent=False forces every channel to LOW regardless
+        of persistent_outputs -- used only by close(), where de-energizing
+        everything (including the relay) at shutdown is the correct
+        behavior, unlike the per-frame case.
         """
         channels = set(self.persistent_outputs)
 
@@ -130,7 +150,8 @@ class SwabianPulseStreamer:
         seq = self.ps.createSequence()
 
         for ch in channels:
-            seq.setDigital(ch, [(duration_ns, 0)])
+            state = int(self.get_digital_output(ch)) if preserve_persistent else 0
+            seq.setDigital(ch, [(duration_ns, state)])
 
         self.ps.stream(seq)
 
@@ -162,6 +183,9 @@ class SwabianPulseStreamer:
 
     def close(self):
         try:
-            self.reset_outputs()
+            # Shutdown wants everything de-energized -- including the
+            # relay -- unlike the per-frame reset_outputs() default, which
+            # preserves it. See reset_outputs()'s docstring.
+            self.reset_outputs(preserve_persistent=False)
         except Exception:
             pass
