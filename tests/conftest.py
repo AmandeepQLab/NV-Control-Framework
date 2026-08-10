@@ -20,6 +20,7 @@ ALLOWED_FILES = frozenset(
         "test_odmr_acquisition_roi.py",
         "test_mw_switch_gating.py",
         "test_odmr_external_acquisition.py",
+        "test_odmr_time_estimate.py",
         "test_paths.py",
         "test_pulse_streamer_single_shot.py",
         "test_roi.py",

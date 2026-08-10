@@ -136,15 +136,6 @@ class ODMRPanel(QWidget):
             "Recommended: 0.002 s.\n"
             "Provides safe overlap between illumination/MW and camera exposure."
         )
-        self.camera_overhead_spin = self._add_double(
-            delays_layout,
-            "Camera Overhead (s):", 0.0, 5.0, 4, 0.35
-        )
-        self.camera_overhead_spin.setToolTip(
-            "Measured camera acquisition overhead per frequency point.\n"
-            "Recommended: 0.35 s for current full-frame Andor buffered OFF/ON acquisition.\n"
-            "Increase this if estimated time is lower than actual time."
-        )
         self.delays_group.setVisible(False)
 
         self.save_check = QCheckBox("Save data")
@@ -299,7 +290,6 @@ class ODMRPanel(QWidget):
             "mw_settle_s": self.mw_settle_spin.value(),
             "pulse_lead_s": self.pulse_lead_spin.value(),
             "pulse_tail_s": self.pulse_tail_spin.value(),
-            "camera_overhead_s": self.camera_overhead_spin.value(),
         }
 
     def get_plot_mode(self):

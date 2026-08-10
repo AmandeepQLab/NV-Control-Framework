@@ -331,9 +331,6 @@ class ODMRWorker(QObject):
                 f"# mw_settle_s={self.config.get('mw_settle_s', 0.0)}",
                 f"# pulse_lead_s={self.config.get('pulse_lead_s', 0.002)}",
                 f"# pulse_tail_s={self.config.get('pulse_tail_s', 0.002)}",
-                f"# camera_overhead_s={self.config.get('camera_overhead_s', 0.35)} "
-                "(GUI time-estimate fudge factor, not read by the "
-                "acquisition path)",
                 f"# estimated_s={self._estimated_s}",
                 f"# measured_scan_total_s={scan_total_s}",
                 "# camera.wait_buffer duration includes trigger wait + "

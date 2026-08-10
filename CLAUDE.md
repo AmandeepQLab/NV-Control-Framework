@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Assistant-facing guide to this repository. Last verified against the code: 2026-08-04.
+Assistant-facing guide to this repository. Last verified against the code: 2026-08-10.
 
 This file documents how the code actually works, not how it was originally intended to work — every claim below was checked against the current source, not carried forward from comments, commit messages, or prior documentation. If you change something this file describes, update this file in the same change.
 
@@ -60,6 +60,10 @@ See `docs/zero_field_audit_2026-07.md` for the full physics/logic audit with per
 - Per-point repeat frames (the `averages` loop inside `acquire_frame()`) are discarded after averaging — only the mean is kept. This is separate from the multi-*scan* raw-saving feature (`save_raw_scans`), which persists whole sweeps, not individual repeats (audit §10.9).
 
 Camera-contention and ROI-validation findings from the same audit are fixed — see "Architecture and call chain" above.
+
+## Known hardware quirks (ODMR timing)
+
+**`trigger_delay_s` below ~0.02s triggers a reproducible ~400ms per-frame stall, cause unknown.** Confirmed from `data/odmr_timing_*.csv` timing-diagnostics recordings: at `trigger_delay_s = 0.0`, roughly 1 frame in 9 (10.4-10.8% in two independent recorded runs) takes ~400-430ms instead of the normal ~90ms — a distinct second mode in the `repeat_total` distribution, not scattered jitter. At `trigger_delay_s >= 0.02s` the second mode disappears entirely (tightest recorded spread: ~130-133ms, no bimodality). This has not been root-caused — candidates include the Andor SDK3 buffer/trigger-arming not having settled from the previous frame, but this is speculation, not confirmed. **Do not push `trigger_delay_s` toward 0 to save time even though MW switch-gating contrast is indifferent to it** — the stall more than cancels any savings and makes scan duration unpredictable. `gui/odmr_window.py::estimate_odmr_time()` does not model this (see the comment at its `trigger_delay_s`-dependent term) — its estimate for `trigger_delay_s < 0.02s` will run 15-30% low for this reason, not because the formula itself is wrong.
 
 ## Testing safety — read before running pytest with `--hardware`
 

@@ -14,6 +14,39 @@ from gui.pulse_sequence_window import PulseSequenceWindow
 from analysis.odmr_fit import fit_single_lorentzian, fit_double_lorentzian
 
 
+# =====================================================
+# ESTIMATE-ONLY CAMERA/VISA CONSTANTS
+# =====================================================
+# Measured facts about this rig's camera/VISA hardware, not user-tunable
+# ODMR parameters -- no spinbox, no config key. Derived as medians pooled
+# across all 23 data/odmr_timing_*.csv timing-diagnostics recordings
+# (2026-08-06 through 2026-08-09; see estimate_odmr_time() below for how
+# each is used).
+#
+# Calibration caveat: all 23 source recordings predate the MW
+# switch-gating change (2026-08-10) and so include a per-frame VISA
+# set_power() write (~1.5-1.6ms) that acquire_triggered_frame() no longer
+# performs. CAMERA_PER_FRAME_OVERHEAD_S below is therefore ~1.5ms/frame
+# higher than current-code reality -- estimates will run slightly high
+# (roughly 2 * repeats * n_points * averages * 1.5ms per scan, well under
+# 1% of a typical scan's total) until constants are re-derived from a
+# post-switch-gating recording.
+
+# camera.{trigger_mode_set,flush_pre,queue_buffer,acquisition_start} (arm)
+# + camera.{acquisition_stop,flush_post} (disarm), once per scan.
+CAMERA_ARM_DISARM_S = 0.160
+
+# visa_set_frequency + visa_rf_on + visa_set_power_initial (SG386 VISA
+# calls in ODMRExperiment.set_scan_point()), once per (point, average).
+VISA_POINT_OVERHEAD_S = 0.0102
+
+# load_sequence + reset_outputs (Pulse Streamer RPCs) + pulse.run() RPC +
+# sensor readout (wait_buffer minus exposure/trigger_delay/fire_delay) +
+# ~1.2ms unaccounted host/thread scheduling overhead (thread creation,
+# Python call overhead), once per triggered frame (2 * repeats per point).
+CAMERA_PER_FRAME_OVERHEAD_S = 0.0132
+
+
 class ODMRWindow(QMainWindow):
 
     stop_requested = pyqtSignal()
@@ -236,25 +269,35 @@ class ODMRWindow(QMainWindow):
         reset_delay_s = config.get("reset_delay_s", 0.005)
         mw_settle_s = config.get("mw_settle_s", 0.0)
         pulse_lead_s = config.get("pulse_lead_s", 0.002)
-        pulse_tail_s = config.get("pulse_tail_s", 0.002)
+        # pulse_tail_s deliberately not read here -- nothing in the
+        # acquisition path waits for it (see build_sequence()/
+        # acquire_triggered_frame() in ODMRExperiment).
 
-        sequence_time_per_point = (
-            trigger_delay_s
-            + repeats * (
-                2 * (exposure_s + pulse_lead_s + pulse_tail_s)
-            )
+        # Each triggered frame (acquire_triggered_frame()) pays
+        # reset_delay_s + fire_delay_s once, then blocks on
+        # grab_external_frame(), which itself waits out the sequence's own
+        # baked-in trigger_delay_s + pulse_lead_s wait (build_sequence()'s
+        # camera_t = trigger_delay_ns + pulse_lead_ns), then exposure_s,
+        # then sensor readout -- all once per frame, and there are
+        # 2 * repeats frames (OFF + ON) per point-average, not one.
+        #
+        # NOTE: at trigger_delay_s < 0.02s, roughly 1 frame in 9 hits a
+        # reproducible ~400ms stall not modeled here at all -- see
+        # "Known hardware quirks (ODMR timing)" in CLAUDE.md. This
+        # formula is a best-estimate for the typical (non-stalled) case;
+        # it will run 15-30% low for scans configured that way.
+        frame_wall_s = (
+            reset_delay_s + fire_delay_s + trigger_delay_s + pulse_lead_s
+            + exposure_s + CAMERA_PER_FRAME_OVERHEAD_S
         )
 
-        camera_overhead_per_point = config.get("camera_overhead_s", 0.35)
-        time_per_point = (
-            mw_settle_s
-            + reset_delay_s
-            + fire_delay_s
-            + sequence_time_per_point
-            + camera_overhead_per_point
+        # set_scan_point() pays its VISA overhead + mw_settle_s once per
+        # (point, average) -- not once per frame.
+        time_per_point_avg = (
+            VISA_POINT_OVERHEAD_S + mw_settle_s + 2 * repeats * frame_wall_s
         )
 
-        return n_points * averages * time_per_point
+        return CAMERA_ARM_DISARM_S + n_points * averages * time_per_point_avg
 
     # =====================================================
     # REFRESH PLOT

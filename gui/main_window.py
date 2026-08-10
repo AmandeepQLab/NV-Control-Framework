@@ -119,7 +119,7 @@ class MainWindow(QMainWindow):
         self.exposure_spin = QDoubleSpinBox()
         self.exposure_spin.setRange(0.001, 10)
         self.exposure_spin.setDecimals(4)
-        self.exposure_spin.setValue(0.02)
+        self.exposure_spin.setValue(0.01)
         self.exposure_spin.valueChanged.connect(self.set_exposure)
 
         exposure_layout.addWidget(self.exposure_spin)
