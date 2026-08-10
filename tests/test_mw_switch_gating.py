@@ -5,6 +5,14 @@ only power write per point, and SimCamera's sequence-based contrast model
 (with its power-based fallback for callers that don't wire a
 pulse_streamer).
 
+Also carries two regression groups relocated here from the deleted
+tests/test_mw_power_settling.py after mw_power_settle_s/
+check_mw_power_settling_margin() were removed (the switch-gating change
+they were kept around to allow reverting is now confirmed at the rig):
+MwSettleUnaffectedTests (mw_settle_s frequency settling is a separate,
+still-live knob) and FrameGapRemovedTests (frame_gap_s-absence checks,
+unrelated to mw_power_settle_s and still valid).
+
 No real hardware.
 """
 
@@ -17,6 +25,7 @@ from PyQt6.QtCore import QCoreApplication, QTimer  # type: ignore
 
 from experiments.odmr_experiment import ODMRExperiment
 from gui.odmr_worker import ODMRWorker
+from gui.panels.odmr_panel import ODMRPanel
 from hardware.camera.sim_camera import SimCamera
 from hardware.hardware_manager import HardwareManager
 from hardware.microwave.sim_microwave import SimMicrowave
@@ -151,6 +160,63 @@ class AcquireFrameSequenceContentTests(unittest.TestCase):
         experiment.acquire_configured_point(2.87e9)
 
         self.assertEqual(mw.power_calls, [-10])
+
+
+# =====================================================
+# set_scan_point(): mw_settle_s (frequency settling) is a separate knob
+# from the removed mw_power_settle_s/check_mw_power_settling_margin()
+# machinery and must stay unaffected by switch gating -- relocated from
+# the now-deleted tests/test_mw_power_settling.py.
+# =====================================================
+
+class MwSettleUnaffectedTests(unittest.TestCase):
+    """mw_settle_s (frequency settling, set_scan_point) is untouched by
+    switch gating: same call order (frequency, one power write, rf_on),
+    no sleep injected beyond mw_settle_s itself."""
+
+    def test_set_scan_point_call_order_and_timing_unchanged(self):
+        hardware, mw, _pulse = _make_hardware()
+        config = _make_config(mw_settle_s=0.0)
+        experiment = ODMRExperiment(hardware, config)
+
+        t0 = time.perf_counter()
+        experiment.set_scan_point(2.87e9)
+        elapsed = time.perf_counter() - t0
+
+        self.assertEqual(mw.frequency, 2.87e9)
+        self.assertEqual(mw.power_calls, [-10])
+        self.assertTrue(mw.rf_enabled)
+        self.assertLess(elapsed, 0.03)
+
+
+# =====================================================
+# frame_gap_s absence regressions -- relocated from the now-deleted
+# tests/test_mw_power_settling.py (their mw_power_settle_s-specific
+# assertions were dropped along with that feature).
+# =====================================================
+
+class FrameGapRemovedTests(unittest.TestCase):
+    def test_panel_has_no_frame_gap_control(self):
+        # Source inspection, not live instantiation: ODMRPanel is a real
+        # QWidget (contains a pyqtgraph PlotWidget) and this test suite
+        # deliberately never constructs GUI widgets outside a running
+        # application -- reading the class source is enough to verify
+        # frame_gap_s is gone, without needing a display/platform plugin.
+        panel_source = inspect.getsource(ODMRPanel)
+        self.assertNotIn("frame_gap", panel_source)
+
+        config_source = inspect.getsource(ODMRPanel.get_config)
+        self.assertNotIn("frame_gap_s", config_source)
+
+    def test_preview_sequence_builds_without_frame_gap_s(self):
+        hardware, _mw, _pulse = _make_hardware()
+        config = _make_config(reset_delay_s=0.005, fire_delay_s=0.005)
+        self.assertNotIn("frame_gap_s", config)
+        experiment = ODMRExperiment(hardware, config)
+
+        sequence = experiment.build_repeated_off_on_sequence(repeats=2)
+
+        self.assertGreater(len(sequence.digital_pulses), 0)
 
 
 # =====================================================

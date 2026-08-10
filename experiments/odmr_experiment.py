@@ -13,13 +13,6 @@ from sequencing.pulse_sequence import PulseSequence
 
 LOGGER = logging.getLogger(__name__)
 
-# SG386 manual: amplitude switching settles to within 1 ppm in under this
-# long. Used only to decide whether to warn that the accumulated delay
-# between an MW power write and the camera gate opening (see
-# check_mw_power_settling_margin) has fallen below spec -- not itself a
-# delay applied anywhere.
-SG386_AMPLITUDE_SETTLE_S = 0.008
-
 
 class ODMRExperiment(ScanExperiment):
 
@@ -67,48 +60,6 @@ class ODMRExperiment(ScanExperiment):
     def setup(self):
 
         super().setup()
-
-    def check_mw_power_settling_margin(self):
-        """Warn if the accumulated delay before the MW/laser gate opens has
-        fallen below the SG386's amplitude-settling spec.
-
-        Sums every delay that elapses between an mw.set_power() write in
-        acquire_frame() and the gate actually opening (see acquire_frame/
-        acquire_triggered_frame/build_sequence for the derivation of this
-        chain): reset_delay_s, fire_delay_s, trigger_delay_s, pulse_lead_s,
-        and mw_power_settle_s itself. At today's defaults this margin is
-        accidental (none of the first four exist for MW-settling reasons),
-        so this check -- not a larger default -- is what catches it
-        shrinking below spec if any of those are tuned down later.
-        """
-        reset_delay_s = self.config.get("reset_delay_s", 0.005)
-        fire_delay_s = self.config.get("fire_delay_s", 0.005)
-        trigger_delay_s = self.config.get("trigger_delay_s", 0.05)
-        pulse_lead_s = self.config.get("pulse_lead_s", 0.002)
-        mw_power_settle_s = self.config.get("mw_power_settle_s", 0.0)
-
-        margin_s = (
-            reset_delay_s + fire_delay_s + trigger_delay_s
-            + pulse_lead_s + mw_power_settle_s
-        )
-
-        if margin_s < SG386_AMPLITUDE_SETTLE_S:
-            LOGGER.warning(
-                "MW power settling margin is %.3f ms, below the SG386's "
-                "%.1f ms amplitude-settling spec (<1 ppm). Contributing "
-                "delays: reset_delay_s=%.3f ms, fire_delay_s=%.3f ms, "
-                "trigger_delay_s=%.3f ms, pulse_lead_s=%.3f ms, "
-                "mw_power_settle_s=%.3f ms. ODMR contrast may include an "
-                "RF settling transient. Raise mw_power_settle_s (or one of "
-                "the other contributing delays) to restore margin.",
-                margin_s * 1000,
-                SG386_AMPLITUDE_SETTLE_S * 1000,
-                reset_delay_s * 1000,
-                fire_delay_s * 1000,
-                trigger_delay_s * 1000,
-                pulse_lead_s * 1000,
-                mw_power_settle_s * 1000,
-            )
 
     def reset_baseline_warning_state(self):
         """Call once at scan start so the once-per-scan baseline-margin
@@ -658,13 +609,7 @@ class ODMRExperiment(ScanExperiment):
         MW on/off is gated entirely by channel 2 (the fast switch) via
         build_sequence()'s mw_on argument -- the SG386 itself stays at
         set_scan_point()'s frequency/power for the whole point, no
-        per-frame VISA power write. This intentionally leaves
-        mw_power_settle_s/check_mw_power_settling_margin() in place
-        elsewhere in this file: they're now dead (nothing shrinks the
-        margin they check), kept only so a clean revert to power-based
-        gating -- to isolate a switch-isolation problem if rig contrast
-        drops -- doesn't also have to restore unrelated code. Removing
-        them is a separate, follow-up change.
+        per-frame VISA power write.
         """
         pulse = self.hw["pulse_streamer"]
         timing = self._timing
