@@ -419,6 +419,17 @@ class ODMRWindow(QMainWindow):
             i_off = np.array(self.odmr_worker.i_off_data)
             i_on = np.array(self.odmr_worker.i_on_data)
 
+            # Camera's genuinely read-back exposure at scan start (see
+            # ODMRExperiment.configure_acquisition()), alongside the
+            # requested exposure_s already in current_config -- lets the
+            # real quantisation/drift magnitude be seen from saved data
+            # rather than assumed.
+            actual_exposure_s = getattr(
+                self.odmr_worker.experiment, "actual_exposure_s", None
+            )
+            if actual_exposure_s is not None:
+                self.current_config["camera_exposure_actual_s"] = actual_exposure_s
+
             self.data_manager.save_odmr(
                 freqs_hz,
                 signal,

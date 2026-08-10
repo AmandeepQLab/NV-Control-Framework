@@ -18,6 +18,7 @@ ALLOWED_FILES = frozenset(
         "test_baseline_correction.py",
         "test_camera_ownership.py",
         "test_odmr_acquisition_roi.py",
+        "test_exposure_propagation.py",
         "test_mw_switch_gating.py",
         "test_odmr_external_acquisition.py",
         "test_odmr_time_estimate.py",

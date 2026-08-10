@@ -53,6 +53,13 @@ class ODMRExperiment(ScanExperiment):
         # process_frame) has already fired for the current scan.
         self._baseline_margin_warned = False
 
+        # The camera's genuinely read-back exposure at scan start (see
+        # configure_acquisition()), for comparison against config
+        # ["exposure_s"] (what camera_gate_s was sized from) and for
+        # recording alongside the requested value in saved metadata.
+        # None until configure_acquisition() runs.
+        self.actual_exposure_s = None
+
     # =====================================================
     # SETUP
     # =====================================================
@@ -73,9 +80,45 @@ class ODMRExperiment(ScanExperiment):
         self.image_cube.scan_axis_unit = self.scan_axis_unit
         self.image_cube.scan_axis_values = self.scan_vector
 
+    # Provisional -- no rig data yet on how large sCMOS row-period
+    # quantisation actually is. Not a correctness threshold, just a
+    # floating-point noise floor so exact-equality jitter doesn't log.
+    # Revisit once actual_exposure_s vs exposure_s has been observed on
+    # real hardware (see the warning below and its recorded metadata).
+    _EXPOSURE_DRIFT_EPSILON_S = 1e-6
+
     def configure_acquisition(self):
-        """Apply this experiment's temporary camera AOI while it is borrowed."""
-        self.hw["camera"].set_roi(self.acquisition_roi)
+        """Apply this experiment's temporary camera AOI while it is borrowed.
+
+        Also reads back the camera's actual exposure (see AndorNeoAndor3.
+        set_exposure()/configure_camera() -- genuine SDK readback, not the
+        last-requested value) and compares it against config["exposure_s"],
+        which is what camera_gate_s in build_sequence() was sized from.
+        Logged, not raised: quantisation/other small drift is expected to
+        be routine once real readback exists, not exceptional, and there's
+        no principled threshold yet to fail hard on.
+        """
+        camera = self.hw["camera"]
+        camera.set_roi(self.acquisition_roi)
+
+        self.actual_exposure_s = getattr(camera, "exposure_time", None)
+        requested_exposure_s = self.config.get("exposure_s")
+        if (
+            self.actual_exposure_s is not None
+            and requested_exposure_s is not None
+            and abs(self.actual_exposure_s - requested_exposure_s)
+            > self._EXPOSURE_DRIFT_EPSILON_S
+        ):
+            LOGGER.warning(
+                "Camera exposure drift at scan start: requested "
+                "exposure_s=%.6f s (camera_gate_s was sized from this), "
+                "camera actually holds %.6f s (difference %.6f s). The "
+                "pulse sequence's camera gate and the real integration "
+                "window disagree.",
+                requested_exposure_s,
+                self.actual_exposure_s,
+                self.actual_exposure_s - requested_exposure_s,
+            )
 
     # =====================================================
     # TIMING DIAGNOSTICS

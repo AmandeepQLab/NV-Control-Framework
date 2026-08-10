@@ -58,9 +58,11 @@ class MainWindow(QMainWindow):
 
         self.state = "IDLE"
         self.odmr_window = None
-        # Full-sensor coordinates for camera acquisition.  Experiments receive
-        # this value but never define a separate acquisition ROI of their own.
-        self.acquisition_state = AcquisitionState()
+        # self.acquisition_state is constructed below, once the exposure/
+        # binning/baseline spinboxes exist -- built from their displayed
+        # values so the GUI display is the single source of truth for the
+        # startup default, not an independent dataclass default. See the
+        # explicit push to the camera at the end of __init__.
         self._sensor_dimensions = self._read_sensor_dimensions()
         self._syncing_roi_controls = False
 
@@ -165,6 +167,18 @@ class MainWindow(QMainWindow):
 
         baseline_layout.addWidget(self.baseline_spin)
         camera_layout.addLayout(baseline_layout)
+
+        # Full-sensor coordinates for camera acquisition.  Experiments
+        # receive this value but never define a separate acquisition ROI
+        # of their own. Built from the spinboxes just created above, not
+        # AcquisitionState's own dataclass defaults, so what's displayed
+        # is what this object holds from the moment it exists -- pushed
+        # to the camera itself at the end of __init__.
+        self.acquisition_state = AcquisitionState(
+            exposure_s=self.exposure_spin.value(),
+            binning=self.binning_spin.value(),
+            baseline_counts=self.baseline_spin.value(),
+        )
 
         # -----------------------------
         # ROI
@@ -353,6 +367,17 @@ class MainWindow(QMainWindow):
         register_camera_state_restorer(
             self.camera, self.apply_acquisition_state_to_camera
         )
+
+        # Push the just-built acquisition_state (from the spinboxes'
+        # displayed values) to the real camera now, once, deterministically
+        # -- before any user interaction or experiment can run. Without
+        # this, the camera keeps running at whatever the driver's own
+        # __init__ hardcoded until the user happens to touch a spinbox,
+        # start a stream, or run a scan, while the GUI already displays
+        # different numbers. Called directly (not via apply_acquisition_state())
+        # since no live view is running yet and no experiment can own the
+        # camera this early in construction.
+        self.apply_acquisition_state_to_camera()
 
     # =====================================================
     # OPEN MAGNET WINDOW

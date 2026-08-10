@@ -21,7 +21,7 @@ class SimCamera:
         # CONFIGURATION
         # =====================================================
 
-        self.exposure_time = 0.01
+        self.exposure_time = 0.02  # matches AndorNeoAndor3's connect-time default
 
         self.roi = None
 

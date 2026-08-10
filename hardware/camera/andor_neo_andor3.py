@@ -277,6 +277,10 @@ class AndorNeoAndor3:
         self.cam.setEnumString("PixelEncoding", "Mono16")
         self.cam.setEnumString("CycleMode", "Continuous")
         self.cam.setFloat("ExposureTime", self.exposure_time)
+        # sCMOS exposure is quantised to the row period -- the SDK may not
+        # accept exactly what was requested. Read back what it actually
+        # holds rather than trusting the request.
+        self.exposure_time = self.cam.getFloat("ExposureTime")
 
         try:
             self.cam.setBool("IOInvert", False)
@@ -327,15 +331,15 @@ class AndorNeoAndor3:
         if self._acquisition_open:
             self.end_external_acquisition()
 
-        self.exposure_time = exposure_s
-
         if self.cam is not None:
             self.cam.setFloat("ExposureTime", exposure_s)
+            # sCMOS exposure is quantised to the row period -- the SDK may
+            # not accept exactly what was requested. Read back what it
+            # actually holds rather than trusting the request.
+            self.exposure_time = self.cam.getFloat("ExposureTime")
+        else:
+            self.exposure_time = exposure_s
 
-    #        actual = self.cam.getFloat("ExposureTime")
-    #        print(f"[Andor] Requested exposure = {exposure_s:.6f} s")
-    #        print(f"[Andor] Actual exposure    = {actual:.6f} s")
-    
     # =====================================================
     # ROI / BINNING PLACEHOLDERS
     # =====================================================
