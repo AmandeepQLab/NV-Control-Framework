@@ -653,14 +653,23 @@ class ODMRExperiment(ScanExperiment):
             self._record_timing(None, None, "visa_rf_on", t0)
 
     def acquire_frame(self):
-        """Acquire the OFF/ON camera-frame pairs for one configured point."""
-        mw = self.hw["microwave"]
+        """Acquire the OFF/ON camera-frame pairs for one configured point.
+
+        MW on/off is gated entirely by channel 2 (the fast switch) via
+        build_sequence()'s mw_on argument -- the SG386 itself stays at
+        set_scan_point()'s frequency/power for the whole point, no
+        per-frame VISA power write. This intentionally leaves
+        mw_power_settle_s/check_mw_power_settling_margin() in place
+        elsewhere in this file: they're now dead (nothing shrinks the
+        margin they check), kept only so a clean revert to power-based
+        gating -- to isolate a switch-isolation problem if rig contrast
+        drops -- doesn't also have to restore unrelated code. Removing
+        them is a separate, follow-up change.
+        """
         pulse = self.hw["pulse_streamer"]
         timing = self._timing
 
-        power_dbm = self.config.get("mw_power_dbm", -10)
         repeats = self.config.get("repeats", 1)
-        mw_power_settle_s = self.config.get("mw_power_settle_s", 0.0)
         frames = []
 
         for r in range(repeats):
@@ -671,21 +680,7 @@ class ODMRExperiment(ScanExperiment):
             # MW OFF FRAME
             # ==========================================
 
-            if hasattr(mw, "set_power"):
-                t0 = time.perf_counter() if timing else None
-                mw.set_power(-100)
-                self._record_timing(r, "off", "visa_set_power_off", t0)
-
-                # Settles the SG386's amplitude step before the gate opens.
-                # Zero by default -- see check_mw_power_settling_margin,
-                # which warns if the delays that already elapse before the
-                # gate (independent of this one) fall below the spec this
-                # exists to cover.
-                t0 = time.perf_counter() if timing else None
-                time.sleep(mw_power_settle_s)
-                self._record_timing(r, "off", "mw_power_settle_sleep", t0)
-
-            seq_off = self.build_sequence()
+            seq_off = self.build_sequence(mw_on=False)
 
             off_t0 = time.perf_counter() if timing else None
             frame_off = self.acquire_triggered_frame(
@@ -699,16 +694,7 @@ class ODMRExperiment(ScanExperiment):
             # MW ON FRAME
             # ==========================================
 
-            if hasattr(mw, "set_power"):
-                t0 = time.perf_counter() if timing else None
-                mw.set_power(power_dbm)
-                self._record_timing(r, "on", "visa_set_power_on", t0)
-
-                t0 = time.perf_counter() if timing else None
-                time.sleep(mw_power_settle_s)
-                self._record_timing(r, "on", "mw_power_settle_sleep", t0)
-
-            seq_on = self.build_sequence()
+            seq_on = self.build_sequence(mw_on=True)
 
             on_t0 = time.perf_counter() if timing else None
             frame_on = self.acquire_triggered_frame(

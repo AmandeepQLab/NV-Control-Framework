@@ -197,6 +197,15 @@ class HardwareManager:
 
             self.hardware["pulse_streamer"] = pulse
 
+            # Lets SimCamera.odmr_contrast() read MW on/off from the
+            # loaded sequence's channel-2 content instead of the source's
+            # own power -- wired explicitly here (not discovered by
+            # either object) because the camera block above runs before
+            # this one, so it can't be a constructor argument without
+            # reordering real-hardware construction too.
+            if camera_type == "sim":
+                camera.pulse_streamer = pulse
+
         else:
             raise ValueError(
                 f"Unknown pulse generator type: {ps_cfg['type']}"

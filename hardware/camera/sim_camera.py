@@ -13,6 +13,7 @@ class SimCamera:
         self,
         image_shape=(64, 64),
         microwave=None,
+        pulse_streamer=None,
         stream_shutdown_timeout_s=12.0,
     ):
 
@@ -31,6 +32,12 @@ class SimCamera:
         # =====================================================
 
         self.microwave = microwave
+
+        # Optional: lets odmr_contrast() read whether MW is gated on in
+        # the currently loaded pulse sequence, instead of inferring it
+        # from the microwave source's power (see odmr_contrast()). None
+        # by default -- HardwareManager wires this in sim mode only.
+        self.pulse_streamer = pulse_streamer
 
         # =====================================================
         # INTERNAL STATE
@@ -221,14 +228,7 @@ class SimCamera:
         if self.microwave is None:
             return 0
 
-        # MW OFF: ODMRExperiment signals "off" with a deeply attenuated
-        # power (-100 dBm) rather than exactly 0, and "on" with the
-        # configured power (typically -10..0 dBm). -50 dBm sits well below
-        # any realistic "on" power and well above the -100 dBm off
-        # convention, so it reliably separates the two.
-        power = getattr(self.microwave, "power", None)
-
-        if power is None or power <= -50:
+        if not self._mw_asserted():
             return 0
 
         f = self.microwave.frequency
@@ -245,6 +245,42 @@ class SimCamera:
         )
 
         return self.contrast * lorentz
+
+    def _mw_asserted(self):
+        """Whether MW is gated on for the frame about to be generated.
+
+        When wired to a pulse_streamer, reads whether the currently
+        loaded sequence asserts the MW channel -- this is the real
+        gating mechanism now that MW on/off comes from the channel-2
+        switch rather than the source's own power (see
+        ODMRExperiment.acquire_frame()/build_sequence()). Anchored to
+        whatever load_sequence() last set (a plain attribute,
+        SimPulseStreamer.sequence), which is written synchronously
+        before the threaded fire()/run() call in
+        acquire_triggered_frame() even starts -- so this is always
+        current by the time a frame is generated, no race with run()'s
+        own (deliberately slow, for-visibility) simulated playback.
+
+        Falls back to the source's own power when no pulse_streamer is
+        wired (e.g. test fixtures that construct SimCamera(microwave=...)
+        alone) -- preserves the previous behavior unchanged for them:
+        ODMRExperiment used to signal "off" with a deeply attenuated
+        power (-100 dBm) and "on" with the configured power (typically
+        -10..0 dBm); -50 dBm sits well below any realistic "on" power and
+        well above the -100 dBm off convention.
+        """
+        if self.pulse_streamer is not None:
+            sequence = getattr(self.pulse_streamer, "sequence", None)
+            if sequence is None:
+                return False
+            mw_channel = self.pulse_streamer.channel_map.get("MW")
+            return any(
+                p.channel == mw_channel and p.state
+                for p in sequence.digital_pulses
+            )
+
+        power = getattr(self.microwave, "power", None)
+        return power is not None and power > -50
 
     # =========================================================
     # FRAME GENERATION

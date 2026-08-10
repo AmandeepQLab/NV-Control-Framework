@@ -1,5 +1,16 @@
-"""Tests for the MW power settling delay (mw_power_settle_s) and the
-startup margin warning, and for frame_gap_s having been fully removed.
+"""Tests for check_mw_power_settling_margin()'s startup warning, for
+frame_gap_s having been fully removed, and for mw_power_settle_s's
+resulting inertness.
+
+MW on/off is now gated by channel 2 (see ODMRExperiment.acquire_frame()/
+build_sequence()), not by per-frame VISA power writes -- so
+mw_power_settle_s (still read by check_mw_power_settling_margin(), the
+GUI, the CSV header, and the time estimate; deliberately left in place
+pending a follow-up removal once the rig confirms contrast holds with
+switch gating) no longer has any sleep to govern. The tests below that
+used to assert on acquire_frame()'s own set_power() timing now assert
+that acquire_frame() never calls set_power() at all, regardless of
+mw_power_settle_s's value.
 
 No real hardware -- SimMicrowave/SimPulseStreamer/SimCamera doubles only.
 """
@@ -83,83 +94,44 @@ def _make_config(**overrides):
     return config
 
 
-class SettlingDelayPlacementTests(unittest.TestCase):
-    """Part (a)/(b): the sleep sits between set_power() and the next
-    frame's dispatch, and applies the same way to both OFF and ON."""
+class AcquireFrameNoLongerWritesPowerTests(unittest.TestCase):
+    """acquire_frame() gates MW via channel 2 now (build_sequence(mw_on=...)),
+    not VISA power writes -- mw_power_settle_s is left in place (dead
+    pending a follow-up removal) but has nothing left to govern."""
 
-    def test_delay_elapses_between_power_write_and_next_dispatch(self):
+    def test_acquire_frame_never_calls_set_power(self):
         hardware, mw, pulse = _make_hardware()
-        settle_s = 0.05
-        config = _make_config(mw_power_settle_s=settle_s)
+        config = _make_config(mw_power_settle_s=0.05)
         experiment = ODMRExperiment(hardware, config)
 
         experiment.acquire_frame()
 
-        self.assertEqual(len(mw.power_calls), 2)  # OFF, ON
-        self.assertEqual(len(pulse.load_sequence_calls), 2)
+        self.assertEqual(mw.power_calls, [])
+        self.assertEqual(len(pulse.load_sequence_calls), 2)  # OFF, ON
 
-        tolerance = 0.01  # timer jitter margin
-        for (power, t_write), t_dispatch in zip(
-            mw.power_calls, pulse.load_sequence_calls
-        ):
-            self.assertGreaterEqual(
-                t_dispatch - t_write, settle_s - tolerance,
-                f"settling delay too short after set_power({power})",
-            )
-
-    def test_off_and_on_writes_get_identical_treatment(self):
-        """Part (b): symmetric code path -- same delay after both the
-        90 dB-down OFF write and the 90 dB-up ON write."""
-        hardware, mw, pulse = _make_hardware()
-        settle_s = 0.04
-        config = _make_config(mw_power_settle_s=settle_s, repeats=2)
-        experiment = ODMRExperiment(hardware, config)
-
-        experiment.acquire_frame()
-
-        self.assertEqual(len(mw.power_calls), 4)  # 2 repeats x (OFF, ON)
-        powers = [p for p, _ in mw.power_calls]
-        self.assertEqual(powers, [-100, -10, -100, -10])
-
-        tolerance = 0.01
-        deltas = [
-            t_dispatch - t_write
-            for (_, t_write), t_dispatch in zip(
-                mw.power_calls, pulse.load_sequence_calls
-            )
-        ]
-        for delta in deltas:
-            self.assertGreaterEqual(delta, settle_s - tolerance)
-
-
-class SettlingDelayConfigTests(unittest.TestCase):
-    """Part (c): default 0.0 (no-op), explicit value overrides it."""
-
-    def test_default_is_zero_and_adds_no_delay(self):
+    def test_default_mw_power_settle_s_also_writes_no_power(self):
         hardware, mw, pulse = _make_hardware()
         config = _make_config()  # no mw_power_settle_s key at all
         experiment = ODMRExperiment(hardware, config)
 
         experiment.acquire_frame()
 
-        generous_tolerance = 0.03
-        for (_, t_write), t_dispatch in zip(
-            mw.power_calls, pulse.load_sequence_calls
-        ):
-            self.assertLess(t_dispatch - t_write, generous_tolerance)
+        self.assertEqual(mw.power_calls, [])
 
-    def test_explicit_value_is_honored(self):
+    def test_mw_power_settle_s_value_has_no_effect_regardless_of_value(self):
+        """Confirms mw_power_settle_s is genuinely inert, not just
+        untested -- a large value produces the same (zero power-write,
+        fast) behavior as the default."""
         hardware, mw, pulse = _make_hardware()
-        config = _make_config(mw_power_settle_s=0.03)
+        config = _make_config(mw_power_settle_s=5.0, repeats=2)
         experiment = ODMRExperiment(hardware, config)
 
+        t0 = time.perf_counter()
         experiment.acquire_frame()
+        elapsed = time.perf_counter() - t0
 
-        tolerance = 0.01
-        for (_, t_write), t_dispatch in zip(
-            mw.power_calls, pulse.load_sequence_calls
-        ):
-            self.assertGreaterEqual(t_dispatch - t_write, 0.03 - tolerance)
+        self.assertEqual(mw.power_calls, [])
+        self.assertLess(elapsed, 1.0)  # would be >=20s if the old sleep still ran
 
 
 class MwSettleUnaffectedTests(unittest.TestCase):
