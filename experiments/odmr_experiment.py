@@ -80,12 +80,16 @@ class ODMRExperiment(ScanExperiment):
         self.image_cube.scan_axis_unit = self.scan_axis_unit
         self.image_cube.scan_axis_values = self.scan_vector
 
-    # Provisional -- no rig data yet on how large sCMOS row-period
-    # quantisation actually is. Not a correctness threshold, just a
-    # floating-point noise floor so exact-equality jitter doesn't log.
-    # Revisit once actual_exposure_s vs exposure_s has been observed on
-    # real hardware (see the warning below and its recorded metadata).
-    _EXPOSURE_DRIFT_EPSILON_S = 1e-6
+    # Measured at the rig: requested 10.000 ms -> camera held 9.997 ms
+    # (-3 us); requested 20.000 ms -> camera held 20.003 ms (+3 us). The
+    # sensor snaps to the nearest whole row period, so this offset is a
+    # fixed ~3 us regardless of exposure, not a proportional error -- an
+    # absolute threshold is therefore correct in principle, not just
+    # convenient. 100 us sits far above that quantisation noise floor
+    # while staying far below anything that could matter: a genuine fault
+    # (a failed SDK write, or camera_gate_s sized from a stale value)
+    # would be off by milliseconds, not microseconds.
+    _EXPOSURE_DRIFT_EPSILON_S = 100e-6
 
     def configure_acquisition(self):
         """Apply this experiment's temporary camera AOI while it is borrowed.
@@ -94,9 +98,9 @@ class ODMRExperiment(ScanExperiment):
         set_exposure()/configure_camera() -- genuine SDK readback, not the
         last-requested value) and compares it against config["exposure_s"],
         which is what camera_gate_s in build_sequence() was sized from.
-        Logged, not raised: quantisation/other small drift is expected to
-        be routine once real readback exists, not exceptional, and there's
-        no principled threshold yet to fail hard on.
+        Logged, not raised: sCMOS row-period quantisation routinely
+        produces a few microseconds of difference (see
+        _EXPOSURE_DRIFT_EPSILON_S) that is not itself a fault.
         """
         camera = self.hw["camera"]
         camera.set_roi(self.acquisition_roi)
@@ -110,11 +114,11 @@ class ODMRExperiment(ScanExperiment):
             > self._EXPOSURE_DRIFT_EPSILON_S
         ):
             LOGGER.warning(
-                "Camera exposure drift at scan start: requested "
-                "exposure_s=%.6f s (camera_gate_s was sized from this), "
-                "camera actually holds %.6f s (difference %.6f s). The "
-                "pulse sequence's camera gate and the real integration "
-                "window disagree.",
+                "Camera exposure differs from the requested value: "
+                "requested exposure_s=%.6f s, camera actually holds "
+                "%.6f s (difference %.6f s). camera_gate_s was sized from "
+                "the requested value. A difference this large may "
+                "indicate a failed SDK write or stale configuration.",
                 requested_exposure_s,
                 self.actual_exposure_s,
                 self.actual_exposure_s - requested_exposure_s,

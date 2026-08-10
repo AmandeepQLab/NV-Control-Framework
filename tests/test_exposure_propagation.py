@@ -129,8 +129,13 @@ class AndorReadbackTests(unittest.TestCase):
 class ExposureDriftWarningTests(unittest.TestCase):
     """ODMRExperiment.configure_acquisition() must log loudly on drift
     between config["exposure_s"] (what camera_gate_s was sized from) and
-    the camera's real exposure -- never raise, per the reasoning that
-    quantisation will make small drift routine once real readback exists."""
+    the camera's real exposure -- never raise. Threshold is an absolute
+    100us (_EXPOSURE_DRIFT_EPSILON_S): rig measurements showed a fixed
+    ~3us row-period quantisation offset regardless of exposure (10ms
+    requested -> 9.997ms held, 20ms requested -> 20.003ms held), so that
+    magnitude of difference is normal hardware behavior and must stay
+    silent; a millisecond-scale difference is not quantisation and must
+    still warn."""
 
     class _FakeCamera:
         def __init__(self, exposure_time):
@@ -140,7 +145,7 @@ class ExposureDriftWarningTests(unittest.TestCase):
         def set_roi(self, roi):
             self.roi_calls.append(roi)
 
-    def test_warns_on_mismatch(self):
+    def test_warns_on_millisecond_scale_mismatch(self):
         camera = self._FakeCamera(exposure_time=0.021)
         experiment = ODMRExperiment(
             {"camera": camera}, {"exposure_s": 0.02}
@@ -162,6 +167,38 @@ class ExposureDriftWarningTests(unittest.TestCase):
         warnings = _collect_warnings(experiment.configure_acquisition)
 
         self.assertEqual(warnings, [])
+
+    def test_silent_at_measured_rig_quantisation_10ms(self):
+        # Rig measurement: requested 10.000ms -> camera held 9.997ms.
+        camera = self._FakeCamera(exposure_time=0.009997)
+        experiment = ODMRExperiment(
+            {"camera": camera}, {"exposure_s": 0.010}
+        )
+
+        warnings = _collect_warnings(experiment.configure_acquisition)
+
+        self.assertEqual(warnings, [])
+
+    def test_silent_at_measured_rig_quantisation_20ms(self):
+        # Rig measurement: requested 20.000ms -> camera held 20.003ms.
+        camera = self._FakeCamera(exposure_time=0.020003)
+        experiment = ODMRExperiment(
+            {"camera": camera}, {"exposure_s": 0.020}
+        )
+
+        warnings = _collect_warnings(experiment.configure_acquisition)
+
+        self.assertEqual(warnings, [])
+
+    def test_warns_just_above_threshold(self):
+        camera = self._FakeCamera(exposure_time=0.020 + 101e-6)
+        experiment = ODMRExperiment(
+            {"camera": camera}, {"exposure_s": 0.020}
+        )
+
+        warnings = _collect_warnings(experiment.configure_acquisition)
+
+        self.assertEqual(len(warnings), 1)
 
     def test_never_raises_on_mismatch(self):
         camera = self._FakeCamera(exposure_time=0.5)  # wildly different
