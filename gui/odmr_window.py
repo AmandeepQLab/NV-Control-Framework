@@ -265,8 +265,8 @@ class ODMRWindow(QMainWindow):
 
         exposure_s = config.get("exposure_s", 0.02)
         trigger_delay_s = config.get("trigger_delay_s", 0.05)
-        fire_delay_s = config.get("fire_delay_s", 0.005)
-        reset_delay_s = config.get("reset_delay_s", 0.005)
+        fire_delay_s = config.get("fire_delay_s", 0.010)
+        reset_delay_s = config.get("reset_delay_s", 0.010)
         mw_settle_s = config.get("mw_settle_s", 0.0)
         pulse_lead_s = config.get("pulse_lead_s", 0.002)
         # pulse_tail_s deliberately not read here -- nothing in the

@@ -94,19 +94,27 @@ class ODMRPanel(QWidget):
         )
 
         self.fire_delay_spin = self._add_double(
-            delays_layout, "Fire Delay (s):", 0.0, 10.0, 4, 0.005
+            delays_layout, "Fire Delay (s):", 0.0, 10.0, 4, 0.010
         )
         self.fire_delay_spin.setToolTip(
-            "Delay after camera arming before Pulse Streamer fires.\n"
-            "Recommended: 0.005 s. Ensures the camera is ready before trigger."
+            "Delay before Pulse Streamer fires after reset.\n"
+            "Recommended: 0.010 s. Measured: below 0.010 s, pulse.run() "
+            "intermittently blocks 300-1000 ms (a Swabian RPC stall, not "
+            "camera arming -- arming now happens once per scan, not per "
+            "frame). 0.010 s eliminated the stalls entirely in testing and "
+            "was faster overall than 0.005 s once the stall tail is counted."
         )
 
         self.reset_delay_spin = self._add_double(
-            delays_layout, "Reset Delay (s):", 0.0, 10.0, 4, 0.005
+            delays_layout, "Reset Delay (s):", 0.0, 10.0, 4, 0.010
         )
         self.reset_delay_spin.setToolTip(
             "Delay after forcing Swabian outputs LOW before acquisition.\n"
-            "Recommended: 0.005 s. Prevents false camera triggers."
+            "Recommended: 0.010 s. Measured: below 0.010 s, pulse.run() "
+            "intermittently blocks 300-1000 ms (the Swabian needs recovery "
+            "time before accepting a new streamed sequence). 0.010 s "
+            "eliminated the stalls entirely in testing and was faster "
+            "overall than 0.005 s once the stall tail is counted."
         )
 
         self.mw_settle_spin = self._add_double(

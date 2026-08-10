@@ -343,8 +343,8 @@ class ODMRExperiment(ScanExperiment):
         # sequence the hardware never actually runs (see acquire_frame(),
         # which fires two independent single-shot sequences instead).
         frame_gap_s = (
-            self.config.get("reset_delay_s", 0.005)
-            + self.config.get("fire_delay_s", 0.005)
+            self.config.get("reset_delay_s", 0.010)
+            + self.config.get("fire_delay_s", 0.010)
         )
         frame_gap_ns = int(frame_gap_s * 1e9)
 
@@ -416,12 +416,12 @@ class ODMRExperiment(ScanExperiment):
 
         pulse.reset_outputs()
         #time.sleep(0.005)
-        reset_delay_s = self.config.get("reset_delay_s", 0.005)
+        reset_delay_s = self.config.get("reset_delay_s", 0.010)
         time.sleep(reset_delay_s)
 
         def fire():
             #time.sleep(0.005)
-            fire_delay_s = self.config.get("fire_delay_s", 0.005)
+            fire_delay_s = self.config.get("fire_delay_s", 0.010)
             time.sleep(fire_delay_s)
             pulse.run()
 
@@ -553,7 +553,7 @@ class ODMRExperiment(ScanExperiment):
         pulse.reset_outputs()
         self._record_timing(repeat_index, frame_label, "reset_outputs", tt0)
 
-        reset_delay_s = self.config.get("reset_delay_s", 0.005)
+        reset_delay_s = self.config.get("reset_delay_s", 0.010)
         tt0 = time.perf_counter() if timing else None
         time.sleep(reset_delay_s)
         self._record_timing(repeat_index, frame_label, "reset_delay_sleep", tt0)
@@ -563,7 +563,7 @@ class ODMRExperiment(ScanExperiment):
         fire_timing = {} if timing else None
 
         def fire():
-            fire_delay_s = self.config.get("fire_delay_s", 0.005)
+            fire_delay_s = self.config.get("fire_delay_s", 0.010)
             ft0 = time.perf_counter() if timing else None
             time.sleep(fire_delay_s)
             if timing:
