@@ -13,6 +13,8 @@ Author:
 =====================================================
 """
 
+import time
+
 
 class MagnetAxis:
 
@@ -39,6 +41,16 @@ class MagnetAxis:
 
         self.current_field = 0.0
         self.current_current = 0.0
+
+        # Timing diagnostics (off by default; temporary instrumentation --
+        # see Magnet.enable_timing_diagnostics/pop_timing_log, which cascade
+        # into this). Brackets only the SCPI-write call itself
+        # (power_supply.set_current()/safe_shutdown()), not the
+        # field<->current calibration conversion above -- that conversion
+        # is pure arithmetic with no I/O, so a row here reflects the actual
+        # hardware transaction, not conversion overhead.
+        self._timing_enabled = False
+        self._timing_log = []
 
     # =====================================================
     # CONVERSION
@@ -71,6 +83,21 @@ class MagnetAxis:
         )
 
     # =====================================================
+    # TIMING DIAGNOSTICS (off by default; temporary instrumentation)
+    # =====================================================
+
+    def enable_timing_diagnostics(self, enabled):
+        """Turn per-call SCPI-write timing on/off. Always clears the log."""
+        self._timing_enabled = bool(enabled)
+        self._timing_log = []
+
+    def pop_timing_log(self):
+        """Return and clear the accumulated (stage, duration_s) log."""
+        log = self._timing_log
+        self._timing_log = []
+        return log
+
+    # =====================================================
     # CONTROL
     # =====================================================
 
@@ -86,6 +113,8 @@ class MagnetAxis:
                 f"{self.name}-coil exceeds maximum current."
             )
 
+        timing = self._timing_enabled
+
         # -------------------------------------------------
         # Zero field
         # -------------------------------------------------
@@ -93,17 +122,29 @@ class MagnetAxis:
         if abs(current) < 1e-9:
 
             if keep_output_enabled:
+                t0 = time.perf_counter() if timing else None
                 self.power_supply.set_current(0.0)
+                if timing:
+                    self._timing_log.append(("set_current", time.perf_counter() - t0))
             else:
+                t0 = time.perf_counter() if timing else None
                 self.power_supply.safe_shutdown()
+                if timing:
+                    self._timing_log.append(("safe_shutdown", time.perf_counter() - t0))
 
         else:
 
+            t0 = time.perf_counter() if timing else None
             self.power_supply.set_current(current)
+            if timing:
+                self._timing_log.append(("set_current", time.perf_counter() - t0))
 
             current = self.field_to_current(field_mT)
 
+            t0 = time.perf_counter() if timing else None
             self.power_supply.set_current(current)
+            if timing:
+                self._timing_log.append(("set_current", time.perf_counter() - t0))
 
             self.current_field = field_mT
 

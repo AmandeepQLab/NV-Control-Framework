@@ -29,6 +29,7 @@ ALLOWED_FILES = frozenset(
         "test_zero_field_analysis.py",
         "test_zero_field_averaging.py",
         "test_zero_field_averaging_module.py",
+        "test_zero_field_timing.py",
     }
 )
 

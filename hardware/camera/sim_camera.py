@@ -332,7 +332,29 @@ class SimCamera:
 
         log_camera_snap(type(self).__name__)
 
-        return self._acquire_and_store_frame()
+        # Mirrors AndorNeoAndor3.snap()'s eight sub-stages for log-shape
+        # parity (see that method). There's no real SDK cost to attribute
+        # to most of them here -- only the exposure sleep inside
+        # _acquire_and_store_frame() is genuinely non-zero, folded into
+        # "wait_buffer" to match where the real driver's own dominant cost
+        # lands.
+        timing = self._timing_enabled
+
+        if timing:
+            self._timing_log.append(("trigger_mode_set", None, 0.0))
+            self._timing_log.append(("queue_buffer", None, 0.0))
+            self._timing_log.append(("acquisition_start", None, 0.0))
+            self._timing_log.append(("software_trigger", None, 0.0))
+
+        t0 = time.perf_counter() if timing else None
+        frame = self._acquire_and_store_frame()
+        if timing:
+            self._timing_log.append(("wait_buffer", None, time.perf_counter() - t0))
+            self._timing_log.append(("buffer_to_image", None, 0.0))
+            self._timing_log.append(("acquisition_stop", None, 0.0))
+            self._timing_log.append(("flush", None, 0.0))
+
+        return frame
 
     def _acquire_and_store_frame(self):
         """Shared by snap() and grab_external_frame(). Kept separate from

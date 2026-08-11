@@ -428,40 +428,66 @@ class AndorNeoAndor3:
 
         log_camera_snap(type(self).__name__)
 
+        timing = self._timing_enabled
+
+        t0 = time.perf_counter() if timing else None
         self.cam.setEnumIndex(
             "TriggerMode",
             4
         )  # Software
+        if timing:
+            self._timing_log.append(("trigger_mode_set", None, time.perf_counter() - t0))
 
+        t0 = time.perf_counter() if timing else None
         self.cam.queueBuffer(1)
+        if timing:
+            self._timing_log.append(("queue_buffer", None, time.perf_counter() - t0))
 
+        t0 = time.perf_counter() if timing else None
         self.cam.command(
             "AcquisitionStart"
         )
+        if timing:
+            self._timing_log.append(("acquisition_start", None, time.perf_counter() - t0))
 
+        t0 = time.perf_counter() if timing else None
         self.cam.command(
             "SoftwareTrigger"
         )
+        if timing:
+            self._timing_log.append(("software_trigger", None, time.perf_counter() - t0))
 
+        t0 = time.perf_counter() if timing else None
         raw = self.cam.waitBuffer(
             10000
         )
+        if timing:
+            self._timing_log.append(("wait_buffer", None, time.perf_counter() - t0))
 
+        t0 = time.perf_counter() if timing else None
         frame = self._buffer_to_image(
             raw
         )
+        if timing:
+            self._timing_log.append(("buffer_to_image", None, time.perf_counter() - t0))
 
+        t0 = time.perf_counter() if timing else None
         try:
             self.cam.command(
                 "AcquisitionStop"
             )
         except Exception:
             pass
+        if timing:
+            self._timing_log.append(("acquisition_stop", None, time.perf_counter() - t0))
 
+        t0 = time.perf_counter() if timing else None
         try:
             self.cam.flush()
         except Exception:
             pass
+        if timing:
+            self._timing_log.append(("flush", None, time.perf_counter() - t0))
 
         with self._lock:
             self.latest_frame = frame

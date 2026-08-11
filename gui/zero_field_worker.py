@@ -1,6 +1,8 @@
 """Background worker for the ZeroFieldExperiment."""
 
+import csv
 import logging
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -110,6 +112,10 @@ class ZeroFieldWorker(QObject):
                     else self._raw_scan_path if streaming else None
                 ),
                 stream_path_is_output=self._single_scan_direct,
+                # Off by default; never set by the GUI panel itself, same
+                # rule as ODMR's timing_diagnostics -- only NV_ZFE_TIMING=1
+                # or a config dict built by a test/script turns this on.
+                timing_diagnostics=self.config.get("timing_diagnostics", False),
             )
             if self._stop_requested:
                 self.experiment.stop()
@@ -140,6 +146,77 @@ class ZeroFieldWorker(QObject):
             self.finished_signal.emit(
                 None, np.asarray(self._fields), np.asarray(self._signals), True
             )
+        finally:
+            # Written regardless of outcome (normal completion, a stop, or
+            # an error) so whatever was recorded before an early exit is
+            # still captured -- mirrors ODMRWorker._write_timing_file()'s
+            # own "called from _finish(), every exit path" contract.
+            self._write_timing_file()
+
+    def _write_timing_file(self):
+        """Write the accumulated Zero Field timing log once, after the run
+        is over. No-op when timing diagnostics were never enabled, or when
+        nothing was recorded (e.g. construction failed before any point
+        ran)."""
+        if self.experiment is None or not self.experiment.timing_enabled():
+            return
+        records = self.experiment.pop_timing_log()
+        if not records:
+            return
+
+        try:
+            base_dir = Path("data")
+            base_dir.mkdir(exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = base_dir / f"zero_field_timing_{timestamp}.csv"
+
+            run_total_s = next(
+                (r["duration_s"] for r in records if r["stage"] == "run_total"),
+                None,
+            )
+            exposure_s = getattr(self.camera, "exposure_time", None)
+            binning = getattr(self.camera, "binning", None)
+
+            header_lines = [
+                "# Zero Field timing diagnostics (temporary instrumentation)",
+                f"# generated={datetime.now().isoformat()}",
+                f"# field_start_gauss={self.config.get('field_start')}",
+                f"# field_stop_gauss={self.config.get('field_stop')}",
+                f"# field_points={self.config.get('field_points')}",
+                f"# field_axis={self.config.get('field_axis')}",
+                f"# settling_time_ms={self.config.get('settling_time_ms')}",
+                f"# averages={self.config.get('averages')}",
+                f"# averaging_enabled={self.config.get('averaging_enabled', False)}",
+                f"# num_scans={self.config.get('num_scans', 1)}",
+                f"# save_raw_scans={self.config.get('save_raw_scans', False)}",
+                f"# zero_other_axes={self.experiment.zero_other_axes}",
+                f"# acquisition_roi={self.acquisition_roi}",
+                f"# camera_exposure_s={exposure_s} (actual camera read-back; "
+                "Zero Field has no requested exposure of its own -- see "
+                "CLAUDE.md)",
+                f"# camera_binning={binning} (actual camera read-back)",
+                f"# measured_run_total_s={run_total_s}",
+            ]
+
+            fieldnames = [
+                "scan_index", "point_index", "field_gauss", "avg_index",
+                "stage", "t_start_rel_s", "duration_s",
+            ]
+
+            with open(path, "w", newline="") as fh:
+                for line in header_lines:
+                    fh.write(line + "\n")
+
+                writer = csv.DictWriter(fh, fieldnames=fieldnames)
+                writer.writeheader()
+
+                for row in records:
+                    writer.writerow({k: row.get(k) for k in fieldnames})
+
+            LOGGER.info("Zero Field timing diagnostics written to %s", path)
+
+        except Exception:
+            LOGGER.exception("Failed to write Zero Field timing diagnostics")
 
     def stop(self):
         """Thread-safe cancellation flag; no hardware calls occur in the GUI thread."""

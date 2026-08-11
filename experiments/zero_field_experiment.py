@@ -2,6 +2,7 @@
 
 import copy
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from collections.abc import Mapping
@@ -51,9 +52,11 @@ class ZeroFieldExperiment(ScanExperiment):
         zero_other_axes=True,
         stream_scan_path=None,
         stream_path_is_output=False,
+        timing_diagnostics=False,
     ):
         config = {
             "settling_time_ms": settling_time_ms,
+            "timing_diagnostics": timing_diagnostics,
         }
         hardware = {
             "camera": camera,
@@ -130,6 +133,99 @@ class ZeroFieldExperiment(ScanExperiment):
         self.latest_image = None
         self._acquisition_started_at = None
 
+        # =====================================================
+        # TIMING DIAGNOSTICS (off by default; temporary instrumentation)
+        # =====================================================
+        # Enabled via config["timing_diagnostics"] or the NV_ZFE_TIMING=1
+        # environment variable -- mirrors ODMRExperiment exactly, with a
+        # separate env var so leaving one experiment's timing on doesn't
+        # silently start logging the other. Never set by the GUI panel
+        # itself (same rule as ODMR's timing_diagnostics).
+        self._timing = bool(self.config.get("timing_diagnostics", False)) or (
+            os.environ.get("NV_ZFE_TIMING") == "1"
+        )
+        self._timing_log = []
+        self._timing_epoch = None
+        # Per-point tagging context, set once per point at the top of the
+        # loop body in _run_single_sweep() and read by every _record_timing/
+        # _merge_*_log call for that point -- avoids threading scan_index/
+        # point_index/field_gauss through every instrumented method's
+        # signature individually.
+        self._timing_scan_index = None
+        self._timing_point_index = None
+        self._timing_field_gauss = None
+
+    def timing_enabled(self):
+        return self._timing
+
+    def reset_timing(self):
+        """Start a fresh timing epoch and log. Call once per run()."""
+        self._timing_log = []
+        self._timing_epoch = time.perf_counter()
+
+    def pop_timing_log(self):
+        """Return and clear accumulated timing records (bounds growth)."""
+        log = self._timing_log
+        self._timing_log = []
+        return log
+
+    def _record_timing(self, stage, avg_index, t0):
+        if not self._timing:
+            return
+        self._timing_log.append({
+            "scan_index": self._timing_scan_index,
+            "point_index": self._timing_point_index,
+            "field_gauss": self._timing_field_gauss,
+            "avg_index": avg_index,
+            "stage": stage,
+            "t_start_rel_s": t0 - self._timing_epoch,
+            "duration_s": time.perf_counter() - t0,
+        })
+
+    def _merge_magnet_log(self, start_rel):
+        """Drain Magnet's per-call timing log, tag with the current point's
+        context, and place each entry using a running cursor from
+        start_rel -- correct because Magnet.set_vector()'s own entries
+        (and the axis entries it merges in) are recorded in strict call
+        order with no untimed gap other than the trivially-fast
+        field<->current conversion (see MagnetAxis.set_field())."""
+        if not self._timing:
+            return
+        running_t = start_rel
+        for stage, duration in self.magnet.pop_timing_log():
+            self._timing_log.append({
+                "scan_index": self._timing_scan_index,
+                "point_index": self._timing_point_index,
+                "field_gauss": self._timing_field_gauss,
+                "avg_index": None,
+                "stage": stage,
+                "t_start_rel_s": running_t,
+                "duration_s": duration,
+            })
+            running_t += duration
+
+    def _merge_camera_log(self, avg_index, start_rel):
+        """Drain the camera driver's per-snap() sub-stage log immediately
+        after each snap() call (see AndorNeoAndor3.snap()/SimCamera.snap())
+        -- keeps that log bounded to at most one call's worth of entries
+        at a time, same discipline as ODMRExperiment._merge_camera_log."""
+        if not self._timing:
+            return
+        if not hasattr(self.camera, "pop_timing_log"):
+            return
+        running_t = start_rel
+        for stage, _frame_idx, duration in self.camera.pop_timing_log():
+            self._timing_log.append({
+                "scan_index": self._timing_scan_index,
+                "point_index": self._timing_point_index,
+                "field_gauss": self._timing_field_gauss,
+                "avg_index": avg_index,
+                "stage": f"camera.{stage}",
+                "t_start_rel_s": running_t,
+                "duration_s": duration,
+            })
+            running_t += duration
+
     def setup_scan(self):
         # Keep all supplies enabled for the full sweep.  In particular, the
         # two non-swept axes remain at zero current but must not be repeatedly
@@ -153,11 +249,23 @@ class ZeroFieldExperiment(ScanExperiment):
             # Physically zero now, rather than waiting for the first scan
             # point, so the magnet visibly reflects the clean state from the
             # start of the scan rather than whatever was left over.
+            #
+            # Timed and drained here, immediately -- this is a real call to
+            # Magnet.set_vector() distinct from any per-point call, and if
+            # left undrained its entries would still be sitting in
+            # Magnet._timing_log the next time set_scan_point() drains it,
+            # bleeding into and inflating the first point's own count
+            # (e.g. an extra apply_global_polarity_noop/flip row wrongly
+            # attributed to point 0).
+            timing = self._timing
+            t0 = time.perf_counter() if timing else None
             self.magnet.set_vector(
                 bx=resolved_field_mT["x"],
                 by=resolved_field_mT["y"],
                 bz=resolved_field_mT["z"],
             )
+            if timing:
+                self._merge_magnet_log(t0 - self._timing_epoch)
         else:
             resolved_field_mT = dict(entry_vector_mT)
             retained_nonzero = {
@@ -202,15 +310,28 @@ class ZeroFieldExperiment(ScanExperiment):
         # Apply magnetic field/current for this measurement point.
         fields_mT = dict(self._configured_field_mT)
         fields_mT[self.field_axis.lower()] = value * 0.1
+
+        timing = self._timing
+        t0 = time.perf_counter() if timing else None
         self.magnet.set_vector(
             bx=fields_mT["x"],
             by=fields_mT["y"],
             bz=fields_mT["z"],
         )
+        if timing:
+            self._merge_magnet_log(t0 - self._timing_epoch)
 
     def acquire_frame(self):
         """Acquire and average all fluorescence frames at one field point."""
-        frames = [self.camera.snap() for _ in range(self.averages)]
+        timing = self._timing
+        frames = []
+        for avg_index in range(self.averages):
+            t0 = time.perf_counter() if timing else None
+            frame = self.camera.snap()
+            if timing:
+                self._record_timing("snap", avg_index, t0)
+                self._merge_camera_log(avg_index, t0 - self._timing_epoch)
+            frames.append(frame)
         return np.mean(np.stack(frames), axis=0)
 
     def process_frame(self, frame):
@@ -226,102 +347,143 @@ class ZeroFieldExperiment(ScanExperiment):
 
     def run(self):
         """Execute one or more sweeps and return their averaged ImageCube."""
-        with exclusive_camera_access(self.camera):
-            self.camera.set_roi(self.acquisition_roi)
-            LOGGER.info("Zero Field acquisition ROI: %s", self.acquisition_roi)
-            scan_count = self.num_scans if self.averaging_enabled else 1
-            averaged_cube = None
-            completed_scans = 0
+        if self._timing:
+            self.reset_timing()
+        run_t0 = time.perf_counter() if self._timing else None
 
-            for scan_index in range(1, scan_count + 1):
-                if self.stop_requested or not self.running:
-                    break
+        try:
+            with exclusive_camera_access(self.camera):
+                self.camera.set_roi(self.acquisition_roi)
+                LOGGER.info("Zero Field acquisition ROI: %s", self.acquisition_roi)
 
-                if self.scan_started_callback is not None:
-                    self.scan_started_callback(scan_index, scan_count)
+                # Enabling here, inside the exclusive_camera_access lease,
+                # is what keeps live-view frames out of the camera-side
+                # log: that context manager has already stopped live
+                # streaming before this point and only resumes it after
+                # the lease is released below, so no concurrent snap()
+                # call from live view can be captured regardless of this
+                # flag's state. See
+                # framework/camera_ownership.exclusive_camera_access.
+                # Disabling happens in the finally below unconditionally
+                # (including on exception) so the flag can never be left
+                # on past this lease -- required for that same guarantee
+                # to hold on every exit path, not just the normal one.
+                if self._timing:
+                    if hasattr(self.camera, "enable_timing_diagnostics"):
+                        self.camera.enable_timing_diagnostics(True)
+                    self.magnet.enable_timing_diagnostics(True)
 
-                self._run_single_sweep(scan_index)
-                acquired_cube = self.image_cube
-                stream_path = self._last_scan_stream_path
-                self._finalize_image_cube_metadata(acquired_cube)
-                self._validate_image_cube(acquired_cube)
-                LOGGER.info("Scan %d/%d acquired.", scan_index, scan_count)
+                try:
+                    scan_count = self.num_scans if self.averaging_enabled else 1
+                    averaged_cube = None
+                    completed_scans = 0
 
-                # A cooperative stop can leave acquired_cube with some but
-                # not all field_points frames -- that's an intentional
-                # partial result (see _validate_image_cube), not a fault,
-                # but it must never be folded into the multi-scan average:
-                # _new_averaged_cube/_update_running_average both assume
-                # every acquired_cube they touch is full-shape.
-                incomplete_sweep = (
-                    acquired_cube.data is None
-                    or acquired_cube.data.shape[0] != self.field_points
-                )
-                if incomplete_sweep:
-                    if averaged_cube is None:
-                        averaged_cube = acquired_cube
-                    break
+                    for scan_index in range(1, scan_count + 1):
+                        if self.stop_requested or not self.running:
+                            break
 
-                completed_scans += 1
-                if averaged_cube is None:
-                    averaged_cube = (
-                        acquired_cube
-                        if scan_count == 1
-                        else self._new_averaged_cube(acquired_cube)
-                    )
-                else:
-                    self._update_running_average(
-                        averaged_cube.data, acquired_cube.data, completed_scans
-                    )
-                LOGGER.info("Running average updated.")
+                        if self.scan_started_callback is not None:
+                            self.scan_started_callback(scan_index, scan_count)
 
-                if stream_path is not None and self.stream_path_is_output:
-                    # This file IS the run's deliverable (a single-scan run
-                    # streaming directly to the final output path) -- never
-                    # delete it, and it isn't a separate "raw scan" artifact
-                    # to record either, regardless of save_raw_scans.
-                    pass
-                elif self.save_raw_scans:
-                    if stream_path is not None:
-                        # Streaming already wrote and finalized this scan's
-                        # file incrementally; re-saving it via raw_scan_saver
-                        # would be a redundant whole-cube rewrite that could
-                        # corrupt a file streaming just safely finished.
-                        filename = stream_path.name
-                    elif self.raw_scan_saver is not None:
-                        filename = self.raw_scan_saver(scan_index, acquired_cube)
-                    else:
-                        raise RuntimeError(
-                            "Saving raw Zero Field scans requires a raw scan saver."
+                        scan_t0 = time.perf_counter() if self._timing else None
+                        self._run_single_sweep(scan_index)
+                        if self._timing:
+                            self._timing_scan_index = scan_index
+                            self._timing_point_index = None
+                            self._timing_field_gauss = None
+                            self._record_timing("scan_total", None, scan_t0)
+                        acquired_cube = self.image_cube
+                        stream_path = self._last_scan_stream_path
+                        self._finalize_image_cube_metadata(acquired_cube)
+                        self._validate_image_cube(acquired_cube)
+                        LOGGER.info("Scan %d/%d acquired.", scan_index, scan_count)
+
+                        # A cooperative stop can leave acquired_cube with some but
+                        # not all field_points frames -- that's an intentional
+                        # partial result (see _validate_image_cube), not a fault,
+                        # but it must never be folded into the multi-scan average:
+                        # _new_averaged_cube/_update_running_average both assume
+                        # every acquired_cube they touch is full-shape.
+                        incomplete_sweep = (
+                            acquired_cube.data is None
+                            or acquired_cube.data.shape[0] != self.field_points
                         )
-                    self.raw_scan_filenames.append(str(filename))
-                    LOGGER.info("Raw scan saved: %s", filename)
-                elif stream_path is not None:
-                    # Streaming always writes a per-scan file for crash
-                    # safety regardless of save_raw_scans; if the user
-                    # didn't ask to keep it, remove it now that its data is
-                    # safely folded into the running average -- matching
-                    # the existing contract of no permanent per-scan file
-                    # unless requested.
-                    stream_path.unlink(missing_ok=True)
+                        if incomplete_sweep:
+                            if averaged_cube is None:
+                                averaged_cube = acquired_cube
+                            break
 
-                self._set_averaging_metadata(averaged_cube, completed_scans)
-                if self.scan_completed_callback is not None:
-                    self.scan_completed_callback(averaged_cube, scan_index, scan_count)
+                        completed_scans += 1
+                        if averaged_cube is None:
+                            averaged_cube = (
+                                acquired_cube
+                                if scan_count == 1
+                                else self._new_averaged_cube(acquired_cube)
+                            )
+                        else:
+                            self._update_running_average(
+                                averaged_cube.data, acquired_cube.data, completed_scans
+                            )
+                        LOGGER.info("Running average updated.")
 
-                # ``averaged_cube`` is the only image cube intentionally
-                # retained between scans.  Release the completed raw cube.
-                if acquired_cube is not averaged_cube:
-                    self.image_cube = None
-                    del acquired_cube
-                LOGGER.info("Scan memory released.")
+                        if stream_path is not None and self.stream_path_is_output:
+                            # This file IS the run's deliverable (a single-scan run
+                            # streaming directly to the final output path) -- never
+                            # delete it, and it isn't a separate "raw scan" artifact
+                            # to record either, regardless of save_raw_scans.
+                            pass
+                        elif self.save_raw_scans:
+                            if stream_path is not None:
+                                # Streaming already wrote and finalized this scan's
+                                # file incrementally; re-saving it via raw_scan_saver
+                                # would be a redundant whole-cube rewrite that could
+                                # corrupt a file streaming just safely finished.
+                                filename = stream_path.name
+                            elif self.raw_scan_saver is not None:
+                                filename = self.raw_scan_saver(scan_index, acquired_cube)
+                            else:
+                                raise RuntimeError(
+                                    "Saving raw Zero Field scans requires a raw scan saver."
+                                )
+                            self.raw_scan_filenames.append(str(filename))
+                            LOGGER.info("Raw scan saved: %s", filename)
+                        elif stream_path is not None:
+                            # Streaming always writes a per-scan file for crash
+                            # safety regardless of save_raw_scans; if the user
+                            # didn't ask to keep it, remove it now that its data is
+                            # safely folded into the running average -- matching
+                            # the existing contract of no permanent per-scan file
+                            # unless requested.
+                            stream_path.unlink(missing_ok=True)
 
-            if averaged_cube is not None:
-                self._set_averaging_metadata(averaged_cube, completed_scans)
-                self._finalize_image_cube_metadata(averaged_cube)
-                self._validate_image_cube(averaged_cube)
-                self.image_cube = averaged_cube
-        return self.image_cube
+                        self._set_averaging_metadata(averaged_cube, completed_scans)
+                        if self.scan_completed_callback is not None:
+                            self.scan_completed_callback(averaged_cube, scan_index, scan_count)
+
+                        # ``averaged_cube`` is the only image cube intentionally
+                        # retained between scans.  Release the completed raw cube.
+                        if acquired_cube is not averaged_cube:
+                            self.image_cube = None
+                            del acquired_cube
+                        LOGGER.info("Scan memory released.")
+
+                    if averaged_cube is not None:
+                        self._set_averaging_metadata(averaged_cube, completed_scans)
+                        self._finalize_image_cube_metadata(averaged_cube)
+                        self._validate_image_cube(averaged_cube)
+                        self.image_cube = averaged_cube
+                finally:
+                    if self._timing:
+                        if hasattr(self.camera, "enable_timing_diagnostics"):
+                            self.camera.enable_timing_diagnostics(False)
+                        self.magnet.enable_timing_diagnostics(False)
+            return self.image_cube
+        finally:
+            if self._timing:
+                self._timing_scan_index = None
+                self._timing_point_index = None
+                self._timing_field_gauss = None
+                self._record_timing("run_total", None, run_t0)
 
     def _run_single_sweep(self, scan_index):
         """Acquire exactly one averaged fluorescence image per field value."""
@@ -336,6 +498,16 @@ class ZeroFieldExperiment(ScanExperiment):
         )
         self._stream_writer = None
         self._last_scan_stream_path = None
+
+        # Set before setup_scan() (not just in the point loop below) so
+        # setup_scan()'s own magnet.set_vector() call -- when
+        # zero_other_axes physically zeroes the non-swept axes -- is
+        # correctly tagged as this scan's setup, point_index=None, rather
+        # than inheriting stale context left over from the previous scan.
+        if self._timing:
+            self._timing_scan_index = scan_index
+            self._timing_point_index = None
+            self._timing_field_gauss = None
 
         try:
             self.setup_scan()
@@ -357,12 +529,21 @@ class ZeroFieldExperiment(ScanExperiment):
                 if self.stop_requested or not self.running:
                     break
 
+                timing = self._timing
+                self._timing_scan_index = scan_index
+                self._timing_point_index = point_index
+                self._timing_field_gauss = field
+                point_t0 = time.perf_counter() if timing else None
+
                 # Apply magnetic field/current.
                 self.set_scan_point(field)
 
                 # Wait for field stabilization.
                 if self.settling_time_ms > 0:
+                    t0 = time.perf_counter() if timing else None
                     time.sleep(self.settling_time_ms / 1000.0)
+                    if timing:
+                        self._record_timing("settling_sleep", None, t0)
 
                 # Acquire averaged fluorescence image.
                 averaged_image = self.acquire_frame()
@@ -370,14 +551,26 @@ class ZeroFieldExperiment(ScanExperiment):
                 # Store measurement exactly once for this field value.
                 self.image_cube.add(averaged_image)
                 if self._stream_writer is not None:
+                    t0 = time.perf_counter() if timing else None
                     self._stream_writer.write_plane(point_index, averaged_image)
+                    if timing:
+                        self._record_timing("write_plane", None, t0)
 
+                t0 = time.perf_counter() if timing else None
                 signal = self.process_frame(averaged_image)
+                if timing:
+                    self._record_timing("process_frame", None, t0)
                 self.scan_signal.append(signal)
 
                 # Update live display and progress once per stored image.
+                t0 = time.perf_counter() if timing else None
                 self.emit_live_update(field, signal)
+                if timing:
+                    self._record_timing("emit_live_update", None, t0)
                 self.emit_progress()
+
+                if timing:
+                    self._record_timing("point_total", None, point_t0)
 
             return self.scan_vector, np.asarray(self.scan_signal)
 
