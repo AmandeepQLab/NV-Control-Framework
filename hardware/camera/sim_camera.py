@@ -58,13 +58,15 @@ class SimCamera:
         self._timing_enabled = False
         self._timing_log = []
 
-        # Interface parity with AndorNeoAndor3's held-open external
-        # acquisition (see that class for the real semantics). There's no
-        # real SDK arm/disarm cost to simulate, but the same state machine
-        # and defensive self-heal calls are mirrored here so ODMR's new
-        # call path -- and the exception/stop-safety tests -- exercise
+        # Interface parity with AndorNeoAndor3's held-open external and
+        # software acquisition trios (see that class for the real
+        # semantics). There's no real SDK arm/disarm cost to simulate, but
+        # the same state machine and defensive self-heal calls are
+        # mirrored here so ODMR's and Zero Field's held-open call paths --
+        # and the exception/stop-safety/coexistence tests -- exercise
         # identical logic against sim as against real hardware.
         self._acquisition_open = False
+        self._acquisition_mode = None
         self._acquisition_frames_served = 0
         self._acquisition_start_count = 0
         self._acquisition_stop_count = 0
@@ -111,18 +113,21 @@ class SimCamera:
 
     def begin_external_acquisition(self):
         if self._acquisition_open:
-            return
+            if self._acquisition_mode == "external":
+                return
+            self._end_held_open_acquisition()
         self._acquisition_open = True
+        self._acquisition_mode = "external"
         self._acquisition_frames_served = 0
         self._acquisition_start_count += 1
         if self._timing_enabled:
             self._timing_log.append(("acquisition_start", None, 0.0))
 
     def grab_external_frame(self, timeout_ms=10000):
-        if not self._acquisition_open:
+        if not (self._acquisition_open and self._acquisition_mode == "external"):
             raise RuntimeError(
-                "grab_external_frame() called without an open acquisition; "
-                "call begin_external_acquisition() first."
+                "grab_external_frame() called without an open external "
+                "acquisition; call begin_external_acquisition() first."
             )
 
         # Timed unconditionally, mirroring AndorNeoAndor3.grab_external_frame
@@ -157,9 +162,17 @@ class SimCamera:
         return frame
 
     def end_external_acquisition(self):
+        self._end_held_open_acquisition()
+
+    def _end_held_open_acquisition(self):
+        """Shared teardown for both held-open modes -- mirrors
+        AndorNeoAndor3._end_held_open_acquisition(). Mode-agnostic, so
+        every defensive self-heal call site below can call this directly
+        regardless of which mode (if any) is actually open."""
         if not self._acquisition_open:
             return
         self._acquisition_open = False
+        self._acquisition_mode = None
         self._acquisition_stop_count += 1
         if self._timing_enabled:
             self._timing_log.append(("acquisition_stop", None, 0.0))
@@ -171,6 +184,72 @@ class SimCamera:
             yield
         finally:
             self.end_external_acquisition()
+
+    # =========================================================
+    # HELD-OPEN SOFTWARE ACQUISITION (parity stub; see AndorNeoAndor3)
+    # =========================================================
+
+    def begin_software_acquisition(self):
+        if self._acquisition_open:
+            if self._acquisition_mode == "software":
+                return
+            self._end_held_open_acquisition()
+        self._acquisition_open = True
+        self._acquisition_mode = "software"
+        self._acquisition_frames_served = 0
+        self._acquisition_start_count += 1
+        if self._timing_enabled:
+            self._timing_log.append(("acquisition_start", None, 0.0))
+
+    def grab_software_frame(self, timeout_ms=10000):
+        if not (self._acquisition_open and self._acquisition_mode == "software"):
+            raise RuntimeError(
+                "grab_software_frame() called without an open software "
+                "acquisition; call begin_software_acquisition() first."
+            )
+
+        if self._timing_enabled:
+            self._timing_log.append(
+                ("software_trigger", self._acquisition_frames_served, 0.0)
+            )
+
+        # See AndorNeoAndor3.grab_software_frame() for the derivation of
+        # this floor -- mirrored here so a subclass simulating an
+        # implausibly fast return exercises the same rejection path.
+        wait_t0 = time.perf_counter()
+        frame = self._acquire_and_store_frame()
+        wait_duration_s = time.perf_counter() - wait_t0
+
+        if self._timing_enabled:
+            self._timing_log.append(
+                ("wait_buffer", self._acquisition_frames_served, wait_duration_s)
+            )
+
+        min_plausible_s = 0.5 * self.exposure_time
+        if wait_duration_s < min_plausible_s:
+            raise RuntimeError(
+                f"grab_software_frame() returned in "
+                f"{wait_duration_s * 1000:.3f} ms, faster than the "
+                f"{min_plausible_s * 1000:.3f} ms floor implied by the "
+                f"{self.exposure_time * 1000:.3f} ms configured exposure. "
+                "This buffer was very likely already filled with stale "
+                "data before this call started waiting, and has been "
+                "rejected rather than returned as if it were fresh."
+            )
+
+        self._acquisition_frames_served += 1
+        return frame
+
+    def end_software_acquisition(self):
+        self._end_held_open_acquisition()
+
+    @contextmanager
+    def software_acquisition(self):
+        self.begin_software_acquisition()
+        try:
+            yield
+        finally:
+            self.end_software_acquisition()
 
     # =========================================================
     # CONNECTION
@@ -188,7 +267,7 @@ class SimCamera:
 
     def close(self):
         if self._acquisition_open:
-            self.end_external_acquisition()
+            self._end_held_open_acquisition()
         try:
             self.stop_stream()
         except Exception:
@@ -201,21 +280,21 @@ class SimCamera:
     def set_exposure(self, exposure_s):
 
         if self._acquisition_open:
-            self.end_external_acquisition()
+            self._end_held_open_acquisition()
 
         self.exposure_time = exposure_s
 
     def set_roi(self, roi):
 
         if self._acquisition_open:
-            self.end_external_acquisition()
+            self._end_held_open_acquisition()
 
         self.roi = roi
 
     def set_binning(self, binning):
 
         if self._acquisition_open:
-            self.end_external_acquisition()
+            self._end_held_open_acquisition()
 
         self.binning = binning
 
@@ -328,7 +407,7 @@ class SimCamera:
     def snap(self):
 
         if self._acquisition_open:
-            self.end_external_acquisition()
+            self._end_held_open_acquisition()
 
         log_camera_snap(type(self).__name__)
 
@@ -401,7 +480,7 @@ class SimCamera:
 
     def start_stream(self):
         if self._acquisition_open:
-            self.end_external_acquisition()
+            self._end_held_open_acquisition()
         log_event("start_stream", source="live stream", camera_type=type(self).__name__)
         self._stream_controller.start(self._stream_loop)
 

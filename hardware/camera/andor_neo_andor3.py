@@ -37,13 +37,20 @@ class AndorNeoAndor3:
         self._timing_enabled = False
         self._timing_log = []
 
-        # Held-open external acquisition state. See begin_external_acquisition
-        # / grab_external_frame / end_external_acquisition below. Any method
-        # that touches camera features outside this trio defensively closes
-        # an open acquisition first (see each method) so a caller that never
-        # learned about this API -- live view's snap(), Zero Field, a future
-        # script -- can't be broken by one left open.
+        # Held-open acquisition state, shared by both the external (ODMR)
+        # and software (Zero Field) trios below -- there is only one
+        # physical camera handle, one TriggerMode, one buffer set, one
+        # AcquisitionStart state, so the two modes can never legitimately
+        # both be open. _acquisition_mode (None / "external" / "software")
+        # records which one, if any; every begin_*_acquisition() checks it
+        # and defensively closes a different open mode before arming its
+        # own, rather than allowing both open at once. Any method that
+        # touches camera features outside these trios defensively closes
+        # whatever is open first (see each method) so a caller that never
+        # learned about this API -- live view's snap(), a future script --
+        # can't be broken by one left open, regardless of which mode it was.
         self._acquisition_open = False
+        self._acquisition_mode = None
         self._acquisition_frames_served = 0
         self._acquisition_start_count = 0
         self._acquisition_stop_count = 0
@@ -98,7 +105,13 @@ class AndorNeoAndor3:
         if self.cam is None:
             raise RuntimeError("Camera is not connected")
         if self._acquisition_open:
-            return
+            if self._acquisition_mode == "external":
+                return
+            # A different mode (software) was left open -- close it first
+            # rather than trusting the caller noticed. Should not happen
+            # under exclusive_camera_access, but this is the same
+            # defensive-self-heal philosophy the rest of this class uses.
+            self._end_held_open_acquisition()
 
         timing = self._timing_enabled
 
@@ -127,13 +140,14 @@ class AndorNeoAndor3:
             self._timing_log.append(("acquisition_start", None, time.perf_counter() - t0))
 
         self._acquisition_open = True
+        self._acquisition_mode = "external"
         self._acquisition_frames_served = 0
 
     def grab_external_frame(self, timeout_ms=10000):
-        if not self._acquisition_open:
+        if not (self._acquisition_open and self._acquisition_mode == "external"):
             raise RuntimeError(
-                "grab_external_frame() called without an open acquisition; "
-                "call begin_external_acquisition() first."
+                "grab_external_frame() called without an open external "
+                "acquisition; call begin_external_acquisition() first."
             )
 
         timing = self._timing_enabled
@@ -213,6 +227,15 @@ class AndorNeoAndor3:
         return frame
 
     def end_external_acquisition(self):
+        self._end_held_open_acquisition()
+
+    def _end_held_open_acquisition(self):
+        """Shared teardown for both held-open modes -- AcquisitionStop and
+        flush are mode-agnostic; only begin_*_acquisition() differs (which
+        TriggerMode gets set). end_external_acquisition() and
+        end_software_acquisition() both delegate here, and so does every
+        defensive self-heal call site elsewhere in this class, so a left-
+        open acquisition of either mode is always closed correctly."""
         if not self._acquisition_open:
             return
 
@@ -220,6 +243,7 @@ class AndorNeoAndor3:
         # True (that would block the defensive self-heal in snap() etc.
         # from ever trying again).
         self._acquisition_open = False
+        self._acquisition_mode = None
         timing = self._timing_enabled
 
         try:
@@ -246,6 +270,152 @@ class AndorNeoAndor3:
             yield
         finally:
             self.end_external_acquisition()
+
+    # =====================================================
+    # HELD-OPEN SOFTWARE ACQUISITION
+    # =====================================================
+    # Mirrors the external trio above exactly, except the trigger source:
+    # TriggerMode=4 (Software) instead of 6 (External), and each frame
+    # needs an explicit command("SoftwareTrigger") before waitBuffer()
+    # since nothing external fires it. Zero Field's scan loop calls this
+    # trio directly to avoid re-arming per frame -- see
+    # ZeroFieldExperiment.acquire_frame().
+
+    def begin_software_acquisition(self):
+        if self.cam is None:
+            raise RuntimeError("Camera is not connected")
+        if self._acquisition_open:
+            if self._acquisition_mode == "software":
+                return
+            self._end_held_open_acquisition()
+
+        timing = self._timing_enabled
+
+        t0 = time.perf_counter() if timing else None
+        self.cam.setEnumIndex("TriggerMode", 4)  # Software
+        if timing:
+            self._timing_log.append(("trigger_mode_set", None, time.perf_counter() - t0))
+
+        try:
+            t0 = time.perf_counter() if timing else None
+            self.cam.flush()
+            if timing:
+                self._timing_log.append(("flush_pre", None, time.perf_counter() - t0))
+        except Exception:
+            pass
+
+        t0 = time.perf_counter() if timing else None
+        self.cam.queueBuffer(1)
+        if timing:
+            self._timing_log.append(("queue_buffer", None, time.perf_counter() - t0))
+
+        t0 = time.perf_counter() if timing else None
+        self.cam.command("AcquisitionStart")
+        self._acquisition_start_count += 1
+        if timing:
+            self._timing_log.append(("acquisition_start", None, time.perf_counter() - t0))
+
+        self._acquisition_open = True
+        self._acquisition_mode = "software"
+        self._acquisition_frames_served = 0
+
+    def grab_software_frame(self, timeout_ms=10000):
+        if not (self._acquisition_open and self._acquisition_mode == "software"):
+            raise RuntimeError(
+                "grab_software_frame() called without an open software "
+                "acquisition; call begin_software_acquisition() first."
+            )
+
+        timing = self._timing_enabled
+
+        t0 = time.perf_counter() if timing else None
+        self.cam.command("SoftwareTrigger")
+        if timing:
+            self._timing_log.append(
+                ("software_trigger", self._acquisition_frames_served, time.perf_counter() - t0)
+            )
+
+        # Timed unconditionally (not just under the timing-diagnostics
+        # flag): the stale-buffer plausibility check below needs this
+        # duration on every call, not just when NV_ZFE_TIMING=1.
+        wait_t0 = time.perf_counter()
+        try:
+            # requeue=True re-arms the same buffer for the next trigger;
+            # copy=True is required alongside it (SDK wrapper's own
+            # docstring) -- without it the returned array is a live view
+            # into a buffer the SDK is free to overwrite as soon as it's
+            # requeued, which happens before waitBuffer() even returns.
+            # Same requirement as grab_external_frame(), unrelated to
+            # trigger source.
+            raw = self.cam.waitBuffer(timeout_ms, copy=True, requeue=True)
+        except Exception as error:
+            if self._acquisition_frames_served > 0:
+                raise RuntimeError(
+                    f"grab_software_frame() failed after "
+                    f"{self._acquisition_frames_served} frame(s) were already "
+                    "served under this AcquisitionStart. The camera stopped "
+                    "responding to SoftwareTrigger partway through a "
+                    "held-open acquisition -- either a genuine failure, or "
+                    "the CycleMode='Continuous' software-trigger assumption "
+                    "(that one AcquisitionStart can serve many sequential "
+                    "SoftwareTrigger commands) is not holding on this "
+                    "camera/SDK. If this recurs, fall back to per-point "
+                    "acquisition scope (arm once per field point instead of "
+                    "once per scan)."
+                ) from error
+            raise
+        wait_duration_s = time.perf_counter() - wait_t0
+
+        if timing:
+            self._timing_log.append(
+                ("wait_buffer", self._acquisition_frames_served, wait_duration_s)
+            )
+
+        # See grab_external_frame() for the derivation of this 0.5x floor.
+        # The specific failure mode that check was originally written for
+        # -- a looping external pulse sequence firing a stray extra gate
+        # between calls -- cannot happen here: nothing but this method's
+        # own command("SoftwareTrigger") call above can trigger a frame in
+        # TriggerMode=Software. Kept anyway as a general implausibly-fast-
+        # return guard: leftover buffer state from an earlier failure, a
+        # firmware/driver quirk, or the CycleMode assumption itself not
+        # holding are all still possible causes.
+        min_plausible_s = 0.5 * self.exposure_time
+        if wait_duration_s < min_plausible_s:
+            raise RuntimeError(
+                f"grab_software_frame() returned in "
+                f"{wait_duration_s * 1000:.3f} ms, faster than the "
+                f"{min_plausible_s * 1000:.3f} ms floor implied by the "
+                f"{self.exposure_time * 1000:.3f} ms configured exposure. "
+                "This buffer was very likely already filled with stale "
+                "data before this call started waiting, and has been "
+                "rejected rather than returned as if it were fresh."
+            )
+
+        t0 = time.perf_counter() if timing else None
+        frame = self._buffer_to_image(raw)
+        if timing:
+            self._timing_log.append(
+                ("buffer_to_image", self._acquisition_frames_served, time.perf_counter() - t0)
+            )
+
+        self._acquisition_frames_served += 1
+
+        with self._lock:
+            self.latest_frame = frame
+
+        return frame
+
+    def end_software_acquisition(self):
+        self._end_held_open_acquisition()
+
+    @contextmanager
+    def software_acquisition(self):
+        self.begin_software_acquisition()
+        try:
+            yield
+        finally:
+            self.end_software_acquisition()
 
     # =====================================================
     # CONNECT
@@ -329,7 +499,7 @@ class AndorNeoAndor3:
     def set_exposure(self, exposure_s):
 
         if self._acquisition_open:
-            self.end_external_acquisition()
+            self._end_held_open_acquisition()
 
         if self.cam is not None:
             self.cam.setFloat("ExposureTime", exposure_s)
@@ -355,7 +525,7 @@ class AndorNeoAndor3:
         """
 
         if self._acquisition_open:
-            self.end_external_acquisition()
+            self._end_held_open_acquisition()
 
         self.roi = roi
 
@@ -391,7 +561,7 @@ class AndorNeoAndor3:
     def set_binning(self, binning):
 
         if self._acquisition_open:
-            self.end_external_acquisition()
+            self._end_held_open_acquisition()
 
         self.binning = binning
 
@@ -424,7 +594,7 @@ class AndorNeoAndor3:
     def snap(self):
 
         if self._acquisition_open:
-            self.end_external_acquisition()
+            self._end_held_open_acquisition()
 
         log_camera_snap(type(self).__name__)
 
@@ -539,7 +709,7 @@ class AndorNeoAndor3:
 
     def start_stream(self):
         if self._acquisition_open:
-            self.end_external_acquisition()
+            self._end_held_open_acquisition()
         log_event("start_stream", source="live stream", camera_type=type(self).__name__)
         self._stream_controller.start(self._stream_loop)
 
@@ -590,7 +760,7 @@ class AndorNeoAndor3:
     def close(self):
 
         if self._acquisition_open:
-            self.end_external_acquisition()
+            self._end_held_open_acquisition()
 
         try:
             self.stop_stream()

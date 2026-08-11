@@ -133,6 +133,14 @@ class ZeroFieldExperiment(ScanExperiment):
         self.latest_image = None
         self._acquisition_started_at = None
 
+        # Whether this run successfully armed the camera's held-open
+        # software acquisition (see run()/acquire_frame()) -- mirrors
+        # ODMRExperiment's own _acquisition_open flag. Distinct from the
+        # camera driver's own _acquisition_open: this one tracks whether
+        # *this experiment* is entitled to call grab_software_frame(),
+        # not whether the camera object happens to be armed right now.
+        self._acquisition_open = False
+
         # =====================================================
         # TIMING DIAGNOSTICS (off by default; temporary instrumentation)
         # =====================================================
@@ -322,14 +330,29 @@ class ZeroFieldExperiment(ScanExperiment):
             self._merge_magnet_log(t0 - self._timing_epoch)
 
     def acquire_frame(self):
-        """Acquire and average all fluorescence frames at one field point."""
+        """Acquire and average all fluorescence frames at one field point.
+
+        Uses the camera's already-armed held-open software acquisition
+        (see run()) when available, falling back to a plain snap() per
+        frame otherwise -- hasattr-guarded so a camera/test-double lacking
+        the new driver API (e.g. FakeCamera in existing tests, or an older
+        sim) simply never gets the held-open path, exactly mirroring
+        ODMRExperiment.acquire_triggered_frame()'s own fallback.
+        """
         timing = self._timing
+        camera = self.camera
+        use_held_open = self._acquisition_open and hasattr(camera, "grab_software_frame")
         frames = []
         for avg_index in range(self.averages):
             t0 = time.perf_counter() if timing else None
-            frame = self.camera.snap()
+            if use_held_open:
+                frame = camera.grab_software_frame(timeout_ms=10000)
+                stage = "grab_software_frame"
+            else:
+                frame = camera.snap()
+                stage = "snap"
             if timing:
-                self._record_timing("snap", avg_index, t0)
+                self._record_timing(stage, avg_index, t0)
                 self._merge_camera_log(avg_index, t0 - self._timing_epoch)
             frames.append(frame)
         return np.mean(np.stack(frames), axis=0)
@@ -372,6 +395,28 @@ class ZeroFieldExperiment(ScanExperiment):
                     if hasattr(self.camera, "enable_timing_diagnostics"):
                         self.camera.enable_timing_diagnostics(True)
                     self.magnet.enable_timing_diagnostics(True)
+
+                # Arm the camera once for the whole run (every scan of a
+                # multi-scan average), not diagnostic-gated -- this is the
+                # actual speedup, avoiding the ~138 ms arm/disarm SDK cost
+                # per frame that plain snap() pays. hasattr-guarded so a
+                # camera/test-double lacking the new driver API (FakeCamera
+                # in existing tests, an older sim) simply never gets the
+                # held-open path -- acquire_frame() falls back to snap().
+                # Counts reset first so get_acquisition_counts() at the end
+                # of this run reports this run's arms only, mirroring
+                # ODMRWorker.start()'s identical reset-then-arm ordering.
+                if hasattr(self.camera, "reset_acquisition_counts"):
+                    self.camera.reset_acquisition_counts()
+                if hasattr(self.camera, "begin_software_acquisition"):
+                    acq_t0 = time.perf_counter() if self._timing else None
+                    self.camera.begin_software_acquisition()
+                    self._acquisition_open = True
+                    if self._timing:
+                        self._timing_scan_index = None
+                        self._timing_point_index = None
+                        self._timing_field_gauss = None
+                        self._merge_camera_log(None, acq_t0 - self._timing_epoch)
 
                 try:
                     scan_count = self.num_scans if self.averaging_enabled else 1
@@ -473,6 +518,22 @@ class ZeroFieldExperiment(ScanExperiment):
                         self._validate_image_cube(averaged_cube)
                         self.image_cube = averaged_cube
                 finally:
+                    # Disarm before disabling timing diagnostics (mirror
+                    # image of the enable-then-arm ordering above) so this
+                    # teardown's own SDK-call timing is still captured
+                    # while it happens on every exit path -- normal
+                    # completion, a cooperative stop, or an exception
+                    # anywhere in the scan body above.
+                    if self._acquisition_open:
+                        acq_t0 = time.perf_counter() if self._timing else None
+                        if hasattr(self.camera, "end_software_acquisition"):
+                            self.camera.end_software_acquisition()
+                        self._acquisition_open = False
+                        if self._timing:
+                            self._timing_scan_index = None
+                            self._timing_point_index = None
+                            self._timing_field_gauss = None
+                            self._merge_camera_log(None, acq_t0 - self._timing_epoch)
                     if self._timing:
                         if hasattr(self.camera, "enable_timing_diagnostics"):
                             self.camera.enable_timing_diagnostics(False)

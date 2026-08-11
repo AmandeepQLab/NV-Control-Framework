@@ -143,7 +143,12 @@ class TimingEnabledTests(unittest.TestCase):
             "axis_Y_set_current",
             "axis_Z_set_current",
             "settling_sleep",
-            "snap",
+            # SimCamera implements the held-open software-acquisition API
+            # (see hardware/camera/sim_camera.py), so acquire_frame() uses
+            # grab_software_frame() here, not the snap() fallback -- see
+            # tests/test_zero_field_software_acquisition.py for the
+            # fallback-path coverage (a camera lacking the new API).
+            "grab_software_frame",
             "camera.wait_buffer",
             "process_frame",
             "emit_live_update",
@@ -154,10 +159,10 @@ class TimingEnabledTests(unittest.TestCase):
             self.assertIn(expected, stages, f"missing stage {expected!r}")
 
         # avg_index should distinguish the two averages() repeats per point.
-        snap_rows = [r for r in records if r["stage"] == "snap"]
-        self.assertEqual(len(snap_rows), 3 * 2)  # field_points * averages
+        grab_rows = [r for r in records if r["stage"] == "grab_software_frame"]
+        self.assertEqual(len(grab_rows), 3 * 2)  # field_points * averages
         self.assertEqual(
-            sorted({r["avg_index"] for r in snap_rows}), [0, 1],
+            sorted({r["avg_index"] for r in grab_rows}), [0, 1],
         )
 
         # Exactly one run_total / scan_total row.
@@ -167,14 +172,14 @@ class TimingEnabledTests(unittest.TestCase):
 
     def test_point_and_scan_totals_are_consistent_with_each_other(self):
         # point_total wraps its whole point body, which includes both a
-        # "snap" entry (the whole camera.snap() call) and that same call's
-        # own camera.* sub-stages (see acquire_frame()/_merge_camera_log)
-        # -- those two overlap in real time by design (the sub-stages
-        # happen *inside* snap()'s own span), so summing every row for one
-        # point_index is not a meaningful bound on point_total. What *is*
-        # true regardless: the sum of point_total rows for one scan can't
-        # exceed that scan's own scan_total, and scan_total can't exceed
-        # run_total.
+        # "grab_software_frame" entry (the whole grab call) and that same
+        # call's own camera.* sub-stages (see acquire_frame()/
+        # _merge_camera_log) -- those two overlap in real time by design
+        # (the sub-stages happen *inside* the grab call's own span), so
+        # summing every row for one point_index is not a meaningful bound
+        # on point_total. What *is* true regardless: the sum of point_total
+        # rows for one scan can't exceed that scan's own scan_total, and
+        # scan_total can't exceed run_total.
         experiment = make_experiment(
             field_points=4, averages=1, timing_diagnostics=True,
         )
@@ -276,7 +281,7 @@ class LiveViewIsolationAndBoundingTests(unittest.TestCase):
         self.assertFalse(magnet.x._timing_enabled)
         self.assertEqual(magnet.x._timing_log, [])
 
-    def test_camera_side_log_never_exceeds_one_snap_worth_of_entries(self):
+    def test_camera_side_log_never_accumulates_across_calls(self):
         experiment = make_experiment(
             field_points=3, averages=2, timing_diagnostics=True,
         )
@@ -292,8 +297,20 @@ class LiveViewIsolationAndBoundingTests(unittest.TestCase):
 
         experiment.run()
 
-        self.assertTrue(observed_lengths)
-        self.assertTrue(all(length == 8 for length in observed_lengths))
+        # Three kinds of drain happen: run()'s arm (begin_software_
+        # acquisition() appends 1 entry: acquisition_start), one per
+        # grab_software_frame() call (2 entries: software_trigger +
+        # wait_buffer) -- field_points * averages of those -- and run()'s
+        # disarm (1 entry: acquisition_stop). The invariant this test
+        # exists for isn't a magic count, it's that the camera-side log is
+        # always drained immediately after the call that filled it and
+        # never left to accumulate entries from more than one call at a
+        # time -- so every observed length matches exactly what that one
+        # call appends, never more.
+        self.assertEqual(len(observed_lengths), 1 + 3 * 2 + 1)
+        self.assertEqual(observed_lengths[0], 1)  # begin_software_acquisition
+        self.assertEqual(observed_lengths[-1], 1)  # end_software_acquisition
+        self.assertTrue(all(length == 2 for length in observed_lengths[1:-1]))
 
     def test_timing_disabled_leaves_camera_and_magnet_flags_untouched(self):
         experiment = make_experiment(timing_diagnostics=False)
