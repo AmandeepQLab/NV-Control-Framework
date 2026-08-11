@@ -59,14 +59,36 @@ class ZeroFieldWidget(QWidget):
         axis_row.addWidget(QLabel("Sweep Axis:"))
         self.field_axis_combo = QComboBox()
         self.field_axis_combo.addItems(["X", "Y", "Z"])
+        self.field_axis_combo.setToolTip(
+            "Axis to sweep; the other two axes are zeroed for the duration "
+            "of the scan (not preserved). The entry vector -- what the "
+            "magnet actually held before the scan touched it -- is "
+            "recorded in the saved metadata, so the zeroing is verifiable "
+            "after the fact."
+        )
         axis_row.addWidget(self.field_axis_combo)
         field_layout.addLayout(axis_row)
 
         self.settling_time_spin = self._add_int(
             field_layout, "Settling Time (ms):", 0, 600000, 100
         )
+        self.settling_time_spin.setToolTip(
+            "Fixed wait after commanding the field, before acquiring. "
+            "Measured to be the largest single per-point cost in a "
+            "multi-scan sweep (~36% of total run time) -- there is no "
+            "field/current readback (see CLAUDE.md), so the correct value "
+            "is empirical: increase if signal looks unsettled at your "
+            "coil/sample, decrease if scans are too slow and results look "
+            "unaffected."
+        )
         self.averages_spin = self._add_int(
             field_layout, "Number of Averages:", 1, 100000, 1
+        )
+        self.averages_spin.setToolTip(
+            "Camera frames averaged per field point. Each repeat now costs "
+            "~16 ms (the held-open software-triggered acquisition -- see "
+            "CLAUDE.md), not the ~165 ms it cost before that change, so "
+            "increasing this is far cheaper than it used to be."
         )
 
         averaging_group = QGroupBox("Multi-Scan Averaging")

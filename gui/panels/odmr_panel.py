@@ -67,7 +67,19 @@ class ODMRPanel(QWidget):
         self.dip2_group.setVisible(False)
 
         self.avg_spin = self._add_int(odmr_layout, "Averages:", 1, 100000, 1)
+        self.avg_spin.setToolTip(
+            "Number of full point re-acquisitions per frequency, each "
+            "producing one contrast value; these are averaged together.\n"
+            "Outer loop -- see Repeats for the averaging that happens "
+            "inside each one."
+        )
         self.repeat_spin = self._add_int(odmr_layout, "Repeats:", 1, 100000, 1)
+        self.repeat_spin.setToolTip(
+            "Number of OFF/ON frame pairs acquired and averaged into one "
+            "contrast value per point, before Averages (above) repeats the "
+            "whole thing.\n"
+            "Inner loop."
+        )
         self.mw_power_spin = self._add_double(odmr_layout, "MW Power (dBm):", -100, 20, 1, -10)
 
         # =====================================================
@@ -90,7 +102,10 @@ class ODMRPanel(QWidget):
         self.trigger_delay_spin.setToolTip(
             "Delay before the first camera trigger pulse.\n"
             "Recommended: 0.02 s.\n"
-            "Reducing below 0.02 s may decrease in ESR contrast."
+            "Below ~0.02 s, ~1 frame in 9 stalls ~400 ms (root cause "
+            "unconfirmed). Rig testing at 0/5/20/150 ms found no "
+            "measurable contrast difference -- this delay doesn't affect "
+            "ESR contrast, only scan-time predictability."
         )
 
         self.fire_delay_spin = self._add_double(
@@ -109,7 +124,9 @@ class ODMRPanel(QWidget):
             delays_layout, "Reset Delay (s):", 0.0, 10.0, 4, 0.010
         )
         self.reset_delay_spin.setToolTip(
-            "Delay after forcing Swabian outputs LOW before acquisition.\n"
+            "Delay after resetting Swabian digital outputs to a clean "
+            "baseline before acquisition (the magnet polarity relay is "
+            "preserved at its commanded state, not zeroed).\n"
             "Recommended: 0.010 s. Measured: below 0.010 s, pulse.run() "
             "intermittently blocks 300-1000 ms (the Swabian needs recovery "
             "time before accepting a new streamed sequence). 0.010 s "
@@ -121,7 +138,10 @@ class ODMRPanel(QWidget):
             delays_layout, "MW Settle (s):", 0.0, 10.0, 4, 0.0
         )
         self.mw_settle_spin.setToolTip(
-            "Delay after setting MW frequency before acquisition.\n"
+            "Delay after setting the SG386's frequency, before acquisition "
+            "-- frequency settling only. Unrelated to MW on/off gating, "
+            "which is done by the fast switch (Pulse Streamer channel 2), "
+            "not this delay.\n"
             "Recommended: 0.0 s currently. Use 0.05–0.1 s only if ESR disappears after frequency jumps."
         )
 
@@ -130,9 +150,13 @@ class ODMRPanel(QWidget):
             "Pulse Lead (s):", 0.0, 1.0, 4, 0.002
         )
         self.pulse_lead_spin.setToolTip(
-            "Laser and MW start before the camera trigger.\n"
+            "Laser and MW switch on this long before the camera trigger "
+            "fires.\n"
             "Recommended: 0.002 s.\n"
-            "This fixed ESR loss at 10 ms exposure."
+            "A sweep at 2/1/0.5/0.2/0 ms found no measurable contrast "
+            "dependence, though the lower values overlap the trigger-delay "
+            "stall regime (see Camera Trigger Delay), so that comparison "
+            "isn't fully clean."
         )
 
         self.pulse_tail_spin = self._add_double(
@@ -140,9 +164,12 @@ class ODMRPanel(QWidget):
             "Pulse Tail (s):", 0.0, 1.0, 4, 0.002
         )
         self.pulse_tail_spin.setToolTip(
-            "Laser and MW remain ON after the camera exposure.\n"
+            "Laser and MW remain ON this long after the camera exposure "
+            "ends, within the pulse sequence itself.\n"
             "Recommended: 0.002 s.\n"
-            "Provides safe overlap between illumination/MW and camera exposure."
+            "Costs no wall-clock scan time -- nothing waits on it; it only "
+            "extends how long the sequence holds these channels on "
+            "hardware."
         )
         self.delays_group.setVisible(False)
 

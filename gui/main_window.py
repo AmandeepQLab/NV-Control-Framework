@@ -122,6 +122,12 @@ class MainWindow(QMainWindow):
         self.exposure_spin.setRange(0.001, 10)
         self.exposure_spin.setDecimals(4)
         self.exposure_spin.setValue(0.01)
+        self.exposure_spin.setToolTip(
+            "Camera exposure time. Pushed to the camera immediately, and "
+            "read back afterward -- the value shown may differ slightly "
+            "from what you typed: the sensor quantises to the nearest row "
+            "period, measured at ±3 µs (see CLAUDE.md)."
+        )
         self.exposure_spin.valueChanged.connect(self.set_exposure)
 
         exposure_layout.addWidget(self.exposure_spin)
@@ -137,6 +143,10 @@ class MainWindow(QMainWindow):
         self.binning_spin = QSpinBox()
         self.binning_spin.setRange(1, 8)
         self.binning_spin.setValue(1)
+        self.binning_spin.setToolTip(
+            "Camera pixel binning (NxN). Applied immediately to the "
+            "camera; changes the acquired frame's pixel dimensions."
+        )
         self.binning_spin.valueChanged.connect(self.set_binning)
 
         binning_layout.addWidget(self.binning_spin)
@@ -156,7 +166,9 @@ class MainWindow(QMainWindow):
         self.baseline_spin.setToolTip(
             "Camera dark-count offset, subtracted from ROI means before ODMR "
             "contrast is computed.\n"
-            "Typically ~100 counts on an Andor Neo sCMOS.\n"
+            "~120 counts measured on this rig (laser blocked, against "
+            "~20,000 counts with laser on) -- re-measure if sample, ROI, "
+            "or laser power changes.\n"
             "Measure by blocking the laser at your working exposure and "
             "entering the resulting ROI mean.\n"
             "0 disables the correction.\n"
@@ -194,6 +206,11 @@ class MainWindow(QMainWindow):
         roi_layout.addWidget(self.roi_label)
 
         coordinates_box = QGroupBox("ROI Coordinates")
+        coordinates_box.setToolTip(
+            "Full-sensor pixel coordinates, 0-based. X/Y is the top-left "
+            "corner; Width/Height extend from there. Applied on "
+            "Enter/focus-out."
+        )
         coordinates_layout = QGridLayout(coordinates_box)
         self.roi_coordinate_spins = {}
         for row, coordinate in enumerate(("X", "Y", "Width", "Height")):
@@ -210,6 +227,9 @@ class MainWindow(QMainWindow):
         roi_layout.addWidget(coordinates_box)
 
         self.reset_roi_button = QPushButton("Reset ROI")
+        self.reset_roi_button.setToolTip(
+            "Clear the acquisition ROI back to the full sensor."
+        )
         self.reset_roi_button.clicked.connect(self.reset_acquisition_roi)
         roi_layout.addWidget(self.reset_roi_button)
 
