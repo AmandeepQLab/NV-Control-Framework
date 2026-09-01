@@ -18,7 +18,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 def _is_hdf5_path(filename):
-    return Path(filename).suffix.lower() in (".h5", ".hdf5")
+    return filename is not None and Path(filename).suffix.lower() in (".h5", ".hdf5")
 
 
 def _atomic_save_hdf5(cube, path):
@@ -56,6 +56,9 @@ class ZeroFieldWorker(QObject):
         metadata,
         output_path,
     ):
+        # output_path is Optional[Path]: None means saving is off for this
+        # run -- no file is written during or after acquisition, and the
+        # result exists only in the ImageCube emitted via finished_signal.
         super().__init__()
         self.hardware_manager = hardware_manager
         self.camera = camera
@@ -100,7 +103,14 @@ class ZeroFieldWorker(QObject):
                 scan_completed_callback=self._on_scan_completed,
                 averaging_enabled=self.config.get("averaging_enabled", False),
                 num_scans=self.config.get("num_scans", 1),
-                save_raw_scans=self.config.get("save_raw_scans", False),
+                # "Save individual scans" is meaningless without a
+                # destination -- force off regardless of widget state so
+                # _save_raw_scan's self.output_path.with_name(...) can never
+                # be reached with output_path=None.
+                save_raw_scans=(
+                    self.config.get("save_raw_scans", False)
+                    and self.output_path is not None
+                ),
                 raw_scan_saver=self._save_raw_scan,
                 # HDF5 only -- streaming needs random-access writes .npz
                 # can't do (see ImageCube.open_streaming_write). A non-.h5
@@ -120,7 +130,7 @@ class ZeroFieldWorker(QObject):
             if self._stop_requested:
                 self.experiment.stop()
             cube = self.experiment.run()
-            if cube.data is not None:
+            if self.output_path is not None and cube.data is not None:
                 if self._single_scan_direct:
                     # Pixel data (and scan_complete/planes_written/
                     # stopped_by_user) already reached output_path

@@ -34,13 +34,18 @@ class ZeroFieldWidget(QWidget):
         control_layout = QVBoxLayout(controls)
 
         output_group = QGroupBox("Output Directory")
-        output_layout = QHBoxLayout(output_group)
+        output_group_layout = QVBoxLayout(output_group)
         control_layout.addWidget(output_group)
+        output_layout = QHBoxLayout()
+        output_group_layout.addLayout(output_layout)
         self.output_directory_edit = QLineEdit()
         self.output_directory_edit.setReadOnly(True)
         output_layout.addWidget(self.output_directory_edit)
         self.browse_output_button = QPushButton("Browse…")
         output_layout.addWidget(self.browse_output_button)
+        self.save_data_check = QCheckBox("Save data")
+        self.save_data_check.setChecked(True)
+        output_group_layout.addWidget(self.save_data_check)
 
         field_group = QGroupBox("Magnetic Field")
         field_layout = QVBoxLayout(field_group)
@@ -104,7 +109,12 @@ class ZeroFieldWidget(QWidget):
         self.averaging_enabled_check.toggled.connect(
             self._set_averaging_controls_enabled
         )
+        self.averaging_enabled_check.toggled.connect(
+            self._update_save_raw_scans_enabled
+        )
+        self.save_data_check.toggled.connect(self._update_save_raw_scans_enabled)
         self._set_averaging_controls_enabled(False)
+        self._update_save_raw_scans_enabled()
 
         camera_group = QGroupBox("Camera Acquisition")
         camera_layout = QVBoxLayout(camera_group)
@@ -240,6 +250,7 @@ class ZeroFieldWidget(QWidget):
             "averaging_enabled": self.averaging_enabled_check.isChecked(),
             "num_scans": self.num_scans_spin.value(),
             "save_raw_scans": self.save_raw_scans_check.isChecked(),
+            "save_data": self.save_data_check.isChecked(),
         }
 
     def reset_scan(self, total, total_scans=1):
@@ -315,6 +326,14 @@ class ZeroFieldWidget(QWidget):
 
     def _set_averaging_controls_enabled(self, enabled):
         self.num_scans_spin.setEnabled(enabled)
+
+    def _update_save_raw_scans_enabled(self, _value=None):
+        """"Save individual scans" is meaningless with saving off, and
+        averaging off means there's only ever one scan to save individually."""
+        enabled = (
+            self.averaging_enabled_check.isChecked()
+            and self.save_data_check.isChecked()
+        )
         self.save_raw_scans_check.setEnabled(enabled)
 
     def _set_manual_display_controls_enabled(self, enabled):

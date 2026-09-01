@@ -60,6 +60,8 @@ class ZeroFieldWindow(QMainWindow):
         self.total_scans = 1
         self.output_directory = self._resolve_default_output_directory()
         self.output_path = None
+        self._scan_timestamp = None
+        self._save_off_warning_shown = False
         self._reference_image = None
         self._latest_averaged_image = None
         self._current_display_image = None
@@ -70,6 +72,7 @@ class ZeroFieldWindow(QMainWindow):
         self.widget.run_stop_button.clicked.connect(self.toggle_scan)
         self.widget.save_button.clicked.connect(self.save_data)
         self.widget.browse_output_button.clicked.connect(self.browse_output_directory)
+        self.widget.save_data_check.toggled.connect(self._handle_save_data_toggled)
         self.widget.display_mode_combo.currentTextChanged.connect(
             self.handle_display_mode_changed
         )
@@ -117,19 +120,22 @@ class ZeroFieldWindow(QMainWindow):
             self.start_scan()
 
     def start_scan(self):
+        config = self.widget.get_config()
+
         # Checked before anything else -- no hardware is touched and no
         # worker/thread is created until the destination is confirmed usable.
-        try:
-            ensure_writable_directory(self.output_directory)
-        except OSError as error:
-            QMessageBox.critical(
-                self,
-                "Zero Field Error",
-                f"Output directory is not usable: {self.output_directory}\n{error}",
-            )
-            return
+        # Skipped entirely when saving is off: there is no destination.
+        if config["save_data"]:
+            try:
+                ensure_writable_directory(self.output_directory)
+            except OSError as error:
+                QMessageBox.critical(
+                    self,
+                    "Zero Field Error",
+                    f"Output directory is not usable: {self.output_directory}\n{error}",
+                )
+                return
 
-        config = self.widget.get_config()
         acquisition_state = self.acquisition_state_getter()
         acquisition_roi = acquisition_state.acquisition_roi
         LOGGER.info("Using acquisition ROI from Main Window: %s", acquisition_roi)
@@ -145,7 +151,13 @@ class ZeroFieldWindow(QMainWindow):
             config["num_scans"] if config["averaging_enabled"] else 1
         )
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        if self.total_scans == 1:
+        # Stored unconditionally (even when saving is off) so "Save Data"
+        # can later synthesize a filename matching what this run would have
+        # used had saving been on.
+        self._scan_timestamp = timestamp
+        if not config["save_data"]:
+            self.output_path = None
+        elif self.total_scans == 1:
             # Nothing to average -- the single scan streams directly into
             # this path, so it's the only file this run produces, not a
             # companion to a separate per-scan file.
@@ -330,16 +342,41 @@ class ZeroFieldWindow(QMainWindow):
                 self.field_point_count,
             )
 
-        self.widget.status_label.setText(
-            "Status: Stopped" if stopped else "Status: Complete"
-        )
-        # Enabled exactly when the worker actually wrote self.output_path
-        # (cube.data is not None), so "Save Data" always has something to copy.
+        status_prefix = "Status: Stopped" if stopped else "Status: Complete"
+        self.widget.status_label.setText(status_prefix)
+        # Enabled exactly when there's an ImageCube to hand to "Save Data" --
+        # either it's already on disk (copy) or it isn't yet (serialize from
+        # memory); either way there's something to save.
         self.widget.save_button.setEnabled(image_cube.data is not None)
         if self.output_path is not None:
             self.widget.status_label.setText(
-                f"Status: {'Stopped' if stopped else 'Complete'} — saved {self.output_path.name}"
+                f"{status_prefix} — saved {self.output_path.name}"
             )
+        elif image_cube.data is not None:
+            # Saving was off for this run -- say so explicitly rather than
+            # leaving "was this saved?" implied by an easy-to-forget
+            # checkbox state, so a scan can't be mistaken for one that
+            # produced a file just because a file usually does exist.
+            self.widget.status_label.setText(
+                f"{status_prefix} — not saved (use Save Data to keep it)"
+            )
+
+    def _handle_save_data_toggled(self, checked):
+        """Warn once per window instance when the user opts out of saving.
+
+        A crash or forced quit with saving off loses the run's data
+        entirely, since nothing is written incrementally -- worth a
+        one-time heads-up, not a dialog on every scan.
+        """
+        if checked or self._save_off_warning_shown:
+            return
+        QMessageBox.warning(
+            self,
+            "Zero Field",
+            "Saving is off: this run's data will exist only in memory. "
+            "A crash or forced quit before you use \"Save Data\" will lose it.",
+        )
+        self._save_off_warning_shown = True
 
     def show_error(self, message):
         self.zero_field_running = False
@@ -371,21 +408,23 @@ class ZeroFieldWindow(QMainWindow):
         )
 
     def save_data(self):
-        """Copy the already-written result file to a chosen location.
+        """Save this run's result, however it currently exists.
 
-        Streaming (or, for a legacy .npz destination, the worker's final
-        save) already wrote self.output_path in full by the time this
-        button is enabled, so this is a plain file copy, not a re-save.
+        If saving was on, the result is already durably written to
+        self.output_path -- this is then a plain file copy, not a re-save.
+        If saving was off, there is no file yet; the in-memory ImageCube is
+        serialized directly to the chosen destination instead.
         """
-        if self.zero_field_running or self.output_path is None:
+        if self.zero_field_running:
             return
-        if not self.output_path.exists():
-            QMessageBox.critical(
-                self, "Zero Field Error",
-                f"Nothing to save -- {self.output_path} does not exist.",
-            )
-            return
+        if self.output_path is not None and self.output_path.exists():
+            self._save_copy_of_output_file()
+        elif self.image_cube is not None and self.image_cube.data is not None:
+            self._save_in_memory_cube()
+        else:
+            QMessageBox.critical(self, "Zero Field Error", "Nothing to save.")
 
+    def _save_copy_of_output_file(self):
         directory = QFileDialog.getExistingDirectory(
             self,
             "Choose Destination for a Copy of the Zero Field Data",
@@ -403,6 +442,33 @@ class ZeroFieldWindow(QMainWindow):
             )
             return
         self.widget.status_label.setText(f"Status: Saved a copy to {destination}")
+
+    def _save_in_memory_cube(self):
+        """Serialize the acquired-but-never-written ImageCube on request.
+
+        Mirrors _save_copy_of_output_file's interaction (pick a folder,
+        report the same way) but writes fresh via ImageCube.save() since
+        there's no already-written file to copy.
+        """
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Choose Destination for the Zero Field Data",
+            str(self.output_directory),
+        )
+        if not directory:
+            return
+
+        suffix = "_average" if self.total_scans > 1 else ""
+        filename = f"zero_field_{self._scan_timestamp}{suffix}{_OUTPUT_EXTENSION}"
+        destination = Path(directory) / filename
+        try:
+            self.image_cube.save(destination)
+        except OSError as error:
+            QMessageBox.critical(
+                self, "Zero Field Error", f"Could not save data: {error}"
+            )
+            return
+        self.widget.status_label.setText(f"Status: Saved data to {destination}")
 
     def closeEvent(self, event):
         if self.zero_field_running:

@@ -11,7 +11,7 @@ from framework.analysis.zero_field import mean_fluorescence_vs_field
 from framework.camera_ownership import register_camera_state_restorer
 from framework.image_cube import ImageCube
 from gui.zero_field_window import ZeroFieldWindow
-from gui.zero_field_worker import ZeroFieldWorker
+from gui.zero_field_worker import ZeroFieldWorker, _is_hdf5_path
 from gui.image_inspection import line_profile, pixel_value
 
 
@@ -773,6 +773,119 @@ class ZeroFieldStreamingTests(unittest.TestCase):
             # artifact -- survives.
             self.assertFalse((Path(directory) / "zero_field_test_scan_001.h5").exists())
             self.assertTrue((Path(directory) / "zero_field_test_scan_002.h5").exists())
+
+
+class ZeroFieldSavingDisabledTests(unittest.TestCase):
+    """output_path=None: the "Save data" checkbox unticked. No file is
+    written anywhere, but the in-memory result and its metadata are
+    otherwise unaffected -- see CLAUDE.md-style rationale in
+    gui/zero_field_worker.py's output_path docstring."""
+
+    def _run_worker(self, frames, config, output_path=None):
+        worker = ZeroFieldWorker(
+            None, FakeCamera(frames), FakeMagnet(), config, None, {}, output_path,
+        )
+        finished = []
+        errors = []
+        worker.finished_signal.connect(
+            lambda cube, fields, signals, stopped: finished.append(cube)
+        )
+        worker.error_signal.connect(errors.append)
+        worker.start()
+        return finished, errors
+
+    @staticmethod
+    def _base_config(**overrides):
+        config = {
+            "field_start": -1.0,
+            "field_stop": 1.0,
+            "field_points": 2,
+            "field_axis": "X",
+            "settling_time_ms": 0,
+            "averages": 1,
+            "averaging_enabled": False,
+            "num_scans": 1,
+            "save_raw_scans": False,
+        }
+        config.update(overrides)
+        return config
+
+    def test_is_hdf5_path_returns_false_for_none(self):
+        self.assertFalse(_is_hdf5_path(None))
+
+    def test_single_scan_run_with_output_path_none_writes_no_file(self):
+        frames = [np.full((2, 2), 1.0), np.full((2, 2), 3.0)]
+        finished, errors = self._run_worker(frames, self._base_config())
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(finished), 1)
+        self.assertIsNotNone(finished[0].data)
+
+    def test_multi_scan_run_with_output_path_none_does_not_persist_running_average(self):
+        # Two scans, two points each -- exercises _on_scan_completed's
+        # per-scan persistence guard, which would otherwise call
+        # _is_hdf5_path(None) after every completed scan.
+        frames = [
+            np.full((2, 2), 1.0), np.full((2, 2), 3.0),
+            np.full((2, 2), 5.0), np.full((2, 2), 7.0),
+        ]
+        config = self._base_config(averaging_enabled=True, num_scans=2)
+        finished, errors = self._run_worker(frames, config)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(finished), 1)
+        cube = finished[0]
+        np.testing.assert_allclose(
+            cube.data,
+            np.stack([np.full((2, 2), 3.0), np.full((2, 2), 5.0)]),
+        )
+        self.assertEqual(cube.metadata["completed_scans"], 2)
+        self.assertTrue(cube.metadata["experiment_complete"])
+
+    def test_save_raw_scans_forced_off_when_output_path_is_none(self):
+        # Regression test for _raw_scan_path()'s self.output_path.with_name(...)
+        # crashing on a None output_path -- save_raw_scans must be forced off
+        # by the worker regardless of what the widget/config say.
+        frames = [
+            np.full((2, 2), 1.0), np.full((2, 2), 3.0),
+            np.full((2, 2), 5.0), np.full((2, 2), 7.0),
+        ]
+        config = self._base_config(
+            averaging_enabled=True, num_scans=2, save_raw_scans=True,
+        )
+        finished, errors = self._run_worker(frames, config)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(finished), 1)
+        self.assertNotIn("raw_scan_filenames", finished[0].metadata)
+
+    def test_saving_disabled_cube_matches_saving_enabled_regression(self):
+        def make_frames():
+            return [np.full((2, 2), 1.0), np.full((2, 2), 3.0)]
+
+        config = self._base_config()
+
+        with tempfile.TemporaryDirectory() as directory:
+            saved_path = Path(directory) / "zero_field_test.h5"
+            finished_on, errors_on = self._run_worker(
+                make_frames(), config, saved_path
+            )
+            finished_off, errors_off = self._run_worker(
+                make_frames(), config, None
+            )
+
+        self.assertEqual(errors_on, [])
+        self.assertEqual(errors_off, [])
+        cube_on, cube_off = finished_on[0], finished_off[0]
+        np.testing.assert_allclose(cube_on.data, cube_off.data)
+        # scan_complete/planes_written are deliberately excluded: those are
+        # a streaming-writer-only concept that never reaches self.image_cube
+        # even when saving is on -- see the "Save Data" metadata analysis.
+        for key in (
+            "completed_scans", "experiment_complete", "averaging_enabled",
+            "image_height_px", "image_width_px",
+        ):
+            self.assertEqual(cube_on.metadata[key], cube_off.metadata[key])
 
 
 class StoppingCamera(FakeCamera):
