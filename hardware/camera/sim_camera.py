@@ -284,6 +284,12 @@ class SimCamera:
 
         self.exposure_time = exposure_s
 
+    def get_exposure_limits(self):
+        """No real hardware floor to query -- a generous fixed range,
+        matching AndorNeoAndor3.get_exposure_limits()'s (min_s, max_s)
+        shape so GUI code can call either camera uniformly."""
+        return (1e-6, 10.0)
+
     def set_roi(self, roi):
 
         if self._acquisition_open:

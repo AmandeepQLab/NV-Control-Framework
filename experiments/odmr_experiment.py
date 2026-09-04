@@ -83,13 +83,38 @@ class ODMRExperiment(ScanExperiment):
     # Measured at the rig: requested 10.000 ms -> camera held 9.997 ms
     # (-3 us); requested 20.000 ms -> camera held 20.003 ms (+3 us). The
     # sensor snaps to the nearest whole row period, so this offset is a
-    # fixed ~3 us regardless of exposure, not a proportional error -- an
-    # absolute threshold is therefore correct in principle, not just
-    # convenient. 100 us sits far above that quantisation noise floor
-    # while staying far below anything that could matter: a genuine fault
-    # (a failed SDK write, or camera_gate_s sized from a stale value)
-    # would be off by milliseconds, not microseconds.
+    # fixed ~3 us regardless of exposure, not a proportional error. 100 us
+    # sits far above that quantisation noise floor while staying far below
+    # anything that could matter at the ms-scale exposures this was
+    # measured at: a genuine fault (a failed SDK write, or camera_gate_s
+    # sized from a stale value) would be off by milliseconds, not
+    # microseconds.
+    #
+    # At sub-millisecond exposures a flat 100us stops being a small
+    # fraction of the exposure -- the actual epsilon used is capped at
+    # this value but scales down proportionally below ~500us requested
+    # exposure (see _drift_epsilon_s()), floored at
+    # _EXPOSURE_DRIFT_FLOOR_S so it never drops below the fixed
+    # quantisation noise above, at any exposure.
     _EXPOSURE_DRIFT_EPSILON_S = 100e-6
+    _EXPOSURE_DRIFT_FLOOR_S = 20e-6
+
+    @classmethod
+    def _drift_epsilon_s(cls, requested_exposure_s):
+        """Warning threshold for actual-vs-requested exposure drift.
+
+        Capped at _EXPOSURE_DRIFT_EPSILON_S (unchanged at the validated
+        ms-scale working point: requested_exposure_s >= 500us puts the cap
+        below 20% of the exposure, so it's what applies). Below that, it
+        scales down proportionally so the check stays meaningful instead
+        of approaching the exposure itself. Floored at
+        _EXPOSURE_DRIFT_FLOOR_S, which doesn't scale down, because the
+        fixed ~3us quantisation noise it guards against doesn't either.
+        """
+        return max(
+            cls._EXPOSURE_DRIFT_FLOOR_S,
+            min(cls._EXPOSURE_DRIFT_EPSILON_S, 0.2 * requested_exposure_s),
+        )
 
     def configure_acquisition(self):
         """Apply this experiment's temporary camera AOI while it is borrowed.
@@ -100,7 +125,7 @@ class ODMRExperiment(ScanExperiment):
         which is what camera_gate_s in build_sequence() was sized from.
         Logged, not raised: sCMOS row-period quantisation routinely
         produces a few microseconds of difference (see
-        _EXPOSURE_DRIFT_EPSILON_S) that is not itself a fault.
+        _drift_epsilon_s()) that is not itself a fault.
         """
         camera = self.hw["camera"]
         camera.set_roi(self.acquisition_roi)
@@ -111,7 +136,7 @@ class ODMRExperiment(ScanExperiment):
             self.actual_exposure_s is not None
             and requested_exposure_s is not None
             and abs(self.actual_exposure_s - requested_exposure_s)
-            > self._EXPOSURE_DRIFT_EPSILON_S
+            > self._drift_epsilon_s(requested_exposure_s)
         ):
             LOGGER.warning(
                 "Camera exposure differs from the requested value: "

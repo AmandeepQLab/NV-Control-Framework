@@ -510,6 +510,21 @@ class AndorNeoAndor3:
         else:
             self.exposure_time = exposure_s
 
+    def get_exposure_limits(self):
+        """Return (min_s, max_s) for ExposureTime, queried live from the SDK.
+
+        Reflects whichever AOI is currently active -- exposure limits on
+        this sensor may be ROI-height dependent (see CLAUDE.md's rolling-
+        shutter note), so re-query after a ROI change if that matters to
+        the caller. Raises whatever the SDK raises (e.g. if self.cam is
+        None or the camera is in a bad state) -- callers that must not
+        fail on this (e.g. GUI startup) should catch and fall back.
+        """
+        return (
+            self.cam.getFloatMin("ExposureTime"),
+            self.cam.getFloatMax("ExposureTime"),
+        )
+
     # =====================================================
     # ROI / BINNING PLACEHOLDERS
     # =====================================================

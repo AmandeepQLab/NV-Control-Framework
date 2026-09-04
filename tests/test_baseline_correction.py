@@ -209,7 +209,9 @@ class AcquisitionStateReconstructionTests(unittest.TestCase):
         fake_self.acquisition_state = AcquisitionState(baseline_counts=42.0)
         fake_self.apply_acquisition_state = lambda: None
 
-        MainWindow.set_exposure(fake_self, 0.05)
+        # set_exposure()'s parameter is milliseconds (the spinbox's display
+        # unit) -- it converts to seconds before storing on AcquisitionState.
+        MainWindow.set_exposure(fake_self, 50.0)
 
         self.assertEqual(fake_self.acquisition_state.baseline_counts, 42.0)
         self.assertEqual(fake_self.acquisition_state.exposure_s, 0.05)

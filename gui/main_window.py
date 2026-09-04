@@ -116,17 +116,33 @@ class MainWindow(QMainWindow):
         # -----------------------------
 
         exposure_layout = QHBoxLayout()
-        exposure_layout.addWidget(QLabel("Exposure (s):"))
+        exposure_layout.addWidget(QLabel("Exposure (ms):"))
+
+        try:
+            exposure_min_s, exposure_max_s = self.camera.get_exposure_limits()
+        except Exception as error:
+            # get_exposure_limits() is an SDK call made during __init__ --
+            # it must never prevent the app from starting. Fall back to
+            # the previous hardcoded range and say so loudly.
+            exposure_min_s, exposure_max_s = 0.001, 10.0
+            print(
+                f"[MainWindow] camera.get_exposure_limits() failed "
+                f"({error!r}); falling back to the default "
+                f"{exposure_min_s * 1000:.3f}-{exposure_max_s * 1000:.0f} ms "
+                f"exposure range."
+            )
 
         self.exposure_spin = QDoubleSpinBox()
-        self.exposure_spin.setRange(0.001, 10)
-        self.exposure_spin.setDecimals(4)
-        self.exposure_spin.setValue(0.01)
+        self.exposure_spin.setRange(exposure_min_s * 1000.0, exposure_max_s * 1000.0)
+        self.exposure_spin.setDecimals(3)
+        self.exposure_spin.setValue(10.0)
         self.exposure_spin.setToolTip(
-            "Camera exposure time. Pushed to the camera immediately, and "
-            "read back afterward -- the value shown may differ slightly "
-            "from what you typed: the sensor quantises to the nearest row "
-            "period, measured at ±3 µs (see CLAUDE.md)."
+            "Camera exposure time, in milliseconds. Pushed to the camera "
+            "immediately, and read back afterward -- the value shown may "
+            "differ slightly from what you typed: the sensor quantises to "
+            "the nearest row period, measured at ±3 µs (see CLAUDE.md). "
+            f"Range ({exposure_min_s * 1000:.3f}-{exposure_max_s * 1000:.0f} "
+            "ms) is queried live from the camera at startup."
         )
         self.exposure_spin.valueChanged.connect(self.set_exposure)
 
@@ -187,7 +203,7 @@ class MainWindow(QMainWindow):
         # is what this object holds from the moment it exists -- pushed
         # to the camera itself at the end of __init__.
         self.acquisition_state = AcquisitionState(
-            exposure_s=self.exposure_spin.value(),
+            exposure_s=self.exposure_spin.value() / 1000.0,
             binning=self.binning_spin.value(),
             baseline_counts=self.baseline_spin.value(),
         )
@@ -489,10 +505,10 @@ class MainWindow(QMainWindow):
     # CAMERA SETTINGS
     # =========================================================
 
-    def set_exposure(self, value):
+    def set_exposure(self, value_ms):
         self.acquisition_state = AcquisitionState(
             acquisition_roi=self.acquisition_state.acquisition_roi,
-            exposure_s=value,
+            exposure_s=value_ms / 1000.0,
             binning=self.acquisition_state.binning,
             baseline_counts=self.acquisition_state.baseline_counts,
         )
