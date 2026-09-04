@@ -11,3 +11,6 @@ venv/
 Data/
 Results/
 CameraData/
+data/
+/*.csv
+PROJECT_STATUS_REPORT.md
