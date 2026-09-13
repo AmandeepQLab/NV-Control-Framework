@@ -88,6 +88,40 @@ class BaseSCPIPowerSupply(BasePowerSupply):
         self.write("*RST")
 
     # =================================================
+    # ERROR QUEUE (diagnostic instrumentation, not called per write)
+    # =================================================
+
+    def check_error_queue(self, max_errors=10):
+        """Drain SYST:ERR? until the instrument reports no error, or
+        max_errors is reached (a safety bound in case a fault leaves the
+        queue returning errors indefinitely). Returns the list of
+        non-empty error strings found, in the order reported.
+
+        This is the only place any power-supply driver reads a response
+        after a command in normal operation -- see
+        Magnet.check_error_queues() for why it's deliberately not part of
+        set_current()/output_on()/output_off()'s own call path.
+        """
+
+        errors = []
+
+        for _ in range(max_errors):
+
+            response = self.query("SYST:ERR?").strip()
+
+            if not response:
+                break
+
+            code = response.split(",", 1)[0].strip().lstrip("+")
+
+            if code in ("0", ""):
+                break
+
+            errors.append(response)
+
+        return errors
+
+    # =================================================
     # DISCONNECT
     # =================================================
 

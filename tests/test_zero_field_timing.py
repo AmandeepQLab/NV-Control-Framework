@@ -59,7 +59,14 @@ def make_magnet():
         power_supplies[axis] = ps
     pulse_streamer = SimPulseStreamer(channel_map={"flipMF": 3})
     pulse_streamer.connect()
-    return Magnet(config=config, power_supplies=power_supplies, pulse_streamer=pulse_streamer)
+    # scpi_write_delay_s=0.0: these tests exercise timing *instrumentation*,
+    # not the inter-command delay itself (see test_magnet_scpi_traffic.py
+    # for that) -- a nonzero delay would just make every test here slower
+    # without testing anything additional.
+    return Magnet(
+        config=config, power_supplies=power_supplies,
+        pulse_streamer=pulse_streamer, scpi_write_delay_s=0.0,
+    )
 
 
 def make_experiment(**overrides):
@@ -195,11 +202,13 @@ class TimingEnabledTests(unittest.TestCase):
         self.assertLessEqual(point_total_sum, scan_total)
         self.assertLessEqual(scan_total, run_total)
 
-    def test_double_set_current_write_is_visible_as_two_rows(self):
-        # X is the swept axis and field=1.0 G at the last point is non-zero
-        # -- MagnetAxis.set_field()'s non-zero branch currently calls
-        # power_supply.set_current() twice (see hardware/magnet/magnet_axis.py).
-        # This test exercises that existing behavior without changing it.
+    def test_nonzero_point_writes_current_exactly_once(self):
+        # X is the swept axis and field=1.0 G at the last point is
+        # non-zero. MagnetAxis.set_field()'s non-zero branch used to call
+        # power_supply.set_current() twice with a provably identical value
+        # (see hardware/magnet/magnet_axis.py) -- the double-write that
+        # contributed to the ZFE SCPI-overrun investigation. This asserts
+        # the fix: exactly one write per point that actually changes.
         experiment = make_experiment(
             field_start=0.0, field_stop=1.0, field_points=2,
             field_axis="X", timing_diagnostics=True,
@@ -214,16 +223,45 @@ class TimingEnabledTests(unittest.TestCase):
             r for r in records
             if r["point_index"] == nonzero_point and r["stage"] == "axis_X_set_current"
         ]
-        self.assertEqual(len(set_current_rows), 2)
+        self.assertEqual(len(set_current_rows), 1)
 
-        # Y/Z stay at zero the whole sweep (zero_other_axes defaults True)
-        # -- the zero-field branch calls set_current() exactly once.
+    def test_change_detection_skips_repeated_axis_values(self):
+        # zero_other_axes (default True) commands Y/Z to 0.0 once during
+        # setup_scan() and never again -- every subsequent point's
+        # set_vector() call requests the identical value change-detection
+        # should recognize as already confirmed, so Y/Z should produce no
+        # further axis_Y_set_current/axis_Z_set_current rows anywhere in
+        # the point loop (point_index is not None), only from setup
+        # (point_index is None).
+        experiment = make_experiment(
+            field_start=0.0, field_stop=1.0, field_points=2,
+            field_axis="X", timing_diagnostics=True,
+        )
+        experiment.run()
+        records = experiment.pop_timing_log()
+
         for axis_stage in ("axis_Y_set_current", "axis_Z_set_current"):
-            rows = [
+            setup_rows = [
                 r for r in records
-                if r["point_index"] == nonzero_point and r["stage"] == axis_stage
+                if r["stage"] == axis_stage and r["point_index"] is None
             ]
-            self.assertEqual(len(rows), 1)
+            point_loop_rows = [
+                r for r in records
+                if r["stage"] == axis_stage and r["point_index"] is not None
+            ]
+            self.assertEqual(len(setup_rows), 1, axis_stage)
+            self.assertEqual(len(point_loop_rows), 0, axis_stage)
+
+        # X (the swept axis) requests 0.0 at point 0 -- identical to what
+        # setup_scan()'s zero_other_axes pass already confirmed for every
+        # axis, X included -- so point 0 should also be skipped entirely,
+        # and only point 1 (the real, nonzero value) should write.
+        x_point_loop_rows = [
+            r for r in records
+            if r["stage"] == "axis_X_set_current" and r["point_index"] is not None
+        ]
+        self.assertEqual(len(x_point_loop_rows), 1)
+        self.assertEqual(x_point_loop_rows[0]["point_index"], 1)
 
     def test_zero_crossing_sweep_shows_exactly_one_flip(self):
         # Sweep starts positive (matching the POSITIVE polarity enable()

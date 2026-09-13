@@ -53,6 +53,7 @@ class ZeroFieldExperiment(ScanExperiment):
         stream_scan_path=None,
         stream_path_is_output=False,
         timing_diagnostics=False,
+        check_power_supply_errors=False,
     ):
         config = {
             "settling_time_ms": settling_time_ms,
@@ -163,6 +164,21 @@ class ZeroFieldExperiment(ScanExperiment):
         self._timing_point_index = None
         self._timing_field_gauss = None
 
+        # =====================================================
+        # POWER SUPPLY ERROR-QUEUE CHECKING (off by default; diagnostic)
+        # =====================================================
+        # Enabled via check_power_supply_errors or the
+        # NV_ZFE_CHECK_PS_ERRORS=1 environment variable -- same off-by-
+        # default, env-var-fallback shape as timing_diagnostics above, and
+        # for the same reason: never set by the GUI panel itself. Checked
+        # only at scan start (setup_scan(), right after magnet.enable())
+        # and scan end (cleanup_scan(), right before magnet.disable()) --
+        # never per point or per write -- so it costs nothing in the hot
+        # path even when enabled. See Magnet.check_error_queues().
+        self._check_ps_errors = bool(check_power_supply_errors) or (
+            os.environ.get("NV_ZFE_CHECK_PS_ERRORS") == "1"
+        )
+
     def timing_enabled(self):
         return self._timing
 
@@ -240,6 +256,13 @@ class ZeroFieldExperiment(ScanExperiment):
         # power-cycled by their per-axis zero-field safety path.
         self.magnet.enable()
 
+        # Checked before this scan sends any set_vector() traffic, so a
+        # queue already non-empty from a prior run (or from enable()
+        # itself) is visible in this run's log instead of silently
+        # compounding into it. Off by default -- see _check_ps_errors.
+        if self._check_ps_errors and hasattr(self.magnet, "check_error_queues"):
+            self.magnet.check_error_queues(context="Zero Field scan start")
+
         # Magnet.get_vector() returns values in millitesla.  Record what was
         # actually there before this scan touches anything, whether or not
         # zero_other_axes ends up overriding it.
@@ -312,6 +335,11 @@ class ZeroFieldExperiment(ScanExperiment):
 
     def cleanup_scan(self):
         """Return the magnet to its existing safe disabled state after a scan."""
+        # Checked before disable() so this reflects what the sweep itself
+        # did to the error queue, not disable()'s own teardown traffic.
+        # Off by default -- see _check_ps_errors.
+        if self._check_ps_errors and hasattr(self.magnet, "check_error_queues"):
+            self.magnet.check_error_queues(context="Zero Field scan end")
         self.magnet.disable()
 
     def set_scan_point(self, value):

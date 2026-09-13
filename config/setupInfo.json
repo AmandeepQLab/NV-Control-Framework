@@ -88,6 +88,7 @@
 		}
 	},
         "Helmholtz": {
+        "scpi_write_delay_s": 0.05,
         "flip_direction": {
             "available": true,
             "type": "pulse_generator",

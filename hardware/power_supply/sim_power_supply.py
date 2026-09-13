@@ -104,3 +104,20 @@ class SimPowerSupply(BasePowerSupply):
     def identify(self):
 
         return "Simulated Power Supply"
+
+    # =================================================
+    # ERROR QUEUE
+    # =================================================
+
+    def check_error_queue(self, max_errors=10):
+        """No real SCPI error queue exists in sim mode; always empty.
+
+        Present for method parity with BaseSCPIPowerSupply (see
+        CLAUDE.md's simulated-hardware rule) so Magnet.check_error_queues()
+        doesn't need to special-case sim vs. real power supplies, and so
+        sim-mode tests can monkeypatch this to exercise
+        check_error_queues()'s aggregation/logging without a real
+        instrument.
+        """
+
+        return []
