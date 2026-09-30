@@ -20,24 +20,34 @@ from hardware.power_supply.sim_power_supply import SimPowerSupply
 from hardware.pulse_streamer.sim_pulse_streamer import SimPulseStreamer
 
 
-# Nonzero calibration offsets, matching the rig's actual config
-# (config/setupInfo.json), are what makes the "zero field" branch of
-# MagnetAxis.set_field() unreachable in practice -- see the ZFE
-# SCPI-overrun investigation. Using them here (rather than the
-# offset=0.0 config test_zero_field_timing.py uses) means these tests
-# exercise the same code path the rig actually hit.
+# Nonzero intercepts exercise compensation-current writes. The negative
+# Y offset deliberately covers the opposite compensation branch as well.
+_RELAY_CHANNELS = {"X": 6, "Y": 7, "Z": 3}
+
+
+def _calibration(ratio, offset):
+    return {
+        branch: {"magnetic_field_ratio": ratio, "magnetic_field_offset": offset}
+        for branch in ("positive", "negative")
+    }
+
+
 _HELMHOLTZ_CFG = {
-    "flip_direction": {
-        "available": True,
-        "switch": {"switchChannel": 3, "switchChannelName": "flipMF"},
-    },
     "X": {"name": "X", "max_current": 5.0,
-          "magnetic_field_ratio": 5.383, "magnetic_field_offset": 0.006},
+          "magnetic_field_calibration": _calibration(5.383, 0.006)},
     "Y": {"name": "Y", "max_current": 5.0,
-          "magnetic_field_ratio": 6.600, "magnetic_field_offset": -0.027},
+          "magnetic_field_calibration": _calibration(6.600, -0.027)},
     "Z": {"name": "Z", "max_current": 5.0,
-          "magnetic_field_ratio": 8.165, "magnetic_field_offset": 0.304},
+          "magnetic_field_calibration": _calibration(8.165, 0.304)},
 }
+for _axis, _channel in _RELAY_CHANNELS.items():
+    _HELMHOLTZ_CFG[_axis]["flip_direction"] = {
+        "available": True,
+        "negative_state": True,
+        "switch": {"switchChannel": _channel, "switchChannelName": f"flipMF_{_axis}"},
+        "discharge_delay_s": 0.0,
+        "settle_delay_s": 0.0,
+    }
 
 
 def _instrument(power_supply):
@@ -56,10 +66,12 @@ def _instrument(power_supply):
 
 def make_magnet(scpi_write_delay_s=0.0, offsets=True):
     cfg = _HELMHOLTZ_CFG if offsets else {
-        "flip_direction": _HELMHOLTZ_CFG["flip_direction"],
-        "X": {**_HELMHOLTZ_CFG["X"], "magnetic_field_offset": 0.0},
-        "Y": {**_HELMHOLTZ_CFG["Y"], "magnetic_field_offset": 0.0},
-        "Z": {**_HELMHOLTZ_CFG["Z"], "magnetic_field_offset": 0.0},
+        axis: {**_HELMHOLTZ_CFG[axis],
+               "magnetic_field_calibration": _calibration(
+                   _HELMHOLTZ_CFG[axis]["magnetic_field_calibration"]["positive"]["magnetic_field_ratio"],
+                   0.0,
+               )}
+        for axis in ("X", "Y", "Z")
     }
     power_supplies = {}
     for axis in ("X", "Y", "Z"):
@@ -67,7 +79,9 @@ def make_magnet(scpi_write_delay_s=0.0, offsets=True):
         ps.connect()
         _instrument(ps)
         power_supplies[axis] = ps
-    pulse_streamer = SimPulseStreamer(channel_map={"flipMF": 3})
+    pulse_streamer = SimPulseStreamer(
+        channel_map={f"flipMF_{axis}": channel for axis, channel in _RELAY_CHANNELS.items()}
+    )
     pulse_streamer.connect()
     return Magnet(
         config=cfg, power_supplies=power_supplies,
@@ -179,19 +193,38 @@ class ChangeDetectionCacheTests(unittest.TestCase):
         self.assertTrue(wrote)
 
     def test_cache_invalidated_by_polarity_flip(self):
-        magnet = make_magnet()
+        magnet = make_magnet(offsets=False)
         magnet.enable()
-        magnet.set_vector(bx=1.5, by=0.0, bz=0.0)  # POSITIVE, no flip
+        magnet.set_vector(bx=1.5, by=0.0, bz=0.0)
 
         ps = magnet.power_supplies["X"]
         ps.calls.clear()
-        magnet.set_vector(bx=-1.5, by=0.0, bz=0.0)  # flips to NEGATIVE
+        magnet.set_vector(bx=-1.5, by=0.0, bz=0.0)
 
-        # abs(-1.5) == abs(1.5) == 1.5 -- same magnitude as before the
-        # flip. Without invalidation this would be a cache hit and skip
-        # the write entirely, leaving the supply's actual current
-        # unconfirmed after a relay operation with no hardware readback.
-        self.assertEqual(len(set_current_calls(ps)), 1)
+        # Equal current magnitude on opposite branches is a physical change:
+        # discharge before reversing, then restore the requested magnitude.
+        self.assertEqual([call[1][0] for call in set_current_calls(ps)], [0.0, 1.5 / 5.383])
+        self.assertEqual(magnet.x.get_polarity(), NEGATIVE)
+
+    def test_single_axis_flip_preserves_other_axes_current_caches(self):
+        for changed_axis in ("X", "Y", "Z"):
+            with self.subTest(axis=changed_axis):
+                magnet = make_magnet(offsets=False)
+                magnet.enable()
+                fields = {"bx": 1.0, "by": 1.0, "bz": 1.0}
+                magnet.set_vector(**fields)
+                for ps in magnet.power_supplies.values():
+                    ps.calls.clear()
+
+                fields[f"b{changed_axis.lower()}"] = -1.0
+                magnet.set_vector(**fields)
+
+                for axis, ps in magnet.power_supplies.items():
+                    if axis == changed_axis:
+                        self.assertEqual(len(set_current_calls(ps)), 2)
+                    else:
+                        self.assertEqual(ps.calls, [], axis)
+                        self.assertEqual(getattr(magnet, axis.lower()).get_polarity(), POSITIVE)
 
     def test_no_flip_still_skips_unchanged_axes(self):
         # The optimisation must survive: a same-direction point-to-point
@@ -210,11 +243,7 @@ class ChangeDetectionCacheTests(unittest.TestCase):
                 len(set_current_calls(magnet.power_supplies[axis])), 0, axis
             )
 
-    def test_zero_field_branch_unaffected_by_offset_bug_fix_scope(self):
-        # Regression: with a true zero offset, set_field(0.0,
-        # keep_output_enabled=False) must still choose safe_shutdown(),
-        # and keep_output_enabled=True must still choose set_current(0.0)
-        # -- the double-write fix only ever touched the non-zero branch.
+    def test_zero_intercept_output_policy_is_preserved(self):
         magnet = make_magnet(offsets=False)
         magnet.enable()
         ps = magnet.power_supplies["X"]
@@ -249,63 +278,27 @@ class SweepTrafficTests(unittest.TestCase):
         experiment.run()
         return magnet
 
-    # Every count below is built from three kinds of write that are NOT
-    # gated by per-point change-detection, by design:
-    #   * setup_scan()'s one-time zero_other_axes pass (a real, distinct
-    #     call from any point -- see setup_scan()) -- +1 per axis.
-    #   * cleanup_scan()'s disable()->zero(), which calls
-    #     power_supply.set_current(0.0) directly on every axis
-    #     unconditionally (Magnet.zero() bypasses MagnetAxis.set_field()
-    #     and its cache entirely) -- +1 per axis.
-    #   * each REAL global polarity flip invalidates all three axes'
-    #     caches, not just the axis whose sign changed (see
-    #     Magnet._apply_global_polarity()) -- a deliberate trade-off:
-    #     re-confirming every axis after a relay operation costs one
-    #     extra write per non-swept axis per flip, in exchange for never
-    #     trusting a cached value across a hardware state change we have
-    #     no readback to verify. A same-direction point-to-point move
-    #     (the common case within one sweep) costs nothing extra.
-    # So "no writes from the point loop" still means (2 + flips) total,
-    # not 0.
-
-    def test_degenerate_repro_writes_drop_from_366_to_a_handful_per_axis(self):
-        # The exact rig repro shape: field_start == field_stop, so every
-        # point after the first requests a value change-detection already
-        # has cached, and there is exactly one real flip (enable() leaves
-        # polarity POSITIVE; every point here is negative). Before this
-        # fix: 6 writes/point x 61 points + one-time enable/zero/disable
-        # traffic = 383 total (see the SCPI-overrun investigation).
+    def test_degenerate_repro_writes_only_initialization_first_point_and_cleanup(self):
         magnet = self._run_sweep(-15, -15, 61, field_axis="X")
 
-        # X: setup(1) + point 0's real value, a cache miss vs. setup's
-        # zero (1) + cleanup(1) = 3. The one flip doesn't add a 4th write
-        # here because X's own value was already changing at that exact
-        # point regardless of the flip's invalidation.
-        self.assertEqual(len(set_current_calls(magnet.power_supplies["X"])), 3)
-        # Y/Z: setup(1) + one forced re-write at the single real flip,
-        # since their value never actually changes (1) + cleanup(1) = 3.
+        # Every axis gets one initialization zero write, compensation, cleanup zero.
+        # X/Z also discharge once when setup selects negative compensation.
+        # Only X gets one changed scan-point write; repeated points are cached.
+        self.assertEqual(len(set_current_calls(magnet.power_supplies["X"])), 5)
         self.assertEqual(len(set_current_calls(magnet.power_supplies["Y"])), 3)
-        self.assertEqual(len(set_current_calls(magnet.power_supplies["Z"])), 3)
+        self.assertEqual(len(set_current_calls(magnet.power_supplies["Z"])), 4)
 
     def test_non_degenerate_sweep_writes_once_per_changed_point(self):
-        # A real sweep: the swept axis changes at every one of its 61
-        # points (linspace(-15, 15, 61) never repeats a value on two
-        # consecutive points, even across the zero crossing) and must
-        # write every time. There are exactly two real flips here
-        # (negative-to-positive crossing splits into "first negative
-        # point" and "first positive point", since a requested value of
-        # exactly 0.0 contributes no sign and doesn't itself flip
-        # anything -- see Magnet._determine_global_polarity()).
         magnet = self._run_sweep(-15, 15, 61, field_axis="X")
 
-        # X: setup(1) + 61 point-loop writes (every point differs from
-        # the last; the 2 flips coincide with points that were already
-        # cache misses, so they add nothing extra) + cleanup(1) = 63.
-        self.assertEqual(len(set_current_calls(magnet.power_supplies["X"])), 63)
-        # Y/Z: setup(1) + one forced re-write at each of the 2 flips,
-        # since their own value never changes (2) + cleanup(1) = 4.
-        self.assertEqual(len(set_current_calls(magnet.power_supplies["Y"])), 4)
+        # X: initialization(1), setup discharge+compensation(2), points(61),
+        # crossing the intercept discharge(1), cleanup(1). The crossing
+        # preserves Y/Z compensation and does not invalidate their caches.
+        self.assertEqual(len(set_current_calls(magnet.power_supplies["X"])), 66)
+        self.assertEqual(len(set_current_calls(magnet.power_supplies["Y"])), 3)
         self.assertEqual(len(set_current_calls(magnet.power_supplies["Z"])), 4)
+        for ps in magnet.power_supplies.values():
+            self.assertTrue(all(call[1][0] >= 0.0 for call in set_current_calls(ps)))
 
 
 class InterCommandDelayTests(unittest.TestCase):
@@ -333,7 +326,7 @@ class InterCommandDelayTests(unittest.TestCase):
 
         magnet.enable()
         with mock.patch("hardware.magnet.magnet.time.sleep", side_effect=fake_sleep):
-            magnet.set_vector(bx=1.5, by=0.3, bz=0.2)  # 3 real writes, all same sign
+            magnet.set_vector(bx=1.5, by=0.3, bz=0.5)  # 3 writes, no relay changes
 
         self.assertEqual(sleep_calls, [0.02, 0.02, 0.02])
 

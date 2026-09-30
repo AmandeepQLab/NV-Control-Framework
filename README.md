@@ -19,9 +19,10 @@ Pulse Streamer channel map (`config/setupInfo.json`, `pulseGenerator.channelName
 |---|---|
 | greenLaser | 1 |
 | MW | 2 |
-| flipMF (magnet polarity relay) | 3 |
+| flipMF_Z (Z polarity relay) | 3 |
 | detector | 5 |
-| detector2 | 6 |
+| flipMF_X (X polarity relay) | 6 |
+| flipMF_Y (Y polarity relay) | 7 |
 
 Analog: `aomPower` on channel 1.
 
@@ -30,7 +31,7 @@ Analog: `aomPower` on channel 1.
 **Implemented and running against real hardware:**
 - ODMR frequency-sweep acquisition, live plotting, Lorentzian fitting, pulse-sequence preview.
 - Zero-field magnetometry: sweep one Helmholtz axis, per-point frame averaging, optional multi-scan averaging with raw-scan persistence, live image + fluorescence plot.
-- Manual Helmholtz magnet control (enable/disable, per-axis field, global polarity) from its own window.
+- Manual Helmholtz magnet control (enable/disable, signed per-axis fields with automatic independent polarity) from its own window. See [magnet calibration and channel audit](docs/magnet_polarity_architecture.md).
 - Live camera view with ROI/exposure/binning control.
 - A `--sim` launch mode (see [Running](#running)) that drives fully simulated hardware instead — see `CLAUDE.md` if you're modifying how devices are selected.
 

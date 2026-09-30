@@ -88,7 +88,7 @@ class SwabianPulseStreamer:
         looping this is never reached (the sequence never "finishes" in
         the firmware's sense), so it costs nothing there. It matters once
         a finite n_runs is requested: without it, every digital channel --
-        including the magnet polarity relay's flip_channel, which shares
+        including all three magnet polarity relay channels, which share
         this same persistent_outputs dict and this same PulseStreamer
         instance -- would be zeroed the instant the sequence completes,
         regardless of what it was actually last commanded to. Mirrors
@@ -121,10 +121,10 @@ class SwabianPulseStreamer:
         preserve_persistent=True (default, used by every per-frame caller)
         holds each channel at its persistent_outputs value rather than
         hardcoding LOW -- channels nothing has ever called
-        set_digital_output() for (greenLaser/MW/detector/detector2) are
+        set_digital_output() for (greenLaser/MW/detector) are
         always False there, so this is behaviorally identical to the old
         unconditional-LOW behavior for them. It matters for a channel that
-        IS commanded, like the magnet polarity relay (flip_channel): this
+        IS commanded, like each magnet polarity relay (X=6/Y=7/Z=3): this
         method is called once per triggered ODMR frame, and forcing that
         channel LOW here every time -- ignoring what it was actually
         commanded to -- was the bug (mirrors the same fix already applied

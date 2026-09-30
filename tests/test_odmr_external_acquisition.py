@@ -167,7 +167,7 @@ def _make_sim_hardware(camera):
         "pulse_streamer": ps,
         "channels": {
             "greenLaser": 1, "MW": 2, "detector": 5,
-            "detector2": 6, "flipMF": 3,
+            "flipMF_X": 6, "flipMF_Y": 7, "flipMF_Z": 3,
         },
     }
 

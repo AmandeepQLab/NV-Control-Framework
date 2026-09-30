@@ -20,6 +20,8 @@ ALLOWED_FILES = frozenset(
         "test_odmr_acquisition_roi.py",
         "test_exposure_propagation.py",
         "test_magnet_scpi_traffic.py",
+        "test_magnet_independent_polarity.py",
+        "test_magnetic_field_gui_units.py",
         "test_mw_switch_gating.py",
         "test_odmr_external_acquisition.py",
         "test_odmr_time_estimate.py",

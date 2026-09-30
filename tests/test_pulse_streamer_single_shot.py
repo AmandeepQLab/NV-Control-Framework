@@ -9,6 +9,7 @@ socket or an SDK DLL.
 """
 
 import unittest
+from unittest import mock
 
 import numpy as np
 from pulsestreamer import Sequence, OutputState
@@ -20,6 +21,7 @@ from hardware.camera.andor_neo_andor3 import AndorNeoAndor3
 from hardware.camera.sim_camera import SimCamera
 from hardware.microwave.sim_microwave import SimMicrowave
 from hardware.magnet.magnet import Magnet, POSITIVE, NEGATIVE
+from hardware.power_supply.sim_power_supply import SimPowerSupply
 from sequencing.pulse_sequence import PulseSequence
 from experiments.odmr_experiment import ODMRExperiment
 from gui.odmr_worker import ODMRWorker
@@ -33,8 +35,10 @@ def _ensure_qapp():
 
 
 CHANNEL_MAP = {
-    "greenLaser": 1, "MW": 2, "detector": 5, "detector2": 6, "flipMF": 3,
+    "greenLaser": 1, "MW": 2, "detector": 5,
+    "flipMF_X": 6, "flipMF_Y": 7, "flipMF_Z": 3,
 }
+RELAY_CHANNELS = {"X": 6, "Y": 7, "Z": 3}
 
 
 # =====================================================
@@ -104,22 +108,24 @@ class RunArgumentPassingTests(unittest.TestCase):
         n_runs=1 with the SDK's own default final=OutputState.ZERO()
         would zero the relay line every single ODMR frame."""
         streamer = _make_loaded_streamer()
-        streamer.set_digital_output(CHANNEL_MAP["flipMF"], True)  # NEGATIVE
-        streamer.run(n_runs=1)
-        digi_mask, _, _ = streamer.ps.stream_calls[-1]["final"].getData()
-        self.assertTrue(digi_mask & (1 << CHANNEL_MAP["flipMF"]))
+        for channel in RELAY_CHANNELS.values():
+            with self.subTest(channel=channel):
+                streamer.set_digital_output(channel, True)
+                streamer.run(n_runs=1)
+                digi_mask, _, _ = streamer.ps.stream_calls[-1]["final"].getData()
+                self.assertTrue(digi_mask & (1 << channel))
 
     def test_final_still_computed_when_looping(self):
         """final is built unconditionally, not just when n_runs=1 is
         requested -- harmless under looping (never reached), but must not
         silently depend on the caller asking for single-shot."""
         streamer = _make_loaded_streamer()
-        streamer.set_digital_output(CHANNEL_MAP["flipMF"], True)
+        streamer.set_digital_output(CHANNEL_MAP["flipMF_Y"], True)
         streamer.run()  # no n_runs -- still looping
         call = streamer.ps.stream_calls[-1]
         self.assertIn("final", call)
         digi_mask, _, _ = call["final"].getData()
-        self.assertTrue(digi_mask & (1 << CHANNEL_MAP["flipMF"]))
+        self.assertTrue(digi_mask & (1 << CHANNEL_MAP["flipMF_Y"]))
 
     def test_explicit_final_override_is_respected(self):
         streamer = _make_loaded_streamer()
@@ -144,23 +150,20 @@ def _channel_pattern(seq, channel):
 class ResetOutputsPreservesRelayTests(unittest.TestCase):
     def test_reset_outputs_preserves_set_relay_channel(self):
         streamer = _make_streamer()
-        streamer.set_digital_output(CHANNEL_MAP["flipMF"], True)
+        active_channels = {RELAY_CHANNELS["X"], RELAY_CHANNELS["Z"]}
+        for channel in active_channels:
+            streamer.set_digital_output(channel, True)
 
         streamer.reset_outputs()
 
         seq, kwargs = streamer.ps.streamed[-1]
         self.assertEqual(kwargs, {})  # n_runs/final still untouched
 
-        relay_pattern = _channel_pattern(seq, CHANNEL_MAP["flipMF"])
-        self.assertTrue(all(state == 1 for _, state in relay_pattern))
-
         for name, ch in CHANNEL_MAP.items():
-            if name == "flipMF":
-                continue
             pattern = _channel_pattern(seq, ch)
             self.assertTrue(
-                all(state == 0 for _, state in pattern),
-                f"{name} (channel {ch}) should still be forced LOW",
+                all(state == int(ch in active_channels) for _, state in pattern),
+                f"{name} (channel {ch}) did not preserve its independent state",
             )
 
     def test_reset_outputs_matches_old_behavior_when_nothing_is_set(self):
@@ -175,7 +178,8 @@ class ResetOutputsPreservesRelayTests(unittest.TestCase):
 
     def test_close_de_energizes_relay_regardless_of_persistent_state(self):
         streamer = _make_streamer()
-        streamer.set_digital_output(CHANNEL_MAP["flipMF"], True)
+        for channel in RELAY_CHANNELS.values():
+            streamer.set_digital_output(channel, True)
 
         streamer.close()
 
@@ -192,19 +196,19 @@ class ResetOutputsPreservesRelayTests(unittest.TestCase):
         """SimPulseStreamer parity -- see CLAUDE.md: sim classes must have
         full method parity, not just currently-called methods."""
         streamer = SimPulseStreamer(channel_map=dict(CHANNEL_MAP))
-        streamer.set_digital_output(CHANNEL_MAP["flipMF"], True)
+        active_channels = {RELAY_CHANNELS["X"], RELAY_CHANNELS["Z"]}
+        for channel in active_channels:
+            streamer.set_digital_output(channel, True)
 
         streamer.reset_outputs()
 
-        self.assertEqual(streamer.last_reset_channels[CHANNEL_MAP["flipMF"]], 1)
         for name, ch in CHANNEL_MAP.items():
-            if name == "flipMF":
-                continue
-            self.assertEqual(streamer.last_reset_channels[ch], 0, name)
+            self.assertEqual(streamer.last_reset_channels[ch], int(ch in active_channels), name)
 
     def test_sim_pulse_streamer_close_de_energizes_relay(self):
         streamer = SimPulseStreamer(channel_map=dict(CHANNEL_MAP))
-        streamer.set_digital_output(CHANNEL_MAP["flipMF"], True)
+        for channel in RELAY_CHANNELS.values():
+            streamer.set_digital_output(channel, True)
 
         streamer.close()
 
@@ -240,30 +244,53 @@ class UntouchedMethodsTests(unittest.TestCase):
 # safe on the shared persistent_outputs/PulseStreamer instance ODMR uses
 # =====================================================
 
-def _make_bare_magnet(streamer, flip_available=True):
-    """Minimal Magnet exercising only the polarity-relay methods, which
-    touch nothing but pulse_streamer/flip_channel/flip_available/
-    direction. Bypasses __init__ (which needs full power-supply/axis
-    wiring irrelevant here) via __new__, matching a common pattern for
-    testing one slice of a heavier constructor."""
-    magnet = Magnet.__new__(Magnet)
-    magnet.pulse_streamer = streamer
-    magnet.direction = POSITIVE
-    magnet.flip_available = flip_available
-    magnet.flip_channel = CHANNEL_MAP["flipMF"]
+def _make_magnet(streamer):
+    """Full magnet stack: simulated supplies and a network-free driver double."""
+    config = {}
+    supplies = {}
+    for axis, channel in RELAY_CHANNELS.items():
+        config[axis] = {
+            "name": axis,
+            "max_current": 5.0,
+            "magnetic_field_calibration": {
+                "positive": {"magnetic_field_ratio": 5.0, "magnetic_field_offset": 0.0},
+                "negative": {"magnetic_field_ratio": 5.0, "magnetic_field_offset": 0.0},
+            },
+            "flip_direction": {
+                "available": True,
+                "negative_state": True,
+                "switch": {"switchChannel": channel, "switchChannelName": f"flipMF_{axis}"},
+                "discharge_delay_s": 0.0,
+                "settle_delay_s": 0.0,
+            },
+        }
+        supplies[axis] = SimPowerSupply({"name": axis})
+        supplies[axis].connect()
+    magnet = Magnet(
+        config=config, power_supplies=supplies, pulse_streamer=streamer,
+        scpi_write_delay_s=0.0,
+    )
+    magnet.enable()
+    streamer.ps.stream_calls.clear()
+    streamer.ps.streamed.clear()
     return magnet
 
 
 class MagnetSharedStreamerTests(unittest.TestCase):
-    def test_apply_global_polarity_never_calls_run_or_reset_outputs(self):
-        streamer = _make_streamer()
-        magnet = _make_bare_magnet(streamer)
+    def test_axis_reversal_only_syncs_its_own_relay(self):
+        for changed_axis, channel in RELAY_CHANNELS.items():
+            with self.subTest(axis=changed_axis):
+                streamer = _make_streamer()
+                magnet = _make_magnet(streamer)
+                with mock.patch.object(streamer, "run", wraps=streamer.run) as run, \
+                     mock.patch.object(streamer, "reset_outputs", wraps=streamer.reset_outputs) as reset:
+                    getattr(magnet, changed_axis.lower()).set_field(-1.0, keep_output_enabled=True)
 
-        magnet.set_polarity(NEGATIVE)
-
-        self.assertEqual(len(streamer.ps.stream_calls), 1)  # sync_outputs only
-        self.assertEqual(streamer.ps.stream_calls[-1], {})
-        self.assertEqual(streamer.get_digital_output(CHANNEL_MAP["flipMF"]), True)
+                run.assert_not_called()
+                reset.assert_not_called()
+                self.assertEqual(streamer.ps.stream_calls, [{}])  # sync_outputs only
+                for relay_channel in RELAY_CHANNELS.values():
+                    self.assertEqual(streamer.get_digital_output(relay_channel), relay_channel == channel)
 
     def test_odmr_run_after_relay_set_keeps_relay_high(self):
         """The integration case that actually matters: the relay and
@@ -271,35 +298,29 @@ class MagnetSharedStreamerTests(unittest.TestCase):
         the relay via the magnet's API, then running an ODMR-style
         single-shot sequence on the SAME instance, must not clobber it."""
         streamer = _make_loaded_streamer()
-        magnet = _make_bare_magnet(streamer)
+        magnet = _make_magnet(streamer)
 
-        magnet.set_polarity(NEGATIVE)
-        self.assertEqual(streamer.get_digital_output(CHANNEL_MAP["flipMF"]), True)
+        magnet.set_vector(bx=-1.0, by=1.0, bz=-1.0)
 
         streamer.run(n_runs=1)
 
         # persistent_outputs itself is untouched by run()...
-        self.assertEqual(streamer.get_digital_output(CHANNEL_MAP["flipMF"]), True)
+        for axis, channel in RELAY_CHANNELS.items():
+            self.assertEqual(streamer.get_digital_output(channel), axis != "Y")
         # ...and the final state ODMR's single-shot sequence leaves the
         # device in still asserts the relay channel.
         digi_mask, _, _ = streamer.ps.stream_calls[-1]["final"].getData()
-        self.assertTrue(digi_mask & (1 << CHANNEL_MAP["flipMF"]))
+        for axis, channel in RELAY_CHANNELS.items():
+            self.assertEqual(bool(digi_mask & (1 << channel)), axis != "Y")
 
-    def test_relay_asserted_in_every_streamed_sequence_during_a_scan(self):
-        """The scenario this task exists to prevent, checked as a gap
-        analysis rather than only at the reset_outputs() calls: the
-        failure mode is the relay dropping LOW between one run() finishing
-        and the next reset_outputs() arriving, so every sequence ever
-        streamed to the device during the scan -- the sync_outputs() call
-        that set the relay, every frame's reset_outputs(), and every
-        frame's run() -- must assert flip_channel throughout its own
-        playback, and (for run() calls, which carry one) in its final
-        state too. If any single one drops it, that's the exact streamed
-        call that would let the relay glitch on real hardware.
-        """
+    def test_mixed_relay_states_preserved_in_every_streamed_sequence_during_scan(self):
+        """All three relay lines keep their selected branch during playback,
+        between OFF/ON frames, and in each single-shot final state."""
         streamer = _make_streamer()
-        magnet = _make_bare_magnet(streamer)
-        magnet.set_polarity(NEGATIVE)  # flip_channel -> True; one sync_outputs() call
+        magnet = _make_magnet(streamer)
+        magnet.set_vector(bx=-1.0, by=1.0, bz=-1.0)
+        streamer.ps.stream_calls.clear()
+        streamer.ps.streamed.clear()
 
         mw = SimMicrowave()
         mw.connect()
@@ -324,34 +345,41 @@ class MagnetSharedStreamerTests(unittest.TestCase):
 
         experiment.acquire_frame()
 
-        flip_channel = CHANNEL_MAP["flipMF"]
-        # 1 sync_outputs() + repeats * 2 frames * (reset_outputs + run)
-        self.assertEqual(len(streamer.ps.streamed), 1 + 3 * 2 * 2)
+        # repeats * 2 frames * (reset_outputs + run)
+        self.assertEqual(len(streamer.ps.streamed), 3 * 2 * 2)
 
         for i, (seq, kwargs) in enumerate(streamer.ps.streamed):
-            pattern = _channel_pattern(seq, flip_channel)
-            self.assertTrue(
-                all(state == 1 for _, state in pattern),
-                f"streamed call #{i} (kwargs={kwargs}) dropped flip_channel "
-                f"during its own playback: pattern={pattern}",
-            )
-            if "final" in kwargs:
-                digi_mask, _, _ = kwargs["final"].getData()
+            for axis, channel in RELAY_CHANNELS.items():
+                expected_state = int(axis != "Y")
+                pattern = _channel_pattern(seq, channel)
                 self.assertTrue(
-                    digi_mask & (1 << flip_channel),
-                    f"streamed call #{i} left flip_channel LOW in its final state",
+                    all(state == expected_state for _, state in pattern),
+                    f"streamed call #{i} changed {axis} relay during playback: {pattern}",
                 )
+                if "final" in kwargs:
+                    digi_mask, _, _ = kwargs["final"].getData()
+                    self.assertEqual(
+                        bool(digi_mask & (1 << channel)), bool(expected_state),
+                        f"streamed call #{i} changed {axis} relay in final state",
+                    )
 
-    def test_sync_positive_polarity_never_calls_run_or_reset_outputs(self):
+    def test_disable_and_reenable_preserve_independent_relay_states(self):
         streamer = _make_streamer()
-        magnet = _make_bare_magnet(streamer)
-        magnet.direction = NEGATIVE
+        magnet = _make_magnet(streamer)
+        magnet.set_vector(bx=1.0, by=-1.0, bz=-1.0)
+        streamer.ps.stream_calls.clear()
 
-        magnet._sync_positive_polarity()
+        magnet.disable()
+        magnet.enable()
 
-        self.assertEqual(len(streamer.ps.stream_calls), 1)
-        self.assertEqual(streamer.ps.stream_calls[-1], {})
-        self.assertEqual(magnet.direction, POSITIVE)
+        self.assertEqual(streamer.ps.stream_calls, [])
+        for axis, channel in RELAY_CHANNELS.items():
+            expected_negative = axis != "X"
+            self.assertEqual(streamer.get_digital_output(channel), expected_negative)
+            self.assertEqual(
+                getattr(magnet, axis.lower()).get_polarity(),
+                NEGATIVE if expected_negative else POSITIVE,
+            )
 
 
 # =====================================================

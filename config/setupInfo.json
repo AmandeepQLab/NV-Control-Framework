@@ -12,8 +12,8 @@
     "pulseGenerator":{
         "type": "pulseStreamer",
         "dummy": false,
-        "channelNames": ["greenLaser", "MW", "detector", "detector2", "flipMF"],
-		"channelValues": [1,      2,      5, 6,      3],
+        "channelNames": ["greenLaser", "MW", "detector", "flipMF_X", "flipMF_Y", "flipMF_Z"],
+		"channelValues": [1, 2, 5, 6, 7, 3],
 	"analogchannelNames" : ["aomPower"],
 	"analogchannelValues" : [1],
         "ipAddress":"132.64.56.138",
@@ -28,15 +28,7 @@
 			"switchChannel": 5,
 			"switchChannelName": "detector"
 		}
-	}, "classname": "Camera",
-        "type": "EventCamera",
-		"address": "",
-		"Switch": {
-			"classname": "pulseStreamer",
-			"switchChannel": 6,
-			"switchChannelName": "detector2"
-		}
-,
+	},
 	"stages": [{
 		"type" : "MCS2",
 		"default": true,
@@ -89,25 +81,36 @@
 	},
         "Helmholtz": {
         "scpi_write_delay_s": 0.05,
-        "flip_direction": {
-            "available": true,
-            "type": "pulse_generator",
-            "switch": {
-                "classname": "pulseStreamer",
-                "switchChannel": 3,
-                "switchChannelName": "flipMF",
-                "onDelay": 0,
-                "offDelay": 0
-            }
-        },
         "X": {
             "type": "E3632A",
             "name": "X",
             "address": "COM13",
             "range": "P15V",
             "max_current": 5,
-            "magnetic_field_ratio": 5.383,
-            "magnetic_field_offset": 0.006
+            "magnetic_field_calibration": {
+                "positive": {
+                    "magnetic_field_ratio": 0.887629,
+                    "magnetic_field_offset": 0.012076
+                },
+                "negative": {
+                    "magnetic_field_ratio": 0.886743,
+                    "magnetic_field_offset": 0.012819
+                }
+            },
+            "flip_direction": {
+                "available": true,
+                "type": "pulse_generator",
+                "negative_state": true,
+                "discharge_delay_s": 0.05,
+                "settle_delay_s": 0.05,
+                "switch": {
+                    "classname": "pulseStreamer",
+                    "switchChannel": 6,
+                    "switchChannelName": "flipMF_X",
+                    "onDelay": 0,
+                    "offDelay": 0
+                }
+            }
         },
         "Y": {
             "type": "E3631A",
@@ -115,8 +118,30 @@
             "address": "COM12",
             "channel": "P6V",
             "max_current": 5,
-            "magnetic_field_ratio": 6.600,
-            "magnetic_field_offset": -0.027
+            "magnetic_field_calibration": {
+                "positive": {
+                    "magnetic_field_ratio": 0.741657,
+                    "magnetic_field_offset": 0.006619
+                },
+                "negative": {
+                    "magnetic_field_ratio": 0.740600,
+                    "magnetic_field_offset": 0.006233
+                }
+            },
+            "flip_direction": {
+                "available": true,
+                "type": "pulse_generator",
+                "negative_state": true,
+                "discharge_delay_s": 0.05,
+                "settle_delay_s": 0.05,
+                "switch": {
+                    "classname": "pulseStreamer",
+                    "switchChannel": 7,
+                    "switchChannelName": "flipMF_Y",
+                    "onDelay": 0,
+                    "offDelay": 0
+                }
+            }
         },
         "Z": {
             "type": "E3632A",
@@ -124,8 +149,30 @@
             "address": "COM11",
             "range": "P15V",
             "max_current": 5,
-            "magnetic_field_ratio": 8.165,
-            "magnetic_field_offset": 0.304
+            "magnetic_field_calibration": {
+                "positive": {
+                    "magnetic_field_ratio": 0.799629,
+                    "magnetic_field_offset": 0.117176
+                },
+                "negative": {
+                    "magnetic_field_ratio": 0.800057,
+                    "magnetic_field_offset": 0.117748
+                }
+            },
+            "flip_direction": {
+                "available": true,
+                "type": "pulse_generator",
+                "negative_state": true,
+                "discharge_delay_s": 0.05,
+                "settle_delay_s": 0.05,
+                "switch": {
+                    "classname": "pulseStreamer",
+                    "switchChannel": 3,
+                    "switchChannelName": "flipMF_Z",
+                    "onDelay": 0,
+                    "offDelay": 0
+                }
+            }
         }
     }
 

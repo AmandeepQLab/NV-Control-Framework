@@ -5,13 +5,13 @@ Magnet Control Window
 Manual control of Helmholtz coils.
 
 This window communicates with the Magnet backend and
-allows manual setting of magnetic fields.
+allows manual setting of magnetic fields in Gauss (G).
 
 Author:
     Amandeep + ChatGPT
 =====================================================
 """
-from hardware.magnet.magnet import (POSITIVE,NEGATIVE)
+from hardware.magnet.magnet import POSITIVE, NEGATIVE
 try:
     from PyQt6.QtWidgets import (  # type: ignore[import]
         QMainWindow,
@@ -62,6 +62,11 @@ except ImportError:
             QComboBox,
         )
 
+# GUI values are Gauss; Magnet/MagnetAxis and calibration remain in mT.
+_MT_TO_GAUSS = 10.0
+_GAUSS_TO_MT = 0.1
+
+
 class MagnetControlWindow(QMainWindow):
 
     # =====================================================
@@ -104,14 +109,17 @@ class MagnetControlWindow(QMainWindow):
 
         self.power_button.setMinimumHeight(42)
 
-        self.polarity_button = QPushButton()
-        self.polarity_button.setCheckable(True)
-        self.polarity_button.setMinimumHeight(42)
-
         power_layout.addWidget(self.power_button)
-        power_layout.addWidget(self.polarity_button)
 
         main_layout.addLayout(power_layout)
+
+        polarity_layout = QHBoxLayout()
+        self.polarity_labels = {}
+        for name in ("X", "Y", "Z"):
+            label = QLabel(f"{name} coil polarity: Unknown")
+            self.polarity_labels[name.lower()] = label
+            polarity_layout.addWidget(label)
+        main_layout.addLayout(polarity_layout)
 
         self.tabs = QTabWidget()
         main_layout.addWidget(self.tabs)
@@ -163,7 +171,7 @@ class MagnetControlWindow(QMainWindow):
         # MAGNETIC FIELD
         # =================================================
 
-        field_box = QGroupBox("Magnetic Field")
+        field_box = QGroupBox("Target Magnetic Field")
 
         layout.addWidget(field_box)
 
@@ -171,13 +179,13 @@ class MagnetControlWindow(QMainWindow):
 
         self.field_spin = QDoubleSpinBox()
 
-        self.field_spin.setRange(-100.0, 100.0)
+        self.field_spin.setRange(-1000.0, 1000.0)
         self.field_spin.setDecimals(3)
-        self.field_spin.setSingleStep(0.1)
-        self.field_spin.setSuffix(" mT")
+        self.field_spin.setSingleStep(1.0)
+        self.field_spin.setSuffix(" G")
 
         field_layout.addRow(
-            "Field",
+            "Field (G)",
             self.field_spin
         )
         # =================================================
@@ -187,8 +195,11 @@ class MagnetControlWindow(QMainWindow):
         button_layout = QHBoxLayout()
 
         self.apply_button = QPushButton("Apply")
-        self.read_button = QPushButton("Read")
-        self.zero_button = QPushButton("Zero")
+        self.read_button = QPushButton("Refresh")
+        self.zero_button = QPushButton("Magnetic Zero (all axes)")
+        self.zero_button.setToolTip(
+            "Command calibrated 0 G on every axis. Compensation currents may be nonzero."
+        )
 
 
         button_layout.addWidget(self.apply_button)
@@ -200,13 +211,13 @@ class MagnetControlWindow(QMainWindow):
         # CURRENT STATUS
         # =================================================
 
-        current_box = QGroupBox("Current Status")
+        current_box = QGroupBox("Commanded / Model Status")
 
         layout.addWidget(current_box)
 
         current_layout = QFormLayout(current_box)
 
-        self.current_field_label = QLabel("0.000 mT")
+        self.current_field_label = QLabel("0.000 G")
 
         self.current_current_label = QLabel("0.0000 A")
 
@@ -215,17 +226,17 @@ class MagnetControlWindow(QMainWindow):
         self.connection_label = QLabel("Connected")
 
         current_layout.addRow(
-            "Field",
+            "Model Field (G)",
             self.current_field_label
         )
 
         current_layout.addRow(
-            "Current",
+            "Commanded Current",
             self.current_current_label
         )
 
         current_layout.addRow(
-            "Direction",
+            "Coil Polarity",
             self.direction_label
         )
 
@@ -238,28 +249,28 @@ class MagnetControlWindow(QMainWindow):
         # CURRENT MAGNET VECTOR
         # =====================================================
 
-        vector_box = QGroupBox("Current Magnet Vector")
+        vector_box = QGroupBox("Commanded / Model Magnet Vector")
 
         layout.addWidget(vector_box)
 
         vector_layout = QFormLayout(vector_box)
 
-        self.bx_label = QLabel("0.000 mT")
-        self.by_label = QLabel("0.000 mT")
-        self.bz_label = QLabel("0.000 mT")
+        self.bx_label = QLabel("0.000 G")
+        self.by_label = QLabel("0.000 G")
+        self.bz_label = QLabel("0.000 G")
 
         vector_layout.addRow(
-            "Bx",
+            "Bx (G)",
             self.bx_label
         )
 
         vector_layout.addRow(
-            "By",
+            "By (G)",
             self.by_label
         )
 
         vector_layout.addRow(
-            "Bz",
+            "Bz (G)",
             self.bz_label
         )
 
@@ -275,6 +286,7 @@ class MagnetControlWindow(QMainWindow):
         status_layout = QVBoxLayout(status_box)
 
         self.status_label = QLabel("Ready")
+        self.status_label.setWordWrap(True)
 
         status_layout.addWidget(self.status_label)
 
@@ -319,9 +331,9 @@ class MagnetControlWindow(QMainWindow):
 
         info_layout.addRow("Axis", self.cfg_axis_label)
 
-        info_layout.addRow("Ratio", self.cfg_ratio_label)
+        info_layout.addRow("Ratio (G/A)", self.cfg_ratio_label)
 
-        info_layout.addRow("Offset", self.cfg_offset_label)
+        info_layout.addRow("Offset (G)", self.cfg_offset_label)
 
         info_layout.addRow("Max Current", self.cfg_max_current_label)
 
@@ -388,10 +400,6 @@ class MagnetControlWindow(QMainWindow):
             self.toggle_power
         )
 
-        self.polarity_button.toggled.connect(
-            self.toggle_polarity
-        )
-
     # =====================================================
     # MAGNET POWER
     # =====================================================
@@ -405,7 +413,7 @@ class MagnetControlWindow(QMainWindow):
                 self.magnet.disable()
 
                 self.status_label.setText(
-                    "Magnet power is OFF."
+                    "Magnet power is OFF; coils de-energized. Model field equals the calibration offset."
                 )
 
             else:
@@ -425,22 +433,6 @@ class MagnetControlWindow(QMainWindow):
         self.update_power_button()
         self.update_display()
 
-    def toggle_polarity(self, negative):
-
-        try:
-
-            self.magnet.set_polarity(
-                NEGATIVE if negative else POSITIVE
-            )
-
-        except Exception as err:
-
-            self.status_label.setText(
-                str(err)
-            )
-
-        self.update_display()
-
     # =====================================================
     # UPDATE POWER BUTTON
     # =====================================================
@@ -449,7 +441,7 @@ class MagnetControlWindow(QMainWindow):
 
         if self.magnet.is_enabled():
 
-            self.power_button.setText("Magnet ON")
+            self.power_button.setText("Magnet ON: Turn OFF (de-energize)")
 
             self.power_button.setStyleSheet(
                 "background-color: lightgreen;"
@@ -457,31 +449,27 @@ class MagnetControlWindow(QMainWindow):
 
         else:
 
-            self.power_button.setText("Magnet OFF")
+            self.power_button.setText("Magnet OFF: Turn ON")
 
             self.power_button.setStyleSheet(
                 "background-color: lightgray;"
             )
 
-        self.update_polarity_button()
+        self.zero_button.setEnabled(self.magnet.is_enabled())
 
-    def update_polarity_button(self):
+    @staticmethod
+    def polarity_text(polarity):
+        if polarity == POSITIVE:
+            return "+ (Positive)"
+        if polarity == NEGATIVE:
+            return "- (Negative)"
+        return "Unknown"
 
-        polarity = self.magnet.get_polarity()
-
-        self.polarity_button.blockSignals(True)
-        self.polarity_button.setChecked(polarity == NEGATIVE)
-        self.polarity_button.blockSignals(False)
-
-        self.polarity_button.setText(
-            "Polarity: NEGATIVE"
-            if polarity == NEGATIVE
-            else "Polarity: POSITIVE"
-        )
-
-        self.polarity_button.setEnabled(
-            self.magnet.is_enabled()
-        )
+    @staticmethod
+    def field_text(field_mT):
+        if field_mT is None:
+            return "Unknown G"
+        return f"{field_mT * _MT_TO_GAUSS:.3f} G"
 
     # =====================================================
     # GET SELECTED AXIS
@@ -507,15 +495,20 @@ class MagnetControlWindow(QMainWindow):
 
         axis = self.get_selected_axis()
 
-        self.current_field_label.setText(f"{axis.get_field():.3f} mT")
-        self.current_current_label.setText(f"{axis.get_current():.4f} A")
+        self.cfg_axis_label.setText(axis.name)
+
+        self.current_field_label.setText(self.field_text(axis.get_field()))
+        current = axis.get_current()
+        self.current_current_label.setText(
+            "Unknown A" if current is None else f"{current:.4f} A"
+        )
         
         self.cfg_ratio_label.setText(
-            f"{axis.get_ratio():.3f} mT/A"
+            f"{axis.get_ratio() * _MT_TO_GAUSS:.3f} G/A"
         )
 
         self.cfg_offset_label.setText(
-            f"{axis.get_offset():.3f} mT"
+            f"{axis.get_offset() * _MT_TO_GAUSS:.3f} G"
         )
 
         self.cfg_max_current_label.setText(
@@ -536,20 +529,19 @@ class MagnetControlWindow(QMainWindow):
 
         vector = self.magnet.get_vector()
 
-        self.bx_label.setText(f"{vector['x']:.3f} mT")
+        self.bx_label.setText(self.field_text(vector['x']))
 
-        self.by_label.setText(f"{vector['y']:.3f} mT")
+        self.by_label.setText(self.field_text(vector['y']))
 
-        self.bz_label.setText(f"{vector['z']:.3f} mT")
+        self.bz_label.setText(self.field_text(vector['z']))
 
-        direction = self.magnet.get_polarity()
+        self.direction_label.setText(self.polarity_text(axis.get_polarity()))
+        for name, polarity in self.magnet.get_polarities().items():
+            self.polarity_labels[name].setText(
+                f"{name.upper()} coil polarity: {self.polarity_text(polarity)}"
+            )
 
-        if direction == POSITIVE:
-            self.direction_label.setText("Positive")
-        else:
-            self.direction_label.setText("Negative")
-
-        self.update_polarity_button()
+        self.update_power_button()
 
 
         self.config_file_label.setText(
@@ -560,7 +552,7 @@ class MagnetControlWindow(QMainWindow):
 
             "Yes"
 
-            if self.magnet.flip_available
+            if axis.flip_available
 
             else
 
@@ -571,7 +563,7 @@ class MagnetControlWindow(QMainWindow):
         self.flip_channel_label.setText(
 
             str(
-                self.magnet.flip_channel
+                axis.flip_channel
             )
 
         )
@@ -591,14 +583,14 @@ class MagnetControlWindow(QMainWindow):
 
         axis = self.get_selected_axis()
 
-        field = self.field_spin.value()
+        field_gauss = self.field_spin.value()
 
         try:
 
-            axis.set_field(field)
+            axis.set_field(field_gauss * _GAUSS_TO_MT, keep_output_enabled=True)
 
             self.status_label.setText(
-                f"{axis.name}-axis set to {field:.3f} mT"
+                f"{axis.name}-axis commanded to {field_gauss:.3f} G"
             )
 
         except Exception as err:
@@ -615,14 +607,18 @@ class MagnetControlWindow(QMainWindow):
 
     def zero_field(self):
 
+        if not self.magnet.is_enabled():
+            self.status_label.setText("Turn magnet power ON to command calibrated magnetic zero.")
+            return
+
         try:
 
-            self.magnet.zero()
+            self.magnet.set_vector(bx=0.0, by=0.0, bz=0.0)
 
             self.field_spin.setValue(0.0)
 
             self.status_label.setText(
-                "Magnet field zeroed"
+                "Calibrated 0 G commanded on all axes; compensation currents may be nonzero."
             )
 
         except Exception as err:
@@ -639,14 +635,11 @@ class MagnetControlWindow(QMainWindow):
     def read_field(self):
 
         """
-        Refresh values from the selected axis.
-
-        In the future this will query the actual
-        power supply (and optional Hall probe).
+        Refresh commanded/model values; no magnetic-field measurement is made.
         """
 
         self.status_label.setText(
-            "Field read."
+            "Commanded/model values refreshed; magnetic field is not measured."
         )
 
         self.update_display()

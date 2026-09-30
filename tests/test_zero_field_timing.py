@@ -37,27 +37,43 @@ def make_magnet():
     config = {
         "X": {
             "name": "X", "max_current": 5.0,
-            "magnetic_field_ratio": 5.0, "magnetic_field_offset": 0.0,
+            "magnetic_field_calibration": {
+                "positive": {"magnetic_field_ratio": 5.0, "magnetic_field_offset": 0.0},
+                "negative": {"magnetic_field_ratio": 5.0, "magnetic_field_offset": 0.0},
+            },
         },
         "Y": {
             "name": "Y", "max_current": 5.0,
-            "magnetic_field_ratio": 5.0, "magnetic_field_offset": 0.0,
+            "magnetic_field_calibration": {
+                "positive": {"magnetic_field_ratio": 5.0, "magnetic_field_offset": 0.0},
+                "negative": {"magnetic_field_ratio": 5.0, "magnetic_field_offset": 0.0},
+            },
         },
         "Z": {
             "name": "Z", "max_current": 5.0,
-            "magnetic_field_ratio": 5.0, "magnetic_field_offset": 0.0,
-        },
-        "flip_direction": {
-            "available": True,
-            "switch": {"switchChannel": 3, "switchChannelName": "flipMF"},
+            "magnetic_field_calibration": {
+                "positive": {"magnetic_field_ratio": 5.0, "magnetic_field_offset": 0.0},
+                "negative": {"magnetic_field_ratio": 5.0, "magnetic_field_offset": 0.0},
+            },
         },
     }
+    channels = {"X": 6, "Y": 7, "Z": 3}
+    for axis, channel in channels.items():
+        config[axis]["flip_direction"] = {
+            "available": True,
+            "negative_state": True,
+            "switch": {"switchChannel": channel, "switchChannelName": f"flipMF_{axis}"},
+            "discharge_delay_s": 0.0,
+            "settle_delay_s": 0.0,
+        }
     power_supplies = {}
     for axis in ("X", "Y", "Z"):
         ps = SimPowerSupply({"name": axis})
         ps.connect()
         power_supplies[axis] = ps
-    pulse_streamer = SimPulseStreamer(channel_map={"flipMF": 3})
+    pulse_streamer = SimPulseStreamer(
+        channel_map={f"flipMF_{axis}": channel for axis, channel in channels.items()}
+    )
     pulse_streamer.connect()
     # scpi_write_delay_s=0.0: these tests exercise timing *instrumentation*,
     # not the inter-command delay itself (see test_magnet_scpi_traffic.py
@@ -145,7 +161,7 @@ class TimingEnabledTests(unittest.TestCase):
 
         stages = {r["stage"] for r in records}
         for expected in (
-            "determine_polarity",
+            "validate_vector",
             "axis_X_set_current",
             "axis_Y_set_current",
             "axis_Z_set_current",
@@ -274,14 +290,16 @@ class TimingEnabledTests(unittest.TestCase):
         experiment.run()
         records = experiment.pop_timing_log()
 
-        flips = [r for r in records if r["stage"] == "apply_global_polarity_flip"]
-        noops = [r for r in records if r["stage"] == "apply_global_polarity_noop"]
+        flips = [r for r in records if r["stage"] == "axis_X_apply_polarity_flip"]
+        noops = [r for r in records if r["stage"] == "axis_X_apply_polarity_noop"]
 
         # One set_vector() call per scan point, plus one extra from
         # setup_scan()'s own zero_other_axes zeroing call (a real, distinct
         # call, correctly tagged point_index=None -- see setup_scan()).
         self.assertEqual(len(flips), 1)
         self.assertEqual(len(noops), len(experiment.scan_vector))
+        for axis in ("Y", "Z"):
+            self.assertFalse(any(r["stage"] == f"axis_{axis}_apply_polarity_flip" for r in records))
 
     def test_multi_scan_run_has_one_scan_total_per_scan_and_one_run_total(self):
         experiment = make_experiment(

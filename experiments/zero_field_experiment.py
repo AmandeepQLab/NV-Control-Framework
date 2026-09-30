@@ -251,9 +251,9 @@ class ZeroFieldExperiment(ScanExperiment):
             running_t += duration
 
     def setup_scan(self):
-        # Keep all supplies enabled for the full sweep.  In particular, the
-        # two non-swept axes remain at zero current but must not be repeatedly
-        # power-cycled by their per-axis zero-field safety path.
+        # Keep supplies enabled for the sweep. Non-swept axes retain their
+        # compensation currents for calibrated B=0; only a reversing axis
+        # briefly disables its output for its own safe relay transition.
         self.magnet.enable()
 
         # Checked before this scan sends any set_vector() traffic, so a
@@ -286,7 +286,7 @@ class ZeroFieldExperiment(ScanExperiment):
             # left undrained its entries would still be sitting in
             # Magnet._timing_log the next time set_scan_point() drains it,
             # bleeding into and inflating the first point's own count
-            # (e.g. an extra apply_global_polarity_noop/flip row wrongly
+            # (e.g. an extra axis polarity timing row wrongly
             # attributed to point 0).
             timing = self._timing
             t0 = time.perf_counter() if timing else None

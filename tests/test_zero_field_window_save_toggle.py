@@ -124,7 +124,10 @@ class ZeroFieldWindowSaveToggleTests(unittest.TestCase):
         # A directory that cannot possibly be writable -- proves the gate
         # really was skipped, not just coincidentally satisfied.
         window.output_directory = Path("Z:/definitely/does/not/exist")
-        window.widget.save_data_check.setChecked(False)
+        # This emits a modal warning synchronously. Mock it like the warning
+        # tests above so a hardware-free/offscreen full-suite run cannot hang.
+        with patch.object(QMessageBox, "warning"):
+            window.widget.save_data_check.setChecked(False)
 
         # ZeroFieldWorker and QThread are both mocked out so start_scan()
         # never spins up a real background thread -- this test is only
