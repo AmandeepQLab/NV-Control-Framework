@@ -295,7 +295,26 @@ class SimCamera:
         if self._acquisition_open:
             self._end_held_open_acquisition()
 
-        self.roi = roi
+        if roi is None:
+            self.roi = None
+            return
+
+        # Match the physical sensor ROI alignment used by the Andor driver.
+        x0, y0, x1, y1 = roi
+        sensor_height, sensor_width = self.image_shape[:2]
+        b = self.binning
+        width = min(max(1, round((x1 - x0) / b)), sensor_width // b)
+        height = min(max(1, round((y1 - y0) / b)), sensor_height // b)
+        max_x0 = max(0, sensor_width - width * b)
+        max_y0 = max(0, sensor_height - height * b)
+        effective_x0 = min(max(0, round(x0 / b)), max_x0 // b)
+        effective_y0 = min(max(0, round(y0 / b)), max_y0 // b)
+        self.roi = (
+            effective_x0 * b,
+            effective_y0 * b,
+            effective_x0 * b + width * b,
+            effective_y0 * b + height * b,
+        )
 
     def set_binning(self, binning):
 
@@ -403,7 +422,7 @@ class SimCamera:
                 self.binning,
                 width // self.binning,
                 self.binning,
-            ).mean(axis=(1, 3))
+            ).sum(axis=(1, 3))
         return frame
 
     # =========================================================

@@ -21,7 +21,11 @@ from framework.camera_ownership import (
     register_live_view_controller,
     start_live_stream_if_available,
 )
-from framework.acquisition_state import AcquisitionState
+from framework.acquisition_state import (
+    AcquisitionState,
+    binned_roi_to_sensor,
+    sensor_roi_to_binned,
+)
 from framework.roi import validate_roi
 from gui.live_view_controller import LiveViewTimerController
 from utils.camera_diagnostics import log_event
@@ -223,7 +227,7 @@ class MainWindow(QMainWindow):
 
         coordinates_box = QGroupBox("ROI Coordinates")
         coordinates_box.setToolTip(
-            "Full-sensor pixel coordinates, 0-based. X/Y is the top-left "
+            "Effective binned-pixel coordinates, 0-based. X/Y is the top-left "
             "corner; Width/Height extend from there. Applied on "
             "Enter/focus-out."
         )
@@ -378,7 +382,11 @@ class MainWindow(QMainWindow):
         right_panel = QVBoxLayout()
         main_layout.addLayout(right_panel, 4)
 
-        self.image_view = pg.ImageView()
+        self.image_plot = pg.PlotItem()
+        self.image_plot.showAxis("bottom", True)
+        self.image_plot.showAxis("left", True)
+        self._pixel_axes_binning = None
+        self.image_view = pg.ImageView(view=self.image_plot)
         right_panel.addWidget(self.image_view, 3)
 
         # ROI overlay
@@ -496,10 +504,34 @@ class MainWindow(QMainWindow):
         if frame is not None:
             self._update_sensor_dimensions_from_full_frame(frame)
             log_event("gui_image_update", source="live stream", image_target="main live-view image")
+            effective_roi = self.acquisition_state.effective_roi
+            x0, y0 = (0, 0) if effective_roi is None else effective_roi[:2]
+            height, width = frame.shape[:2]
             self.image_view.setImage(
                 frame.T,
-                autoLevels=False
+                autoRange=False,
+                autoLevels=False,
+                pos=(x0, y0),
             )
+            binning = self.acquisition_state.binning
+            self._update_pixel_axes(binning)
+            self.image_view.getView().setRange(
+                xRange=(x0, x0 + width),
+                yRange=(y0, y0 + height),
+                padding=0,
+            )
+
+    def _update_pixel_axes(self, binning):
+        """Label plot axes with effective-pixel units when binning changes."""
+        if getattr(self, "_pixel_axes_binning", None) == binning:
+            return
+        self.image_plot.setLabel(
+            "bottom", f"X ({binning}x{binning} effective binned pixels)"
+        )
+        self.image_plot.setLabel(
+            "left", f"Y ({binning}x{binning} effective binned pixels)"
+        )
+        self._pixel_axes_binning = binning
 
     # =========================================================
     # CAMERA SETTINGS
@@ -515,13 +547,38 @@ class MainWindow(QMainWindow):
         self.apply_acquisition_state()
 
     def set_binning(self, value):
-        self.acquisition_state = AcquisitionState(
+        previous_state = self.acquisition_state
+        candidate_state = AcquisitionState(
             acquisition_roi=self.acquisition_state.acquisition_roi,
             exposure_s=self.acquisition_state.exposure_s,
             binning=value,
             baseline_counts=self.acquisition_state.baseline_counts,
         )
-        self.apply_acquisition_state()
+        self.acquisition_state = candidate_state
+        applied = self.apply_acquisition_state()
+        if applied is False:
+            self.acquisition_state = previous_state
+            blocker = QSignalBlocker(self.binning_spin)
+            self.binning_spin.setValue(previous_state.binning)
+            del blocker
+            return
+
+        # The Andor driver may align an ROI to the active binning and
+        # SDK-reported AOI limits. Keep the authoritative GUI state in
+        # sync with the ROI that was actually programmed.
+        actual_roi = getattr(
+            getattr(self, "camera", None), "roi", candidate_state.acquisition_roi
+        )
+        if actual_roi != candidate_state.acquisition_roi:
+            self.acquisition_state = AcquisitionState(
+                acquisition_roi=actual_roi,
+                exposure_s=candidate_state.exposure_s,
+                binning=candidate_state.binning,
+                baseline_counts=candidate_state.baseline_counts,
+            )
+        sync_roi_controls = getattr(self, "_sync_roi_controls", None)
+        if sync_roi_controls is not None:
+            sync_roi_controls()
 
     def set_baseline_counts(self, value):
         """Update the camera dark-count offset. Never touches the camera --
@@ -560,7 +617,7 @@ class MainWindow(QMainWindow):
         )
 
     def apply_roi_coordinates(self):
-        """Convert the coordinate editor's origin and size into an AOI."""
+        """Apply effective binned-pixel coordinates as a sensor AOI."""
         x = self.roi_coordinate_spins["x"].value()
         y = self.roi_coordinate_spins["y"].value()
         width = self.roi_coordinate_spins["width"].value()
@@ -576,9 +633,10 @@ class MainWindow(QMainWindow):
         self._set_acquisition_roi((x, y, x + width, y + height))
 
     def _set_acquisition_roi(self, roi, show_validation_error=True):
-        """Apply one validated ROI without creating a second ROI state."""
+        """Apply one effective-pixel ROI as the authoritative sensor ROI."""
         try:
-            roi = self._validate_acquisition_roi(roi)
+            sensor_roi = binned_roi_to_sensor(roi, self.acquisition_state.binning)
+            sensor_roi = self._validate_acquisition_roi(sensor_roi)
         except ValueError as error:
             self._sync_roi_controls()
             if show_validation_error:
@@ -586,7 +644,7 @@ class MainWindow(QMainWindow):
             return False
 
         candidate_state = AcquisitionState(
-            acquisition_roi=roi,
+            acquisition_roi=sensor_roi,
             exposure_s=self.acquisition_state.exposure_s,
             binning=self.acquisition_state.binning,
             baseline_counts=self.acquisition_state.baseline_counts,
@@ -621,7 +679,13 @@ class MainWindow(QMainWindow):
                 )
             return False
 
-        self.acquisition_state = candidate_state
+        actual_roi = getattr(self.camera, "roi", sensor_roi)
+        self.acquisition_state = AcquisitionState(
+            acquisition_roi=actual_roi,
+            exposure_s=candidate_state.exposure_s,
+            binning=candidate_state.binning,
+            baseline_counts=candidate_state.baseline_counts,
+        )
         self._sync_roi_controls()
         return True
 
@@ -664,33 +728,43 @@ class MainWindow(QMainWindow):
         return None
 
     def _update_sensor_dimensions_from_full_frame(self, frame):
-        """Use a full-sensor live frame only when hardware dimensions are unavailable."""
+        """Infer sensor size from a full-frame output if hardware size is unavailable."""
         if self._sensor_dimensions is not None or self.acquisition_state.acquisition_roi is not None:
             return
         if getattr(frame, "ndim", 0) >= 2:
-            self._sensor_dimensions = (int(frame.shape[1]), int(frame.shape[0]))
+            binning = self.acquisition_state.binning
+            self._sensor_dimensions = (
+                int(frame.shape[1]) * binning,
+                int(frame.shape[0]) * binning,
+            )
             self._sync_roi_controls()
 
     def _sync_roi_controls(self):
-        """Reflect the authoritative acquisition ROI in both editing interfaces."""
+        """Show the sensor ROI in effective binned-pixel coordinates."""
         roi = self.acquisition_state.acquisition_roi
+        binning = self.acquisition_state.binning
         if roi is None:
             sensor_dimensions = self._sensor_dimensions or self._read_sensor_dimensions()
             if sensor_dimensions is None:
                 self.roi_label.setText("Acquisition ROI: Full sensor")
                 return
             width, height = sensor_dimensions
+            width //= binning
+            height //= binning
             coordinates = (0, 0, width, height)
             overlay_roi = (0, 0, width, height)
             self.roi_label.setText(
-                f"Acquisition ROI: x=0, y=0, w={width}, h={height}"
+                f"Full sensor ({binning}x{binning} effective pixels): "
+                f"x=0, y=0, w={width}, h={height}"
             )
         else:
-            x0, y0, x1, y1 = roi
+            effective_roi = sensor_roi_to_binned(roi, binning)
+            x0, y0, x1, y1 = effective_roi
             coordinates = (x0, y0, x1 - x0, y1 - y0)
-            overlay_roi = roi
+            overlay_roi = effective_roi
             self.roi_label.setText(
-                f"Acquisition ROI: x={x0}, y={y0}, "
+                f"Acquisition ROI ({binning}x{binning} effective pixels): "
+                f"x={x0}, y={y0}, "
                 f"w={x1 - x0}, h={y1 - y0}"
             )
 

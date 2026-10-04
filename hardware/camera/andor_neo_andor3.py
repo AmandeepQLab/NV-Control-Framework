@@ -542,8 +542,6 @@ class AndorNeoAndor3:
         if self._acquisition_open:
             self._end_held_open_acquisition()
 
-        self.roi = roi
-
         # Stop acquisition if necessary
         try:
             self.cam.command("AcquisitionStop")
@@ -552,35 +550,81 @@ class AndorNeoAndor3:
 
         self.cam.setBool("VerticallyCentreAOI", False)
 
+        binning = self.binning
+
         if roi is None:
             sensor_width = self.cam.getInt("SensorWidth")
             sensor_height = self.cam.getInt("SensorHeight")
 
             self.cam.setInt("AOILeft", 1)
             self.cam.setInt("AOITop", 1)
-            self.cam.setInt("AOIWidth", sensor_width)
-            self.cam.setInt("AOIHeight", sensor_height)
+            # SDK3 reports AOI dimensions in output (binned) pixels, while
+            # the application and AOILeft/AOITop use sensor-pixel units.
+            self.cam.setInt("AOIWidth", sensor_width // binning)
+            self.cam.setInt("AOIHeight", sensor_height // binning)
+            self.roi = None
             return
 
         x0, y0, x1, y1 = roi
+        sensor_width = self.cam.getInt("SensorWidth")
+        sensor_height = self.cam.getInt("SensorHeight")
+        if not (0 <= x0 < x1 <= sensor_width and 0 <= y0 < y1 <= sensor_height):
+            raise ValueError("ROI must be a non-empty rectangle inside the sensor")
 
-        width = x1 - x0
-        height = y1 - y0
+        # ROI state is full-sensor, zero-based, and has exclusive ends.
+        # SDK3 AOI dimensions are in output pixels; positions are in
+        # sensor pixels. Move to the origin before changing dimensions so
+        # the old position cannot become invalid as the AOI size changes.
+        self.cam.setInt("AOILeft", 1)
+        self.cam.setInt("AOITop", 1)
 
+        requested_width = max(1, round((x1 - x0) / binning))
+        requested_height = max(1, round((y1 - y0) / binning))
+        width = min(
+            max(requested_width, self.cam.getIntMin("AOIWidth")),
+            self.cam.getIntMax("AOIWidth"),
+            sensor_width // binning,
+        )
+        height = min(
+            max(requested_height, self.cam.getIntMin("AOIHeight")),
+            self.cam.getIntMax("AOIHeight"),
+            sensor_height // binning,
+        )
         self.cam.setInt("AOIWidth", width)
         self.cam.setInt("AOIHeight", height)
 
-        # SDK3 uses 1-based coordinates
-        self.cam.setInt("AOILeft", x0 + 1)
-        self.cam.setInt("AOITop", y0 + 1)
+        # The SDK provides current position limits, which depend on the
+        # selected binning and AOI dimensions. Bin-aligned origins are
+        # required because AOITop/AOILeft are sensor-pixel coordinates.
+        min_x0 = self.cam.getIntMin("AOILeft") - 1
+        min_y0 = self.cam.getIntMin("AOITop") - 1
+        max_x0 = min(sensor_width - width * binning, self.cam.getIntMax("AOILeft") - 1)
+        max_y0 = min(sensor_height - height * binning, self.cam.getIntMax("AOITop") - 1)
+        min_x0 = ((min_x0 + binning - 1) // binning) * binning
+        min_y0 = ((min_y0 + binning - 1) // binning) * binning
+        max_x0 = (max_x0 // binning) * binning
+        max_y0 = (max_y0 // binning) * binning
+        if max_x0 < min_x0 or max_y0 < min_y0:
+            raise ValueError("ROI cannot be represented within the camera's AOI limits")
+        normalized_x0 = min(max(min_x0, round(x0 / binning) * binning), max_x0)
+        normalized_y0 = min(max(min_y0, round(y0 / binning) * binning), max_y0)
+
+        # SDK3 uses one-based coordinates; convert only at this boundary.
+        self.cam.setInt("AOILeft", normalized_x0 + 1)
+        self.cam.setInt("AOITop", normalized_y0 + 1)
+        self.roi = (
+            normalized_x0,
+            normalized_y0,
+            normalized_x0 + width * binning,
+            normalized_y0 + height * binning,
+        )
     def set_binning(self, binning):
 
         if self._acquisition_open:
             self._end_held_open_acquisition()
 
-        self.binning = binning
-
         if self.cam is None:
+            self.binning = binning
             return
 
         bin_map = {
@@ -595,7 +639,14 @@ class AndorNeoAndor3:
             raise ValueError(f"Unsupported Andor binning: {binning}")
 
         try:
+            # AOIBinning changes the legal AOI position range. Reset the
+            # origin while it is still valid under the old geometry, then
+            # set the new binning; AcquisitionState applies the requested
+            # ROI immediately afterwards using the new SDK limits.
+            self.cam.setInt("AOILeft", 1)
+            self.cam.setInt("AOITop", 1)
             self.cam.setEnumIndex("AOIBinning", bin_map[binning])
+            self.binning = binning
             LOGGER.info("Andor AOI binning set to %dx%d", binning, binning)
 
         except Exception:
