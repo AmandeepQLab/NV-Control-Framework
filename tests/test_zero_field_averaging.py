@@ -50,9 +50,11 @@ class RecordingMagnet(FakeMagnet):
 
     ``initial_vector`` may be a single dict (returned from every
     get_vector() call, matching FakeMagnet's constant-zero default when
-    omitted) or an iterable of dicts (one consumed per get_vector() call,
-    to simulate the magnet reading differently at the start of each scan
-    in a multi-scan run).
+    omitted) or an iterable of dicts (one consumed per scan, to simulate
+    the magnet reading differently at the start of each scan in a
+    multi-scan run). The sequence advances on enable() -- called once at
+    the start of every scan -- so per-point get_vector() reads (the model
+    field snapshot) see that scan's value rather than consuming the next.
     """
 
     def __init__(self, events, initial_vector=None):
@@ -68,9 +70,12 @@ class RecordingMagnet(FakeMagnet):
             self._vector_sequence = iter(initial_vector)
             self._fixed_vector = None
 
-    def get_vector(self):
+    def enable(self):
         if self._vector_sequence is not None:
-            return dict(next(self._vector_sequence))
+            self._fixed_vector = dict(next(self._vector_sequence))
+        super().enable()
+
+    def get_vector(self):
         return dict(self._fixed_vector)
 
     def set_vector(self, **fields):

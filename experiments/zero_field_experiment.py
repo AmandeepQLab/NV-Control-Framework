@@ -157,6 +157,16 @@ class ZeroFieldExperiment(ScanExperiment):
         # settling in between, so point 0 is the point they affect.
         self._setup_flip_axes = frozenset()
 
+        # What the magnet was actually commanded to per point, according to
+        # its calibration model -- as opposed to field_values_gauss, the
+        # requested linspace. They differ in a branch gap (model = the
+        # intercept); in an overlap the field matches but the branch is a
+        # matter of sweep history, which model_polarity records. One entry
+        # per acquired point, reset per sweep.
+        self.model_field_values_gauss = []
+        self.model_field_vector_mT = []
+        self.model_polarity = []
+
         # Whether this run successfully armed the camera's held-open
         # software acquisition (see run()/acquire_frame()) -- mirrors
         # ODMRExperiment's own _acquisition_open flag. Distinct from the
@@ -387,10 +397,73 @@ class ZeroFieldExperiment(ScanExperiment):
         flip report (returning None or a Mock) count as no flip."""
         return frozenset(flipped) if isinstance(flipped, (set, frozenset)) else frozenset()
 
-    def _relay_flip_metadata(self):
+    def _per_point_metadata(self):
+        """Per-acquired-point lists recorded alongside field_values_gauss."""
         return {
             "relay_flip_occurred": [bool(f) for f in self.relay_flip_occurred],
             "relay_flip_axes": [",".join(sorted(a)) for a in self.relay_flip_axes],
+            "model_field_values_gauss": list(self.model_field_values_gauss),
+            "model_field_vector_mT": [list(v) for v in self.model_field_vector_mT],
+            "model_polarity": [list(p) for p in self.model_polarity],
+        }
+
+    @staticmethod
+    def _polarity_symbol(polarity):
+        """'+'/'-' for a synchronized relay branch, '?' when unknown."""
+        value = getattr(polarity, "value", None)
+        return {1: "+", -1: "-"}.get(value, "?")
+
+    def _model_snapshot(self):
+        """Modelled state right after a point's set_vector(): the swept
+        axis's model field (G), the full model vector (mT), and polarities.
+        Model values, not measurements (see MagnetAxis.get_field())."""
+        vector = self.magnet.get_vector()
+        vector_mT = [vector.get(axis) for axis in ("x", "y", "z")]
+        swept_mT = vector.get(self.field_axis.lower())
+        swept_gauss = None if swept_mT is None else swept_mT * 10.0
+        get_polarities = getattr(self.magnet, "get_polarities", None)
+        polarities = get_polarities() if callable(get_polarities) else {}
+        polarity = [
+            self._polarity_symbol(polarities.get(axis)) for axis in ("x", "y", "z")
+        ]
+        return swept_gauss, vector_mT, polarity
+
+    @staticmethod
+    def _merge_model_fields(averaged_cube, acquired_cube, scan_count):
+        """Fold one completed scan's model fields into the multi-scan average.
+
+        Fields: running mean per point, matching how the image is averaged
+        (None if any scan had no model value). Polarity can't be averaged:
+        an axis whose branch differed between averaged scans becomes "mixed".
+        """
+        average = averaged_cube.metadata
+        current = acquired_cube.metadata
+        keys = ("model_field_values_gauss", "model_field_vector_mT", "model_polarity")
+        if any(key not in average or key not in current for key in keys):
+            return
+
+        def mean(old, new):
+            if old is None or new is None:
+                return None
+            return old + (new - old) / scan_count
+
+        fields = [
+            mean(a, b)
+            for a, b in zip(average["model_field_values_gauss"], current["model_field_values_gauss"])
+        ]
+        vectors = [
+            [mean(a, b) for a, b in zip(old, new)]
+            for old, new in zip(average["model_field_vector_mT"], current["model_field_vector_mT"])
+        ]
+        polarity = [
+            [a if a == b else "mixed" for a, b in zip(old, new)]
+            for old, new in zip(average["model_polarity"], current["model_polarity"])
+        ]
+        averaged_cube.metadata = {
+            **average,
+            "model_field_values_gauss": fields,
+            "model_field_vector_mT": vectors,
+            "model_polarity": polarity,
         }
 
     @staticmethod
@@ -555,6 +628,9 @@ class ZeroFieldExperiment(ScanExperiment):
                                 averaged_cube.data, acquired_cube.data, completed_scans
                             )
                             self._merge_relay_flips(averaged_cube, acquired_cube)
+                            self._merge_model_fields(
+                                averaged_cube, acquired_cube, completed_scans
+                            )
                         LOGGER.info("Running average updated.")
 
                         if stream_path is not None and self.stream_path_is_output:
@@ -651,6 +727,9 @@ class ZeroFieldExperiment(ScanExperiment):
         self.relay_flip_occurred = []
         self.relay_flip_axes = []
         self._setup_flip_axes = frozenset()
+        self.model_field_values_gauss = []
+        self.model_field_vector_mT = []
+        self.model_polarity = []
 
         # Set before setup_scan() (not just in the point loop below) so
         # setup_scan()'s own magnet.set_vector() call -- when
@@ -693,6 +772,9 @@ class ZeroFieldExperiment(ScanExperiment):
                     self._as_flip_set(self.set_scan_point(field)) | self._setup_flip_axes
                 )
                 self._setup_flip_axes = frozenset()
+                # What was actually commanded, read before anything else can
+                # change the magnet; stored with the frame below.
+                model_gauss, model_vector_mT, model_polarity = self._model_snapshot()
 
                 # Wait for field stabilization.
                 if self.settling_time_ms > 0:
@@ -716,6 +798,9 @@ class ZeroFieldExperiment(ScanExperiment):
                 self.image_cube.add(averaged_image)
                 self.relay_flip_occurred.append(bool(flipped))
                 self.relay_flip_axes.append(flipped)
+                self.model_field_values_gauss.append(model_gauss)
+                self.model_field_vector_mT.append(model_vector_mT)
+                self.model_polarity.append(model_polarity)
                 if self._stream_writer is not None:
                     t0 = time.perf_counter() if timing else None
                     self._stream_writer.write_plane(point_index, averaged_image)
@@ -771,10 +856,14 @@ class ZeroFieldExperiment(ScanExperiment):
             # Release the unfilled part of the pre-allocated buffer after an
             # early stop. No-op for a complete sweep.
             self.image_cube.truncate(frame_count)
-            # One flip entry per stored frame, like field_values_gauss.
-            del self.relay_flip_occurred[frame_count:]
-            del self.relay_flip_axes[frame_count:]
-            flip_metadata = self._relay_flip_metadata()
+            # One entry per stored frame, like field_values_gauss.
+            for per_point in (
+                self.relay_flip_occurred, self.relay_flip_axes,
+                self.model_field_values_gauss, self.model_field_vector_mT,
+                self.model_polarity,
+            ):
+                del per_point[frame_count:]
+            flip_metadata = self._per_point_metadata()
             self.image_cube.metadata = {**self.image_cube.metadata, **flip_metadata}
             if self._stream_writer is not None:
                 writer = self._stream_writer
@@ -861,6 +950,30 @@ class ZeroFieldExperiment(ScanExperiment):
                 "camera_binning": self._camera_setting("binning"),
                 "field_axis": self.field_axis,
                 "field_values_gauss": self.scan_vector.tolist(),
+                "field_value_definitions": {
+                    "field_values_gauss": (
+                        "Requested swept-axis field per point (the linspace), "
+                        "in G; same as scan_axis_values."
+                    ),
+                    "model_field_values_gauss": (
+                        "Swept-axis field the magnet was commanded to per its "
+                        "calibration model, in G, read right after each "
+                        "point's set_vector(). Differs from the request in a "
+                        "branch gap (model = the branch intercept). Not a "
+                        "measurement."
+                    ),
+                    "model_field_vector_mT": (
+                        "Full modelled [x, y, z] field per point, in mT, read "
+                        "the same way. Not a measurement."
+                    ),
+                    "model_polarity": (
+                        "Relay branch per point as [x, y, z]: '+', '-', or '?' "
+                        "(unknown); 'mixed' in a multi-scan average whose scans "
+                        "differed. In a branch overlap the field matches the "
+                        "request on either branch, so this is what shows "
+                        "which branch was used."
+                    ),
+                },
                 "field_point_count": self.field_points,
                 "field_start_gauss": self.field_start,
                 "field_stop_gauss": self.field_stop,
