@@ -8,9 +8,11 @@ venv/
 *.tiff
 *.h5
 
-Data/
+Data/*
 Results/
 CameraData/
-data/
+data/*
+!data/__init__.py
+!data/data_manager.py
 /*.csv
 PROJECT_STATUS_REPORT.md
