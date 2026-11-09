@@ -22,6 +22,7 @@ ALLOWED_FILES = frozenset(
         "test_exposure_propagation.py",
         "test_image_cube_preallocation.py",
         "test_magnet_scpi_traffic.py",
+        "test_main_window_close_safety.py",
         "test_magnet_experiment_lock.py",
         "test_magnet_independent_polarity.py",
         "test_magnetic_field_gui_units.py",

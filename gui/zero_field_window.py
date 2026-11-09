@@ -292,6 +292,16 @@ class ZeroFieldWindow(QMainWindow):
             self.widget.status_label.setText("Status: Stopping")
             self.worker.stop()
 
+    # Experiment-window interface used by MainWindow's worker registry and
+    # close-safety path (see CLAUDE.md). ODMRWindow implements the same two.
+    def worker_thread(self):
+        """The QThread running the current scan's worker, or None."""
+        return self.thread
+
+    def request_stop(self):
+        """Ask the running scan to stop; it finishes asynchronously."""
+        self.stop_scan()
+
     def handle_live_update(self, field, signal, image):
         log_event("gui_image_update", source="Zero Field experiment", image_target="Zero Field image")
         self._latest_averaged_image = np.array(image, copy=True)
@@ -554,16 +564,12 @@ class ZeroFieldWindow(QMainWindow):
         self.widget.status_label.setText(f"Status: Saved data to {destination}")
 
     def closeEvent(self, event):
+        # MainWindow is the close gatekeeper (it waits for worker threads
+        # before shutting hardware down). Here, a running scan is asked to
+        # stop and the window stays open until it has finished; closing it
+        # afterwards is accepted normally.
         if self.zero_field_running:
-            reply = QMessageBox.question(
-                self,
-                "Close Zero Field",
-                "A scan is running. Stop it and close this window?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                event.ignore()
-                return
-            self.stop_scan()
+            self.request_stop()
+            event.ignore()
+            return
         event.accept()

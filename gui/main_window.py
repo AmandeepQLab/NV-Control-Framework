@@ -1,5 +1,6 @@
 import sys
 import argparse
+import logging
 import pyqtgraph as pg # type: ignore
 
 from PyQt6.QtWidgets import ( # type: ignore
@@ -33,6 +34,12 @@ from gui.live_view_controller import LiveViewTimerController
 from utils.camera_diagnostics import log_event
 
 
+LOGGER = logging.getLogger(__name__)
+
+# How long a "Stop and Close" waits for worker threads before closing anyway.
+_CLOSE_WAIT_TIMEOUT_MS = 10_000
+
+
 class MainWindow(QMainWindow):
 
     # Experiment lifetime, relayed to MagnetControlWindow's command lock.
@@ -50,6 +57,7 @@ class MainWindow(QMainWindow):
         # window -> (experiment_name, magnet_is_swept).
         self._running_experiments = {}
         self.magnet_window = None
+        self._init_close_state()
 
         self.setWindowTitle("NV Control")
         self.resize(1600, 800)
@@ -487,6 +495,7 @@ class MainWindow(QMainWindow):
 
     def _experiment_window_started(self, window, name, magnet_is_swept):
         self._running_experiments[window] = (name, bool(magnet_is_swept))
+        self._register_worker_thread(window)
         self.experiment_started.emit(*self._combined_experiment_state())
 
     def _experiment_window_finished(self, window):
@@ -502,6 +511,95 @@ class MainWindow(QMainWindow):
     def _relay_zero_field_vector(self, x_mT, y_mT, z_mT):
         if self.magnet_window is not None:
             self.magnet_window.update_field_display(x_mT, y_mT, z_mT)
+
+    # =========================================================
+    # WORKER REGISTRY + CLOSE SAFETY
+    # =========================================================
+    # closeEvent() must not shut hardware down while an experiment worker
+    # thread may still be commanding it. Every experiment window exposes
+    # worker_thread() and request_stop(); a thread is registered when its
+    # window announces run_started and removed on QThread.finished -- the
+    # thread really exiting, which is later than run_finished (the worker
+    # can still be running after emitting its finished signal).
+
+    def _init_close_state(self):
+        # Live worker threads: QThread -> the experiment window that owns it.
+        self._worker_threads = {}
+        self._closing_after_stop = False  # user chose "Stop and Close"
+        self._force_close = False         # wait timed out; close regardless
+        self._shut_down = False           # hardware shutdown already done
+        self._close_timeout_timer = None
+
+    def _register_worker_thread(self, window):
+        thread = window.worker_thread()
+        if thread is None or thread in self._worker_threads:
+            return
+        self._worker_threads[thread] = window
+        # Bound method (not a lambda), so this runs on the GUI thread even
+        # though QThread.finished is emitted from the worker thread.
+        thread.finished.connect(self._on_worker_thread_finished)
+
+    def _on_worker_thread_finished(self):
+        self._worker_threads.pop(self.sender(), None)
+
+    def _ask_stop_and_close(self):
+        """True for "Stop and Close", False for "Cancel"."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Scan in progress")
+        box.setText(
+            "A scan is running. Stop it and close the application, "
+            "or cancel and return to the scan?"
+        )
+        stop_button = box.addButton(
+            "Stop and Close", QMessageBox.ButtonRole.AcceptRole
+        )
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(stop_button)
+        box.exec()
+        return box.clickedButton() is stop_button
+
+    def _begin_stop_and_close(self):
+        """Stop every running scan and close once all workers have exited.
+
+        Never blocks the GUI thread: the close is re-attempted from
+        _on_worker_finished_for_close() or, at worst, _on_close_timeout().
+        """
+        for window in set(self._worker_threads.values()):
+            try:
+                window.request_stop()
+            except Exception:
+                LOGGER.exception("Failed to request stop for %r", window)
+        self.statusBar().showMessage("Stopping scan — please wait…")
+        for thread in list(self._worker_threads):
+            # Connected after the registry slot, so it sees the registry
+            # already updated for this thread.
+            thread.finished.connect(self._on_worker_finished_for_close)
+        self._close_timeout_timer = QTimer(self)
+        self._close_timeout_timer.setSingleShot(True)
+        self._close_timeout_timer.timeout.connect(self._on_close_timeout)
+        self._close_timeout_timer.start(_CLOSE_WAIT_TIMEOUT_MS)
+
+    def _on_worker_finished_for_close(self):
+        if not self._closing_after_stop or self._shut_down:
+            return
+        if self._worker_threads:
+            return
+        if self._close_timeout_timer is not None:
+            self._close_timeout_timer.stop()
+        self.close()
+
+    def _on_close_timeout(self):
+        if self._shut_down:
+            return
+        if self._worker_threads:
+            LOGGER.warning(
+                "Closing after %.0f s with %d experiment worker thread(s) "
+                "still running; hardware shutdown may race with them.",
+                _CLOSE_WAIT_TIMEOUT_MS / 1000.0, len(self._worker_threads),
+            )
+        self._force_close = True
+        self.close()
 
     # =========================================================
     # STATE
@@ -939,61 +1037,75 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
 
-        running_odmr = (
-            self.odmr_window is not None
-            and getattr(self.odmr_window, "odmr_running", False)
-        )
-
-        if running_odmr:
-            msg = (
-                "An ODMR scan is currently running.\n\n"
-                "Closing the NV Control GUI will stop all running experiments.\n\n"
-                "Are you sure you want to continue?"
-            )
-        else:
-            msg = (
-                "Closing the NV Control GUI will stop all running experiments.\n\n"
-                "Are you sure you want to continue?"
-            )
-
-        reply = QMessageBox.question(
-            self,
-            "Exit NV Control",
-            msg,
-            QMessageBox.StandardButton.Yes
-            | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No
-        )
-
-        if reply == QMessageBox.StandardButton.Yes:
-
-            # Stop live view safely
-            self.stop_stream()
-
-            # Close ODMR window if open
-            try:
-                if self.odmr_window is not None:
-                    self.odmr_window.close()
-            except Exception:
-                pass
-
-            try:
-                if getattr(self, "zero_field_window", None) is not None:
-                    self.zero_field_window.close()
-            except Exception:
-                pass
-
-            # Shut down hardware if HardwareManager supports it
-            try:
-                self.hw_manager.shutdown()
-            except Exception:
-                pass
-
+        if self._shut_down:
             event.accept()
+            return
 
-        else:
+        # Gatekeeper: never shut hardware down under a live worker thread.
+        if self._worker_threads and not self._force_close:
+            if self._closing_after_stop:
+                # Already stopping; the worker-finished slot or the
+                # timeout will close again.
+                event.ignore()
+                return
+            if not self._ask_stop_and_close():
+                event.ignore()
+                return
+            self._closing_after_stop = True
+            if self._worker_threads:
+                # Defer: close is re-attempted once every worker exits.
+                event.ignore()
+                self._begin_stop_and_close()
+                return
+            # Every worker exited while the dialog was open: close now.
 
-            event.ignore()
+        # "Stop and Close" already confirmed the exit; don't ask twice.
+        if not (self._closing_after_stop or self._force_close):
+            reply = QMessageBox.question(
+                self,
+                "Exit NV Control",
+                "Closing the NV Control GUI will stop all running experiments.\n\n"
+                "Are you sure you want to continue?",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+
+        self._shutdown_hardware()
+        event.accept()
+
+    def _shutdown_hardware(self):
+        """Stop live view, close experiment windows, shut hardware down."""
+
+        self._shut_down = True
+        if self._close_timeout_timer is not None:
+            self._close_timeout_timer.stop()
+
+        # Stop live view safely
+        self.stop_stream()
+
+        # Close experiment windows; no scan is running by now, so each
+        # window accepts its close.
+        try:
+            if self.odmr_window is not None:
+                self.odmr_window.close()
+        except Exception:
+            pass
+
+        try:
+            if getattr(self, "zero_field_window", None) is not None:
+                self.zero_field_window.close()
+        except Exception:
+            pass
+
+        # Shut down hardware if HardwareManager supports it
+        try:
+            self.hw_manager.shutdown()
+        except Exception:
+            pass
 
 
 def main():

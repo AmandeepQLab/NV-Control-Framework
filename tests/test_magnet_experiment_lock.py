@@ -201,6 +201,16 @@ class MagnetWindowLockTests(unittest.TestCase):
         self.assertEqual(w.vector_box.title(), MagnetControlWindow._VECTOR_BOX_TITLE)
 
 
+class _IdleExperimentWindow:
+    """Experiment-window stand-in with no worker thread to register."""
+
+    def worker_thread(self):
+        return None
+
+    def request_stop(self):
+        pass
+
+
 class _BookkeepingMainWindow:
     """MainWindow's bookkeeping methods on a bare QMainWindow.
 
@@ -214,6 +224,7 @@ class _BookkeepingMainWindow:
         QMainWindow.__init__(window)
         window._running_experiments = {}
         window.magnet_window = None
+        window._init_close_state()
         return window
 
 
@@ -229,14 +240,14 @@ class MainWindowExperimentBookkeepingTests(unittest.TestCase):
         self.main.deleteLater()
 
     def test_single_experiment(self):
-        zfe = object()
+        zfe = _IdleExperimentWindow()
         self.main._experiment_window_started(zfe, "Zero Field", True)
         self.main._experiment_window_finished(zfe)
         self.assertEqual(self.started, [("Zero Field", True)])
         self.assertEqual(self.finished, [True])
 
     def test_overlapping_experiments_stay_locked_until_all_finish(self):
-        odmr, zfe = object(), object()
+        odmr, zfe = _IdleExperimentWindow(), _IdleExperimentWindow()
         self.main._experiment_window_started(odmr, "ODMR", False)
         self.main._experiment_window_started(zfe, "Zero Field", True)
         self.main._experiment_window_finished(odmr)

@@ -208,6 +208,16 @@ class ODMRWindow(QMainWindow):
         if self.odmr_worker is not None:
             self.stop_requested.emit()
 
+    # Experiment-window interface used by MainWindow's worker registry and
+    # close-safety path (see CLAUDE.md). ZeroFieldWindow implements the same.
+    def worker_thread(self):
+        """The QThread running the current scan's worker, or None."""
+        return self.odmr_thread
+
+    def request_stop(self):
+        """Ask the running scan to stop; it finishes asynchronously."""
+        self.stop_odmr()
+
     # =====================================================
     # STORE DATA DURING SCAN
     # =====================================================
@@ -466,43 +476,13 @@ class ODMRWindow(QMainWindow):
 
     def closeEvent(self, event):
 
-        running = (
-            self.odmr_worker is not None
-            and getattr(self.odmr_worker, "running", False)
-        )
-
-        if running:
-
-            msg = (
-                "An ODMR scan is currently running.\n\n"
-                "Are you sure you want to stop the scan and close the ODMR GUI?"
-            )
-
-        else:
-
-            msg = (
-                "Are you sure you want to close the ODMR GUI?"
-            )
-
-        reply = QMessageBox.question(
-            self,
-            "Close ODMR",
-            msg,
-            QMessageBox.StandardButton.Yes
-            | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No
-        )
-
-        if reply == QMessageBox.StandardButton.Yes:
-
-            try:
-                if self.odmr_worker is not None:
-                    self.stop_requested.emit()
-            except Exception:
-                pass
-
-            event.accept()
-
-        else:
-
+        # MainWindow is the close gatekeeper (it waits for worker threads
+        # before shutting hardware down). Here, a running scan is asked to
+        # stop and the window stays open until it has finished; closing it
+        # afterwards is accepted normally.
+        if self.odmr_running:
+            self.request_stop()
             event.ignore()
+            return
+
+        event.accept()
