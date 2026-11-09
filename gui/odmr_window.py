@@ -50,6 +50,12 @@ CAMERA_PER_FRAME_OVERHEAD_S = 0.0132
 class ODMRWindow(QMainWindow):
 
     stop_requested = pyqtSignal()
+    # Announce a run's lifetime to MainWindow, which relays it to the magnet
+    # control lock. run_finished fires once per run_started, from
+    # odmr_finished() -- ODMRWorker._finish() emits finished_signal exactly
+    # once on every exit path (completion, stop, error).
+    run_started = pyqtSignal()
+    run_finished = pyqtSignal()
 
     def __init__(self, hardware, camera, acquisition_state_getter):
         super().__init__()
@@ -190,6 +196,7 @@ class ODMRWindow(QMainWindow):
         self.odmr_worker.progress_signal.connect(self.panel.update_progress)
         self.odmr_worker.frequency_signal.connect(self.panel.update_frequency)
 
+        self.run_started.emit()
         self.odmr_thread.start()
 
     # =====================================================
@@ -386,6 +393,9 @@ class ODMRWindow(QMainWindow):
     def odmr_finished(self):
 
         self.odmr_running = False
+        # First, so a failure in statistics/saving below can't leave the
+        # magnet control window locked.
+        self.run_finished.emit()
         self.panel.set_running_state(False)
 
         self.refresh_plot()

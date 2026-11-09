@@ -7,7 +7,7 @@ from datetime import datetime
 
 import numpy as np
 
-from PyQt6.QtCore import QThread
+from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtWidgets import QFileDialog, QMainWindow, QMessageBox
 
 from gui.widgets.zero_field_widget import ZeroFieldWidget
@@ -32,6 +32,15 @@ _DEFAULT_OUTPUT_DIRECTORY = Path(__file__).resolve().parents[1] / "data"
 
 class ZeroFieldWindow(QMainWindow):
     """Configure, run, monitor, and save a ZeroFieldExperiment."""
+
+    # Announce a run's lifetime to MainWindow, which relays it to the magnet
+    # control lock. run_finished fires exactly once per run_started, from
+    # scan_finished() -- the worker's finished_signal reaches it on every exit
+    # path (completion, stop, error).
+    run_started = pyqtSignal()
+    run_finished = pyqtSignal()
+    # Relayed from ZeroFieldWorker.field_updated: (x_mT, y_mT, z_mT).
+    field_updated = pyqtSignal(float, float, float)
 
     def __init__(
         self,
@@ -205,7 +214,11 @@ class ZeroFieldWindow(QMainWindow):
         self.worker.finished_signal.connect(self.thread.quit)
         self.worker.error_signal.connect(self.show_error)
         self.worker.error_signal.connect(self.thread.quit)
+        self.worker.field_updated.connect(self.field_updated)
         self.thread.finished.connect(self.thread.deleteLater)
+        # Before the thread starts, so the magnet lock is in place before
+        # the worker can send any magnet command.
+        self.run_started.emit()
         self.thread.start()
 
     def stop_scan(self):
@@ -325,6 +338,10 @@ class ZeroFieldWindow(QMainWindow):
     def scan_finished(self, image_cube, _fields, _signals, stopped):
         self.image_cube = image_cube
         self.zero_field_running = False
+        # Emitted first so nothing below can prevent the magnet lock from
+        # being released. The worker has already finished cleanup_scan()
+        # (magnet.disable()) by the time finished_signal is sent.
+        self.run_finished.emit()
         self.widget.set_running_state(False)
         if image_cube is None:
             self.widget.status_label.setText("Status: Error")

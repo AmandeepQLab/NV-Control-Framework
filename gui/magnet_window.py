@@ -27,6 +27,8 @@ try:
         QTabWidget,
         QGroupBox,
         QComboBox,
+        QCheckBox,
+        QMessageBox,
     )
 except ImportError:
     try:
@@ -44,6 +46,8 @@ except ImportError:
             QTabWidget,
             QGroupBox,
             QComboBox,
+            QCheckBox,
+            QMessageBox,
         )
     except ImportError:
         from PyQt5.QtWidgets import (  # type: ignore[import]
@@ -60,14 +64,28 @@ except ImportError:
             QTabWidget,
             QGroupBox,
             QComboBox,
+            QCheckBox,
+            QMessageBox,
         )
 
 # GUI values are Gauss; Magnet/MagnetAxis and calibration remain in mT.
 _MT_TO_GAUSS = 10.0
 _GAUSS_TO_MT = 0.1
 
+# Post-experiment magnet actions (see on_experiment_finished()).
+POST_EXPERIMENT_FIELD_ZERO = "Field zero at diamond"
+POST_EXPERIMENT_ELECTRICAL_OFF = "Electrical off"
+
+_SWEPT_OVERRIDE_WARNING = (
+    "This experiment is actively sweeping the magnet field. "
+    "Manual commands will conflict with it and corrupt your data."
+)
+_STATIC_OVERRIDE_WARNING = "Changing the field will affect your measurement."
+
 
 class MagnetControlWindow(QMainWindow):
+
+    _VECTOR_BOX_TITLE = "Commanded / Model Magnet Vector"
 
     # =====================================================
     # INITIALIZATION
@@ -82,6 +100,16 @@ class MagnetControlWindow(QMainWindow):
 
         self.setWindowTitle("Magnet Control")
         self.resize(650, 500)
+
+        # Experiment lock state, driven by MainWindow's experiment_started/
+        # experiment_finished signals. None means no experiment is running.
+        # Set before build_ui(): update_power_button() reads it.
+        self._experiment_name = None
+        self._magnet_is_swept = False
+        self._override_active = False
+        # Commanded (x, y, z) mT from a running Zero Field scan, shown in the
+        # vector display instead of magnet.get_vector() while it runs.
+        self._live_vector_mT = None
 
         self.build_ui()
         self.connect_signals()
@@ -112,6 +140,43 @@ class MagnetControlWindow(QMainWindow):
         power_layout.addWidget(self.power_button)
 
         main_layout.addLayout(power_layout)
+
+        # =================================================
+        # EXPERIMENT LOCK
+        # =================================================
+        # Outside the tabs so the lock state is visible from either tab.
+
+        lock_box = QGroupBox("Experiment Lock")
+
+        lock_layout = QVBoxLayout(lock_box)
+
+        self.lock_label = QLabel("")
+        self.lock_label.setWordWrap(True)
+        self.lock_label.setVisible(False)
+        lock_layout.addWidget(self.lock_label)
+
+        self.override_check = QCheckBox("Allow manual control during experiment")
+        self.override_check.setChecked(False)
+        # Only meaningful while an experiment is running.
+        self.override_check.setVisible(False)
+        lock_layout.addWidget(self.override_check)
+
+        post_layout = QHBoxLayout()
+        post_layout.addWidget(QLabel("After experiment:"))
+        self.post_experiment_combo = QComboBox()
+        self.post_experiment_combo.addItems(
+            [POST_EXPERIMENT_FIELD_ZERO, POST_EXPERIMENT_ELECTRICAL_OFF]
+        )
+        self.post_experiment_combo.setCurrentText(POST_EXPERIMENT_FIELD_ZERO)
+        self.post_experiment_combo.setToolTip(
+            "Applies to static-field experiments (e.g. ODMR). After a Zero Field "
+            "scan the magnet is always turned off by the experiment itself."
+        )
+        post_layout.addWidget(self.post_experiment_combo)
+        post_layout.addStretch()
+        lock_layout.addLayout(post_layout)
+
+        main_layout.addWidget(lock_box)
 
         polarity_layout = QHBoxLayout()
         self.polarity_labels = {}
@@ -249,11 +314,11 @@ class MagnetControlWindow(QMainWindow):
         # CURRENT MAGNET VECTOR
         # =====================================================
 
-        vector_box = QGroupBox("Commanded / Model Magnet Vector")
+        self.vector_box = QGroupBox(self._VECTOR_BOX_TITLE)
 
-        layout.addWidget(vector_box)
+        layout.addWidget(self.vector_box)
 
-        vector_layout = QFormLayout(vector_box)
+        vector_layout = QFormLayout(self.vector_box)
 
         self.bx_label = QLabel("0.000 G")
         self.by_label = QLabel("0.000 G")
@@ -400,11 +465,18 @@ class MagnetControlWindow(QMainWindow):
             self.toggle_power
         )
 
+        self.override_check.toggled.connect(
+            self._on_override_toggled
+        )
+
     # =====================================================
     # MAGNET POWER
     # =====================================================
 
     def toggle_power(self):
+
+        if not self._commands_allowed():
+            return
 
         try:
 
@@ -455,7 +527,135 @@ class MagnetControlWindow(QMainWindow):
                 "background-color: lightgray;"
             )
 
-        self.zero_button.setEnabled(self.magnet.is_enabled())
+        self._apply_command_lock()
+
+    # =====================================================
+    # EXPERIMENT LOCK
+    # =====================================================
+    # GUI-layer only: prevents this window from issuing magnet commands
+    # that would interleave with a running experiment's own. No lock exists
+    # in hardware/magnet/ by design (see CLAUDE.md).
+
+    def _commands_allowed(self):
+        return self._experiment_name is None or self._override_active
+
+    def _apply_command_lock(self):
+        """Enable command controls per lock state; readouts stay enabled."""
+        allowed = self._commands_allowed()
+        self.power_button.setEnabled(allowed)
+        self.apply_button.setEnabled(allowed)
+        # Magnetic Zero additionally requires powered coils, as before.
+        self.zero_button.setEnabled(allowed and self.magnet.is_enabled())
+
+    def _set_override_checked(self, checked):
+        """Change the checkbox without re-entering _on_override_toggled."""
+        self.override_check.blockSignals(True)
+        try:
+            self.override_check.setChecked(checked)
+        finally:
+            self.override_check.blockSignals(False)
+
+    def on_experiment_started(self, experiment_name, magnet_is_swept):
+        """Lock command controls while an experiment runs.
+
+        Also called when the running set changes (MainWindow re-announces
+        the combined state), so it always re-locks and clears any override.
+        """
+        self._experiment_name = experiment_name
+        self._magnet_is_swept = bool(magnet_is_swept)
+        self._override_active = False
+        self._set_override_checked(False)
+        self.override_check.setVisible(True)
+        self.lock_label.setText(f"Magnet locked — {experiment_name} running")
+        self.lock_label.setVisible(True)
+        self._apply_command_lock()
+
+    def on_experiment_finished(self):
+        """Unlock unconditionally, then apply the post-experiment action."""
+        if self._experiment_name is None:
+            return
+        self._override_active = False
+        self._set_override_checked(False)
+        self.override_check.setVisible(False)
+        self._experiment_name = None
+        self._magnet_is_swept = False
+        self.lock_label.setText("")
+        self.lock_label.setVisible(False)
+        self._live_vector_mT = None
+        self.vector_box.setTitle(self._VECTOR_BOX_TITLE)
+        self._apply_command_lock()
+        self._run_post_experiment_action()
+        self.update_display()
+
+    def _on_override_toggled(self, checked):
+        if self._experiment_name is None:
+            # Not shown when idle; ignore any programmatic toggle.
+            self._set_override_checked(False)
+            return
+        if checked:
+            message = (
+                _SWEPT_OVERRIDE_WARNING
+                if self._magnet_is_swept
+                else _STATIC_OVERRIDE_WARNING
+            )
+            reply = QMessageBox.warning(
+                self,
+                "Manual Magnet Control",
+                message,
+                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if reply != QMessageBox.StandardButton.Ok:
+                self._set_override_checked(False)
+                return
+            self._override_active = True
+            self.lock_label.setText(
+                f"Manual override active — {self._experiment_name} running"
+            )
+        else:
+            self._override_active = False
+            self.lock_label.setText(f"Magnet locked — {self._experiment_name} running")
+        self._apply_command_lock()
+
+    def _run_post_experiment_action(self):
+        """Apply the selected post-experiment state, if the magnet is on.
+
+        Skipped silently when the magnet is not enabled -- including after a
+        Zero Field scan, whose own cleanup already disabled it.
+        """
+        if not self.magnet.is_enabled():
+            return
+        action = self.post_experiment_combo.currentText()
+        try:
+            if action == POST_EXPERIMENT_ELECTRICAL_OFF:
+                self.magnet.disable()
+                self.status_label.setText(
+                    "After experiment: magnet de-energized, outputs off."
+                )
+            else:
+                self.magnet.set_vector(bx=0.0, by=0.0, bz=0.0)
+                self.status_label.setText(
+                    "After experiment: calibrated 0 G commanded on all axes; "
+                    "compensation currents may be nonzero."
+                )
+        except Exception as err:
+            self.status_label.setText(f"After-experiment action failed: {err}")
+
+    def update_field_display(self, x_mT, y_mT, z_mT):
+        """Show a running Zero Field scan's commanded vector, read-only.
+
+        Ignored when no experiment is running, so the display keeps its
+        normal behaviour outside a scan.
+        """
+        if self._experiment_name is None:
+            return
+        self._live_vector_mT = {"x": x_mT, "y": y_mT, "z": z_mT}
+        self.vector_box.setTitle(
+            f"Commanded Magnet Vector (live: {self._experiment_name})"
+        )
+        self.bx_label.setText(self.field_text(x_mT))
+        self.by_label.setText(self.field_text(y_mT))
+        self.bz_label.setText(self.field_text(z_mT))
 
     @staticmethod
     def polarity_text(polarity):
@@ -527,7 +727,11 @@ class MagnetControlWindow(QMainWindow):
             axis.get_supply_range()
         )
 
-        vector = self.magnet.get_vector()
+        vector = (
+            self._live_vector_mT
+            if self._live_vector_mT is not None
+            else self.magnet.get_vector()
+        )
 
         self.bx_label.setText(self.field_text(vector['x']))
 
@@ -573,6 +777,9 @@ class MagnetControlWindow(QMainWindow):
 
     def apply_field(self):
 
+        if not self._commands_allowed():
+            return
+
         if not self.magnet.is_enabled():
 
             self.status_label.setText(
@@ -606,6 +813,9 @@ class MagnetControlWindow(QMainWindow):
     # =====================================================
 
     def zero_field(self):
+
+        if not self._commands_allowed():
+            return
 
         if not self.magnet.is_enabled():
             self.status_label.setText("Turn magnet power ON to command calibrated magnetic zero.")

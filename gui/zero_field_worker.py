@@ -45,6 +45,10 @@ class ZeroFieldWorker(QObject):
     scan_completed_signal = pyqtSignal(object, int, int)
     finished_signal = pyqtSignal(object, object, object, bool)
     error_signal = pyqtSignal(str)
+    # Full commanded 3-axis vector (x_mT, y_mT, z_mT) for each stored point:
+    # the swept axis's requested value plus the non-swept axes' resolved
+    # values. Commanded targets, not measurements.
+    field_updated = pyqtSignal(float, float, float)
 
     def __init__(
         self,
@@ -246,6 +250,16 @@ class ZeroFieldWorker(QObject):
             np.asarray(self._fields), np.asarray(self._signals)
         )
         self.progress_signal.emit(len(self._fields), self.config["field_points"])
+
+        configured_mT = getattr(self.experiment, "_configured_field_mT", None)
+        if configured_mT is not None:
+            vector_mT = dict(configured_mT)
+            # Same G -> mT conversion as ZeroFieldExperiment.set_scan_point().
+            vector_mT[self.experiment.field_axis.lower()] = float(field) * 0.1
+            if all(vector_mT[axis] is not None for axis in ("x", "y", "z")):
+                self.field_updated.emit(
+                    float(vector_mT["x"]), float(vector_mT["y"]), float(vector_mT["z"])
+                )
 
     @staticmethod
     def _compute_live_fluorescence(averaged_image):

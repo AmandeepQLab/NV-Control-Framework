@@ -9,8 +9,10 @@ from PyQt6.QtWidgets import ( # type: ignore
     QDoubleSpinBox, QSpinBox, QGridLayout,
     QGroupBox, QMessageBox
 )
-from PyQt6.QtCore import QSignalBlocker, QTimer # type: ignore
+from PyQt6.QtCore import QSignalBlocker, QTimer, pyqtSignal # type: ignore
 from gui.magnet_window import MagnetControlWindow
+from experiments.odmr_experiment import ODMRExperiment
+from experiments.zero_field_experiment import ZeroFieldExperiment
 from config.config_manager import ConfigManager
 from hardware.hardware_manager import HardwareManager
 from gui.odmr_window import ODMRWindow
@@ -33,8 +35,21 @@ from utils.camera_diagnostics import log_event
 
 class MainWindow(QMainWindow):
 
+    # Experiment lifetime, relayed to MagnetControlWindow's command lock.
+    # experiment_started carries (experiment_name, magnet_is_swept), where
+    # magnet_is_swept is the experiment class's MAGNET_IS_SWEPT constant.
+    # With several experiments running at once it is re-emitted with the
+    # combined state, and experiment_finished fires only when none remain.
+    experiment_started = pyqtSignal(str, bool)
+    experiment_finished = pyqtSignal()
+
     def __init__(self, sim=False):
         super().__init__()
+
+        # Running experiments, keyed by the window that started them:
+        # window -> (experiment_name, magnet_is_swept).
+        self._running_experiments = {}
+        self.magnet_window = None
 
         self.setWindowTitle("NV Control")
         self.resize(1600, 800)
@@ -429,7 +444,7 @@ class MainWindow(QMainWindow):
 
     def open_magnet_window(self):
 
-        if hasattr(self, "magnet_window"):
+        if self.magnet_window is not None:
 
             self.magnet_window.raise_()
 
@@ -441,6 +456,15 @@ class MainWindow(QMainWindow):
             self.hardware
         )
 
+        self.experiment_started.connect(self.magnet_window.on_experiment_started)
+        self.experiment_finished.connect(self.magnet_window.on_experiment_finished)
+        # Opened mid-experiment: start locked rather than waiting for the
+        # next start/finish transition.
+        if self._running_experiments:
+            self.magnet_window.on_experiment_started(
+                *self._combined_experiment_state()
+            )
+
         self.magnet_window.show()
 
         self.magnet_window.destroyed.connect(
@@ -450,6 +474,34 @@ class MainWindow(QMainWindow):
                 None
             )
         )
+
+    # =========================================================
+    # EXPERIMENT LIFETIME (magnet control lock)
+    # =========================================================
+
+    def _combined_experiment_state(self):
+        """(name, magnet_is_swept) summarizing every running experiment."""
+        entries = list(self._running_experiments.values())
+        name = " + ".join(entry_name for entry_name, _ in entries)
+        return name, any(swept for _, swept in entries)
+
+    def _experiment_window_started(self, window, name, magnet_is_swept):
+        self._running_experiments[window] = (name, bool(magnet_is_swept))
+        self.experiment_started.emit(*self._combined_experiment_state())
+
+    def _experiment_window_finished(self, window):
+        if self._running_experiments.pop(window, None) is None:
+            return
+        if self._running_experiments:
+            # Another experiment is still running: stay locked, but update
+            # the name/swept flag to what is still running.
+            self.experiment_started.emit(*self._combined_experiment_state())
+        else:
+            self.experiment_finished.emit()
+
+    def _relay_zero_field_vector(self, x_mT, y_mT, z_mT):
+        if self.magnet_window is not None:
+            self.magnet_window.update_field_display(x_mT, y_mT, z_mT)
 
     # =========================================================
     # STATE
@@ -832,6 +884,16 @@ class MainWindow(QMainWindow):
             acquisition_state_getter=self.get_acquisition_state,
         )
 
+        window = self.odmr_window
+        window.run_started.connect(
+            lambda: self._experiment_window_started(
+                window, "ODMR", ODMRExperiment.MAGNET_IS_SWEPT
+            )
+        )
+        window.run_finished.connect(
+            lambda: self._experiment_window_finished(window)
+        )
+
         self.odmr_window.show()
     # =====================================================
     # ZERO-FIELD IMAGING WINDOW
@@ -859,6 +921,16 @@ class MainWindow(QMainWindow):
             acquisition_state_getter=self.get_acquisition_state,
 
         )
+        window = self.zero_field_window
+        window.run_started.connect(
+            lambda: self._experiment_window_started(
+                window, "Zero Field", ZeroFieldExperiment.MAGNET_IS_SWEPT
+            )
+        )
+        window.run_finished.connect(
+            lambda: self._experiment_window_finished(window)
+        )
+        window.field_updated.connect(self._relay_zero_field_vector)
 
         self.zero_field_window.show()
     # =========================================================

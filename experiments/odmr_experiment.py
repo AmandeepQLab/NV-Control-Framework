@@ -19,6 +19,11 @@ class ODMRExperiment(ScanExperiment):
     scan_axis_name = "frequency"
     scan_axis_unit = "Hz"
 
+    # ODMR never commands the magnet; whatever bias field is set stays put
+    # for the whole scan. Read by MainWindow when announcing a run, so
+    # MagnetControlWindow can warn accordingly (see CLAUDE.md).
+    MAGNET_IS_SWEPT = False
+
     def __init__(self, hardware, config, acquisition_roi=None):
 
         super().__init__(hardware, config)

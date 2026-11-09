@@ -201,6 +201,34 @@ class ZeroFieldWindowSaveToggleTests(unittest.TestCase):
             loaded = ImageCube.load(written[0])
             np.testing.assert_allclose(loaded.data, cube.data)
 
+    def test_start_scan_announces_run_before_thread_starts(self):
+        # Magnet control lock (see CLAUDE.md): run_started must be emitted
+        # before the worker thread can send any magnet command.
+        window = self.window
+        events = []
+        window.run_started.connect(lambda: events.append("run_started"))
+        with patch.object(QMessageBox, "warning"):
+            window.widget.save_data_check.setChecked(False)
+        with patch("gui.zero_field_window.ZeroFieldWorker"), patch(
+            "gui.zero_field_window.QThread"
+        ) as thread_class:
+            thread_class.return_value.start.side_effect = (
+                lambda: events.append("thread_start")
+            )
+            window.start_scan()
+        window.run_started.disconnect()
+        self.assertEqual(events, ["run_started", "thread_start"])
+
+    def test_scan_finished_announces_run_end_once(self):
+        window = self.window
+        window.zero_field_running = True
+        finished = []
+        window.run_finished.connect(lambda: finished.append(True))
+        window.scan_finished(None, [], [], True)
+        window.run_finished.disconnect()
+        self.assertEqual(finished, [True])
+        self.assertFalse(window.zero_field_running)
+
     def test_save_button_reports_nothing_to_save(self):
         window = self.window
         with patch.object(QMessageBox, "critical") as critical:

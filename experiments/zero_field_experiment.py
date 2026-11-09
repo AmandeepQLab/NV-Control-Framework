@@ -29,6 +29,11 @@ class ZeroFieldExperiment(ScanExperiment):
     scan_axis_name = "Magnetic Field"
     scan_axis_unit = "G"
 
+    # This experiment commands the magnet itself on every scan point. Read
+    # by MainWindow when announcing a run, so MagnetControlWindow can warn
+    # that manual commands would conflict with the sweep (see CLAUDE.md).
+    MAGNET_IS_SWEPT = True
+
     def __init__(
         self,
         hardware_manager,
