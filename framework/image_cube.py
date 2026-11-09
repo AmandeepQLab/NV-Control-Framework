@@ -7,11 +7,15 @@ Standard container for widefield imaging data.
 """
 
 import json
+import logging
 import zipfile
 from pathlib import Path
 
 import h5py
 import numpy as np
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 # Datasets/attributes not backed by ``ImageCube`` fields (all bookkeeping
@@ -54,7 +58,16 @@ class ImageCube:
         scan_axis_name=None,
         scan_axis_unit=None,
         scan_axis_values=None,
+        expected_planes=None,
     ):
+
+        # When the plane count is known upfront (a scan with a fixed number
+        # of points), add() fills a buffer allocated once on the first frame
+        # instead of re-concatenating the whole cube per frame, which costs
+        # O(N^2 * frame size) in copies. See add() and truncate().
+        self._expected_planes = (
+            int(expected_planes) if expected_planes and expected_planes > 0 else None
+        )
 
         self.data = data
 
@@ -72,9 +85,54 @@ class ImageCube:
             [] if scan_axis_values is None else scan_axis_values
         )
 
+    @property
+    def data(self):
+        """The acquired frames.
+
+        For a pre-allocated cube this is a view of only the planes filled so
+        far, never the unfilled remainder of the buffer -- so callers that
+        count frames with ``data.shape[0]`` (e.g. after a stopped scan) see
+        exactly what was acquired, with no copy.
+        """
+        if self._count is None or self._data is None:
+            return self._data
+        return self._data[:self._count]
+
+    @data.setter
+    def data(self, value):
+        # Assigning data directly replaces any pre-allocated buffer; the
+        # cube then behaves like one constructed from that data.
+        self._data = value
+        self._count = None
+
     def add(self, frame):
         """Append one acquired frame along the leading scan dimension."""
         frame = np.asarray(frame)
+
+        if self._expected_planes is not None and self._data is None:
+            # First frame reveals the per-plane shape: allocate once.
+            self._data = np.empty(
+                (self._expected_planes,) + frame.shape, dtype=np.float64
+            )
+            self._count = 0
+
+        if self._count is not None:
+            if self._data.shape[1:] != frame.shape:
+                raise ValueError(
+                    "All ImageCube frames must have the same shape."
+                )
+            if self._count < len(self._data):
+                self._data[self._count] = frame
+                self._count += 1
+                return
+            # More frames than declared: keep going rather than crash, but
+            # say so -- from here on each frame copies the cube again.
+            LOGGER.warning(
+                "ImageCube received more than its expected %d planes; "
+                "falling back to per-frame concatenation.",
+                self._expected_planes,
+            )
+            self.data = self._data[:self._count]
 
         if self.data is None:
             self.data = frame[np.newaxis, ...]
@@ -92,6 +150,29 @@ class ImageCube:
             )
 
         self.data = np.concatenate((self.data, frame[np.newaxis, ...]), axis=0)
+
+    def truncate(self, n):
+        """Keep only the first *n* acquired planes of a pre-allocated cube.
+
+        For a scan stopped early. ``data`` already hides unfilled planes, so
+        this exists to release the unused part of the buffer: the kept planes
+        are copied into an exactly-sized array (a slice would be a view that
+        keeps the whole buffer alive). No-op when nothing would be dropped,
+        and for a cube that was never pre-allocated (concatenation already
+        sizes it exactly).
+        """
+        if self._count is None or self._data is None:
+            return
+        n = max(0, min(int(n), self._count))
+        if n == len(self._data):
+            return
+        if n == 0:
+            # Match a cube that never received a frame.
+            self._data = None
+            self._count = None
+            return
+        self._data = self._data[:n].copy()
+        self._count = n
 
     # =====================================================
     # DATA PROPERTIES

@@ -584,11 +584,14 @@ class ZeroFieldExperiment(ScanExperiment):
         self.state = self.RUNNING
         self.start_time = time.time()
         self.scan_signal = []
+        # field_points is the length of the linspace setup_scan() builds, so
+        # the cube is allocated once instead of re-copied on every point.
         self.image_cube = ImageCube(
             data=None,
             scan_axis_name=self.scan_axis_name,
             scan_axis_unit=self.scan_axis_unit,
             scan_axis_values=[],
+            expected_planes=self.field_points,
         )
         self._stream_writer = None
         self._last_scan_stream_path = None
@@ -696,6 +699,9 @@ class ZeroFieldExperiment(ScanExperiment):
                         metadata["field_values_gauss"]
                     )[:frame_count]
                 self.image_cube.metadata = metadata
+            # Release the unfilled part of the pre-allocated buffer after an
+            # early stop. No-op for a complete sweep.
+            self.image_cube.truncate(frame_count)
             if self._stream_writer is not None:
                 writer = self._stream_writer
                 self._stream_writer = None

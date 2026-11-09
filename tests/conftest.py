@@ -20,6 +20,7 @@ ALLOWED_FILES = frozenset(
         "test_camera_ownership.py",
         "test_odmr_acquisition_roi.py",
         "test_exposure_propagation.py",
+        "test_image_cube_preallocation.py",
         "test_magnet_scpi_traffic.py",
         "test_magnet_experiment_lock.py",
         "test_magnet_independent_polarity.py",
