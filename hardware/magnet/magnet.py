@@ -80,8 +80,16 @@ class Magnet:
         self.electrical_zero()
 
     def set_vector(self, bx=0.0, by=0.0, bz=0.0):
-        """Command signed total fields in mT independently on all three axes."""
+        """Command signed total fields in mT independently on all three axes.
+
+        Returns a frozenset of the axis names ("X"/"Y"/"Z") whose polarity
+        relay flipped during this call, frozenset() if none. During
+        set_vector() an axis's direction only changes inside
+        MagnetAxis._switch_polarity() (the zero/off/discharge/switch/settle/
+        on sequence), so a changed direction means that sequence ran.
+        """
         values = (bx, by, bz)
+        flipped = set()
         timing = self._timing_enabled
         start = time.perf_counter() if timing else None
         # A bad target must not cause a partially applied vector through validation.
@@ -92,11 +100,15 @@ class Magnet:
         for axis, value in zip(self.axes, values):
             # enable()/zero() diagnostics do not belong to this vector command.
             axis.pop_timing_log()
+            direction_before = axis.direction
             wrote = axis.set_field(value, keep_output_enabled=True)
+            if axis.direction != direction_before:
+                flipped.add(axis.name)
             if timing:
                 for stage, duration in axis.pop_timing_log():
                     self._timing_log.append((f"axis_{axis.name}_{stage}", duration))
             self._pace_after_write(wrote, axis.name, timing)
+        return frozenset(flipped)
 
     def _pace_after_write(self, wrote, axis_name, timing):
         """Preserve pacing after real writes; a cached point never sleeps."""

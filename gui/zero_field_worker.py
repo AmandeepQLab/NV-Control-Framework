@@ -99,6 +99,7 @@ class ZeroFieldWorker(QObject):
                 field_points=self.config["field_points"],
                 field_axis=self.config["field_axis"],
                 settling_time_ms=self.config["settling_time_ms"],
+                post_flip_settling_ms=self.config.get("post_flip_settling_ms", 0.0),
                 averages=self.config["averages"],
                 acquisition_roi=self.acquisition_roi,
                 metadata=self.metadata,

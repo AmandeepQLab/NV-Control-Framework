@@ -86,6 +86,14 @@ class ZeroFieldWidget(QWidget):
             "coil/sample, decrease if scans are too slow and results look "
             "unaffected."
         )
+        self.post_flip_settling_spin = self._add_int(
+            field_layout, "Post-flip extra settling (ms)", 0, 60000, 500
+        )
+        self.post_flip_settling_spin.setToolTip(
+            "Extra settling time applied after a polarity relay flip on any "
+            "axis. Relay flips occur near field zero; the coil current is cut "
+            "and restored, requiring longer settling than an incremental step."
+        )
         self.averages_spin = self._add_int(
             field_layout, "Number of Averages:", 1, 100000, 1
         )
@@ -246,6 +254,7 @@ class ZeroFieldWidget(QWidget):
             "field_points": self.field_points_spin.value(),
             "field_axis": self.field_axis_combo.currentText(),
             "settling_time_ms": self.settling_time_spin.value(),
+            "post_flip_settling_ms": self.post_flip_settling_spin.value(),
             "averages": self.averages_spin.value(),
             "averaging_enabled": self.averaging_enabled_check.isChecked(),
             "num_scans": self.num_scans_spin.value(),

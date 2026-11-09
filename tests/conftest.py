@@ -37,6 +37,7 @@ ALLOWED_FILES = frozenset(
         "test_zero_field_averaging.py",
         "test_zero_field_averaging_module.py",
         "test_zero_field_software_acquisition.py",
+        "test_zero_field_relay_flips.py",
         "test_zero_field_timing.py",
         "test_zero_field_window_save_toggle.py",
     }

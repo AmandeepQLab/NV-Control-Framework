@@ -59,6 +59,7 @@ class ZeroFieldExperiment(ScanExperiment):
         stream_path_is_output=False,
         timing_diagnostics=False,
         check_power_supply_errors=False,
+        post_flip_settling_ms=0.0,
     ):
         config = {
             "settling_time_ms": settling_time_ms,
@@ -85,6 +86,9 @@ class ZeroFieldExperiment(ScanExperiment):
             raise ValueError("save_raw_scans must be a boolean.")
         if not isinstance(zero_other_axes, bool):
             raise ValueError("zero_other_axes must be a boolean.")
+        post_flip_settling_ms = float(post_flip_settling_ms)
+        if not np.isfinite(post_flip_settling_ms) or post_flip_settling_ms < 0:
+            raise ValueError("post_flip_settling_ms must be non-negative and finite.")
 
         self.hardware_manager = hardware_manager
         self.camera = camera
@@ -138,6 +142,20 @@ class ZeroFieldExperiment(ScanExperiment):
         self.latest_field = None
         self.latest_image = None
         self._acquisition_started_at = None
+
+        # Polarity relay flips (see Magnet.set_vector()'s return value).
+        # Extra settling applied after any point whose field command flipped
+        # a relay -- _switch_polarity() cuts and restores coil current, a far
+        # larger transient than an incremental step.
+        self.post_flip_settling_ms = post_flip_settling_ms
+        # One entry per acquired point of the current sweep, reset per sweep
+        # and written to metadata as relay_flip_occurred / relay_flip_axes.
+        self.relay_flip_occurred = []
+        self.relay_flip_axes = []
+        # Flips caused by setup_scan()'s own set_vector(), folded into point
+        # 0: they happen immediately before point 0's command, with no
+        # settling in between, so point 0 is the point they affect.
+        self._setup_flip_axes = frozenset()
 
         # Whether this run successfully armed the camera's held-open
         # software acquisition (see run()/acquire_frame()) -- mirrors
@@ -295,11 +313,11 @@ class ZeroFieldExperiment(ScanExperiment):
             # attributed to point 0).
             timing = self._timing
             t0 = time.perf_counter() if timing else None
-            self.magnet.set_vector(
+            self._setup_flip_axes = self._as_flip_set(self.magnet.set_vector(
                 bx=resolved_field_mT["x"],
                 by=resolved_field_mT["y"],
                 bz=resolved_field_mT["z"],
-            )
+            ))
             if timing:
                 self._merge_magnet_log(t0 - self._timing_epoch)
         else:
@@ -348,19 +366,53 @@ class ZeroFieldExperiment(ScanExperiment):
         self.magnet.disable()
 
     def set_scan_point(self, value):
-        # Apply magnetic field/current for this measurement point.
+        """Apply the field for this point; return the axes whose relay flipped."""
         fields_mT = dict(self._configured_field_mT)
         fields_mT[self.field_axis.lower()] = value * 0.1
 
         timing = self._timing
         t0 = time.perf_counter() if timing else None
-        self.magnet.set_vector(
+        flipped = self.magnet.set_vector(
             bx=fields_mT["x"],
             by=fields_mT["y"],
             bz=fields_mT["z"],
         )
         if timing:
             self._merge_magnet_log(t0 - self._timing_epoch)
+        return self._as_flip_set(flipped)
+
+    @staticmethod
+    def _as_flip_set(flipped):
+        """Normalize set_vector()'s return value; magnet doubles without the
+        flip report (returning None or a Mock) count as no flip."""
+        return frozenset(flipped) if isinstance(flipped, (set, frozenset)) else frozenset()
+
+    def _relay_flip_metadata(self):
+        return {
+            "relay_flip_occurred": [bool(f) for f in self.relay_flip_occurred],
+            "relay_flip_axes": [",".join(sorted(a)) for a in self.relay_flip_axes],
+        }
+
+    @staticmethod
+    def _merge_relay_flips(averaged_cube, acquired_cube):
+        """Fold one completed scan's flips into the multi-scan average: a
+        point is flagged if a flip preceded it in any averaged scan, with
+        the union of the axes involved."""
+        average = averaged_cube.metadata
+        current = acquired_cube.metadata
+        if "relay_flip_occurred" not in average or "relay_flip_occurred" not in current:
+            return
+        occurred = [
+            bool(a or b)
+            for a, b in zip(average["relay_flip_occurred"], current["relay_flip_occurred"])
+        ]
+        axes = [
+            ",".join(sorted(set(filter(None, a.split(","))) | set(filter(None, b.split(",")))))
+            for a, b in zip(average["relay_flip_axes"], current["relay_flip_axes"])
+        ]
+        averaged_cube.metadata = {
+            **average, "relay_flip_occurred": occurred, "relay_flip_axes": axes,
+        }
 
     def acquire_frame(self):
         """Acquire and average all fluorescence frames at one field point.
@@ -502,6 +554,7 @@ class ZeroFieldExperiment(ScanExperiment):
                             self._update_running_average(
                                 averaged_cube.data, acquired_cube.data, completed_scans
                             )
+                            self._merge_relay_flips(averaged_cube, acquired_cube)
                         LOGGER.info("Running average updated.")
 
                         if stream_path is not None and self.stream_path_is_output:
@@ -595,6 +648,9 @@ class ZeroFieldExperiment(ScanExperiment):
         )
         self._stream_writer = None
         self._last_scan_stream_path = None
+        self.relay_flip_occurred = []
+        self.relay_flip_axes = []
+        self._setup_flip_axes = frozenset()
 
         # Set before setup_scan() (not just in the point loop below) so
         # setup_scan()'s own magnet.set_vector() call -- when
@@ -633,7 +689,10 @@ class ZeroFieldExperiment(ScanExperiment):
                 point_t0 = time.perf_counter() if timing else None
 
                 # Apply magnetic field/current.
-                self.set_scan_point(field)
+                flipped = (
+                    self._as_flip_set(self.set_scan_point(field)) | self._setup_flip_axes
+                )
+                self._setup_flip_axes = frozenset()
 
                 # Wait for field stabilization.
                 if self.settling_time_ms > 0:
@@ -642,11 +701,21 @@ class ZeroFieldExperiment(ScanExperiment):
                     if timing:
                         self._record_timing("settling_sleep", None, t0)
 
+                # A relay flip cut and restored coil current: wait longer.
+                # Like the settling sleep above, not interruptible by stop.
+                if flipped and self.post_flip_settling_ms > 0:
+                    t0 = time.perf_counter() if timing else None
+                    time.sleep(self.post_flip_settling_ms / 1000.0)
+                    if timing:
+                        self._record_timing("post_flip_settling_sleep", None, t0)
+
                 # Acquire averaged fluorescence image.
                 averaged_image = self.acquire_frame()
 
                 # Store measurement exactly once for this field value.
                 self.image_cube.add(averaged_image)
+                self.relay_flip_occurred.append(bool(flipped))
+                self.relay_flip_axes.append(flipped)
                 if self._stream_writer is not None:
                     t0 = time.perf_counter() if timing else None
                     self._stream_writer.write_plane(point_index, averaged_image)
@@ -702,6 +771,11 @@ class ZeroFieldExperiment(ScanExperiment):
             # Release the unfilled part of the pre-allocated buffer after an
             # early stop. No-op for a complete sweep.
             self.image_cube.truncate(frame_count)
+            # One flip entry per stored frame, like field_values_gauss.
+            del self.relay_flip_occurred[frame_count:]
+            del self.relay_flip_axes[frame_count:]
+            flip_metadata = self._relay_flip_metadata()
+            self.image_cube.metadata = {**self.image_cube.metadata, **flip_metadata}
             if self._stream_writer is not None:
                 writer = self._stream_writer
                 self._stream_writer = None
@@ -709,7 +783,9 @@ class ZeroFieldExperiment(ScanExperiment):
                 # a cooperative stop and a crash both leave it False, so
                 # stopped_by_user is what distinguishes intent from failure.
                 swept_fully = len(self.scan_signal) == len(self.scan_vector)
-                writer.update_metadata({"stopped_by_user": bool(self.stop_requested)})
+                writer.update_metadata(
+                    {"stopped_by_user": bool(self.stop_requested), **flip_metadata}
+                )
                 if swept_fully:
                     writer.finalize()
                 else:
@@ -789,6 +865,7 @@ class ZeroFieldExperiment(ScanExperiment):
                 "field_start_gauss": self.field_start,
                 "field_stop_gauss": self.field_stop,
                 "settling_time_ms": self.settling_time_ms,
+                "post_flip_settling_ms": self.post_flip_settling_ms,
                 "averages_per_point": self.averages,
                 "camera_model": type(self.camera).__name__,
                 "zero_other_axes": self.zero_other_axes,
