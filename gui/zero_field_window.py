@@ -131,6 +131,11 @@ class ZeroFieldWindow(QMainWindow):
     def start_scan(self):
         config = self.widget.get_config()
 
+        # Reject an unreachable sweep before any state changes, any thread
+        # exists, or any hardware is touched.
+        if not self._preflight_field_range(config):
+            return
+
         # Checked before anything else -- no hardware is touched and no
         # worker/thread is created until the destination is confirmed usable.
         # Skipped entirely when saving is off: there is no destination.
@@ -220,6 +225,67 @@ class ZeroFieldWindow(QMainWindow):
         # the worker can send any magnet command.
         self.run_started.emit()
         self.thread.start()
+
+    def _preflight_field_range(self, config):
+        """Return False (after telling the user) if the sweep can't be reached.
+
+        Runs MagnetAxis.plan_field() -- pure calculation, no I/O -- for the
+        vector at each sweep endpoint: the swept axis at field_start/field_stop
+        and the other axes at 0.0 mT (this window always zeroes them). This is
+        the same check Magnet.set_vector() makes per point mid-scan. Required
+        current on a branch is |target - intercept| / ratio, so over a linear
+        sweep its maximum is at an endpoint; checking both endpoints covers
+        every point in between.
+
+        Only ValueError blocks the scan: that is what plan_field() raises for
+        an out-of-range or non-finite target. Its RuntimeErrors concern relay
+        state, notably "unsynchronized relay" before the magnet's first
+        enable(), which the scan's own setup_scan() resolves -- blocking on
+        those would refuse every first scan after launch.
+        """
+        swept = config["field_axis"].lower()
+        for endpoint_gauss in (config["field_start"], config["field_stop"]):
+            for name in ("x", "y", "z"):
+                target_mT = endpoint_gauss * 0.1 if name == swept else 0.0
+                try:
+                    getattr(self.magnet, name).plan_field(target_mT)
+                except ValueError as error:
+                    QMessageBox.critical(
+                        self,
+                        "Field range out of bounds",
+                        f"{error}\n\n"
+                        f"Requested sweep: {config['field_start']:g} G to "
+                        f"{config['field_stop']:g} G on {swept.upper()}.\n"
+                        f"{self._axis_limit_note(name)}",
+                    )
+                    return False
+                except RuntimeError:
+                    # Relay-state precondition, not a range problem; see docstring.
+                    continue
+        return True
+
+    def _axis_limit_note(self, name):
+        """Approximate reachable range of one axis, in Gauss, from its config."""
+        note = f"Check your calibration limits in setupInfo.json (Helmholtz.{name.upper()})."
+        try:
+            axis = getattr(self.magnet, name)
+            positive = axis.calibration["positive"]
+            negative = axis.calibration["negative"]
+            max_current = axis.max_current
+            upper_gauss = 10.0 * (
+                positive["magnetic_field_offset"]
+                + positive["magnetic_field_ratio"] * max_current
+            )
+            lower_gauss = 10.0 * (
+                negative["magnetic_field_offset"]
+                - negative["magnetic_field_ratio"] * max_current
+            )
+        except (AttributeError, KeyError, TypeError):
+            return note
+        return (
+            f"{name.upper()}-axis reachable range is about {lower_gauss:.1f} G to "
+            f"{upper_gauss:.1f} G (max_current {max_current:g} A). {note}"
+        )
 
     def stop_scan(self):
         if self.worker is not None:

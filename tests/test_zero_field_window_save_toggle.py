@@ -53,7 +53,23 @@ from framework.image_cube import ImageCube
 from gui.zero_field_window import ZeroFieldWindow
 
 
+class FakeAxis:
+    """Accepts any target; start_scan()'s field-range preflight calls this."""
+
+    max_current = 5.0
+    calibration = {
+        "positive": {"magnetic_field_ratio": 0.8, "magnetic_field_offset": 0.0},
+        "negative": {"magnetic_field_ratio": 0.8, "magnetic_field_offset": 0.0},
+    }
+
+    def plan_field(self, field_mT):
+        return 0.0, None, field_mT
+
+
 class FakeMagnet:
+    def __init__(self):
+        self.x, self.y, self.z = FakeAxis(), FakeAxis(), FakeAxis()
+
     def enable(self):
         pass
 
@@ -228,6 +244,70 @@ class ZeroFieldWindowSaveToggleTests(unittest.TestCase):
         window.run_finished.disconnect()
         self.assertEqual(finished, [True])
         self.assertFalse(window.zero_field_running)
+
+    def test_unreachable_stop_field_blocks_scan_before_thread(self):
+        window = self.window
+        widget = window.widget
+        widget.field_axis_combo.setCurrentText("X")
+        widget.field_start_spin.setValue(-2.0)
+        widget.field_stop_spin.setValue(500.0)
+        announced = []
+        window.run_started.connect(lambda: announced.append(True))
+
+        def plan_field(field_mT):
+            if abs(field_mT - 50.0) < 1e-9:  # 500 G stop -> 50 mT
+                raise ValueError("current exceeds max")
+            return 0.0, None, field_mT
+
+        with patch.object(window.magnet.x, "plan_field", side_effect=plan_field), \
+             patch.object(QMessageBox, "critical") as critical, \
+             patch("gui.zero_field_window.QThread") as thread_class, \
+             patch("gui.zero_field_window.ZeroFieldWorker") as worker_class:
+            window.start_scan()
+        window.run_started.disconnect()
+
+        thread_class.assert_not_called()
+        worker_class.assert_not_called()
+        self.assertIsNone(window.thread)
+        self.assertFalse(window.zero_field_running)
+        self.assertEqual(announced, [])
+        critical.assert_called_once()
+        _parent, title, text = critical.call_args.args
+        self.assertEqual(title, "Field range out of bounds")
+        self.assertIn("current exceeds max", text)
+        self.assertIn("setupInfo.json", text)
+        widget.field_stop_spin.setValue(2.0)
+
+    def test_preflight_with_real_magnet_limits_and_unsynchronized_relays(self):
+        # Real Magnet/MagnetAxis, never enabled: every relay is still
+        # unsynchronized, so plan_field() raises RuntimeError for any nonzero
+        # current. That must not block a reachable sweep (the scan's own
+        # setup_scan() enables the magnet), while an unreachable one must
+        # still be refused -- ValueError fires before the relay check.
+        from tests.test_magnetic_field_gui_units import _make_magnet
+
+        window = self.window
+        widget = window.widget
+        original_magnet = window.magnet
+        window.magnet = _make_magnet()  # X: 0.8 mT/A, 5 A -> about +41 G
+        try:
+            widget.field_axis_combo.setCurrentText("X")
+            widget.field_start_spin.setValue(-30.0)
+            widget.field_stop_spin.setValue(30.0)
+            with patch.object(QMessageBox, "critical") as critical:
+                self.assertTrue(window._preflight_field_range(widget.get_config()))
+            critical.assert_not_called()
+
+            widget.field_stop_spin.setValue(60.0)
+            with patch.object(QMessageBox, "critical") as critical:
+                self.assertFalse(window._preflight_field_range(widget.get_config()))
+            critical.assert_called_once()
+            self.assertIn("X-axis reachable range is about -39.4 G to 41.0 G",
+                          critical.call_args.args[2])
+        finally:
+            window.magnet = original_magnet
+            widget.field_start_spin.setValue(-2.0)
+            widget.field_stop_spin.setValue(2.0)
 
     def test_save_button_reports_nothing_to_save(self):
         window = self.window
