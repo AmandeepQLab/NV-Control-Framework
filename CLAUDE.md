@@ -63,6 +63,27 @@ Magnet startup coordinates the shared Pulse Streamer output bank: every axis wit
 
 Simulated classes have full method parity with their real counterparts, not just the methods currently called: `hardware/camera/sim_camera.py::SimCamera`, `hardware/microwave/sim_microwave.py::SimMicrowave`, `hardware/pulse_streamer/sim_pulse_streamer.py::SimPulseStreamer`, `hardware/power_supply/sim_power_supply.py::SimPowerSupply`. `SimCamera` can optionally be wired to the constructed microwave object (`SimCamera(microwave=...)`) so a simulated ODMR sweep produces a real Lorentzian dip — `HardwareManager` does this automatically in sim mode. `SimPulseStreamer` stores all three magnet relay states independently by channel; magnet simulation verifies control flow and contains no synthetic magnetic-field or Zero Field physics.
 
+## Display settings (`display` section of setupInfo.json)
+
+`config/setupInfo.json` has a `display` section with one colormap per image display, stored lowercase as the pyqtgraph/matplotlib name:
+
+```json
+"display": { "live_view_colormap": "gray", "zfe_colormap": "gray" }
+```
+
+- `live_view_colormap` — the main-window live view. The "Colormap:" combo sits directly above the image (`MainWindow.colormap_combo`).
+- `zfe_colormap` — the Zero Field image. The combo is `ZeroFieldWidget.colormap_combo` (in "Camera Acquisition"), which is the reference implementation.
+- There is **no `odmr_colormap`**: the ODMR window shows only a spectrum plot, with no image to colour. The separate ODMR analysis window's map has its own colormap list and is not persisted.
+
+Both selectors offer the same list: `gui/display_settings.py::COLORMAP_NAMES` (Gray, Viridis, Plasma, Inferno, Magma). A test keeps it equal to the ZFE widget's hard-coded items.
+
+- **Applies immediately**, with no scan or stream running. The live view sets the colormap on the `ImageView` LUT, which recolours the frame on screen and persists across `setImage()`. ZFE re-renders its retained display image, as it already did.
+- **Loaded at window construction**, without emitting a change signal, so startup neither renders nor writes. A missing or unknown value means Gray; a window built without a config (tests: `hardware_manager=None`) defaults to Gray and never saves.
+- **Saved on every change** via `save_colormap()`. It updates the in-memory `ConfigManager.config`, so a ZFE window opened later sees the latest choice.
+- **How the file is written.** Only the `display` block's text is rewritten (an atomic temp-file replace), so the rest of the file, formatting included, is byte-for-byte unchanged. If that targeted edit can't be verified to parse to the expected content, the file is re-serialised in full (same data, normalised formatting) and a warning is logged.
+- **Save failures** are logged, never raised.
+- Because the file is tracked, changing a colormap at the rig shows up as a working-tree change to `config/setupInfo.json`.
+
 ## Dead code — do not build on these
 
 Confirmed unused by the running application; each is either an abandoned duplicate or a stub with no subclasses:
@@ -135,7 +156,7 @@ These are characterized properties of the current rig/sample, not code facts —
 
 ## Testing safety — read before running pytest with `--hardware`
 
-`tests/` contains 92 test files (excluding `__init__.py`/`conftest.py`). Only 35 are real, hardware-free pytest tests — see `tests/conftest.py::ALLOWED_FILES` for the current, authoritative list rather than a copy here that will drift the next time a file is added to it (as just happened for this change). **The other ~57 are ad-hoc scripts that command real lab hardware — the Andor camera, the SG386 microwave source over VISA, the Swabian pulse streamer, the Helmholtz power supplies — unconditionally at module import time, not just inside a test function.** Several have no `if __name__ == "__main__":` guard at all: importing them fires a relay, streams a pulse, or turns on a power-supply output as a side effect of Python loading the file.
+`tests/` contains 93 test files (excluding `__init__.py`/`conftest.py`). Only 36 are real, hardware-free pytest tests — see `tests/conftest.py::ALLOWED_FILES` for the current, authoritative list rather than a copy here that will drift the next time a file is added to it (as just happened for this change). **The other ~57 are ad-hoc scripts that command real lab hardware — the Andor camera, the SG386 microwave source over VISA, the Swabian pulse streamer, the Helmholtz power supplies — unconditionally at module import time, not just inside a test function.** Several have no `if __name__ == "__main__":` guard at all: importing them fires a relay, streams a pulse, or turns on a power-supply output as a side effect of Python loading the file.
 
 `pytest.ini` (`testpaths = tests`) plus `tests/conftest.py`'s `pytest_ignore_collect` hook gate this: a bare `pytest` run only collects the files named in `ALLOWED_FILES`. The gate is an allowlist, not a denylist — anything not explicitly named there is excluded from collection entirely, so it is never imported. Passing `--hardware` lifts the restriction and collects everything, including every hardware-commanding script.
 

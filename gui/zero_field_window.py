@@ -10,6 +10,12 @@ import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtWidgets import QFileDialog, QMainWindow, QMessageBox
 
+from gui.display_settings import (
+    ZFE_COLORMAP_KEY,
+    load_colormap,
+    save_colormap,
+    select_colormap,
+)
 from gui.widgets.zero_field_widget import ZeroFieldWidget
 from gui.zero_field_worker import ZeroFieldWorker
 from framework.analysis.zero_field import mean_fluorescence_vs_field
@@ -96,6 +102,16 @@ class ZeroFieldWindow(QMainWindow):
         )
         self.widget.colormap_combo.currentTextChanged.connect(
             self.handle_display_settings_changed
+        )
+        # Persisted colormap (config display.zfe_colormap, default Gray).
+        # Selected without emitting, so startup neither renders nor saves.
+        self._display_cfg = getattr(hardware_manager, "cfg", None)
+        select_colormap(
+            self.widget.colormap_combo,
+            load_colormap(self._display_cfg, ZFE_COLORMAP_KEY),
+        )
+        self.widget.colormap_combo.currentTextChanged.connect(
+            self._save_colormap
         )
         # "Save Data" copies the already-written result file to a
         # user-chosen location; there's nothing to copy until a scan has
@@ -317,6 +333,9 @@ class ZeroFieldWindow(QMainWindow):
     def handle_display_settings_changed(self, _value):
         """Re-render the retained display image after a visualization change."""
         self._render_displayed_image()
+
+    def _save_colormap(self, name):
+        save_colormap(self._display_cfg, ZFE_COLORMAP_KEY, name)
 
     def handle_fluorescence_update(self, fields, signals):
         """Display the cumulative raw fluorescence curve for this scan."""

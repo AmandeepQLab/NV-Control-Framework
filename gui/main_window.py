@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import ( # type: ignore
     QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel,
     QDoubleSpinBox, QSpinBox, QGridLayout,
-    QGroupBox, QMessageBox
+    QGroupBox, QMessageBox, QComboBox
 )
 from PyQt6.QtCore import QSignalBlocker, QTimer, pyqtSignal # type: ignore
 from gui.magnet_window import MagnetControlWindow
@@ -31,6 +31,14 @@ from framework.acquisition_state import (
 )
 from framework.roi import validate_roi
 from gui.live_view_controller import LiveViewTimerController
+from gui.display_settings import (
+    COLORMAP_NAMES,
+    LIVE_VIEW_COLORMAP_KEY,
+    colormap_for,
+    load_colormap,
+    save_colormap,
+    select_colormap,
+)
 from utils.camera_diagnostics import log_event
 
 
@@ -405,12 +413,22 @@ class MainWindow(QMainWindow):
         right_panel = QVBoxLayout()
         main_layout.addLayout(right_panel, 4)
 
+        # Same selector as the Zero Field window's (gui/display_settings.py).
+        colormap_row = QHBoxLayout()
+        colormap_row.addWidget(QLabel("Colormap:"))
+        self.colormap_combo = QComboBox()
+        self.colormap_combo.addItems(COLORMAP_NAMES)
+        colormap_row.addWidget(self.colormap_combo)
+        colormap_row.addStretch()
+        right_panel.addLayout(colormap_row)
+
         self.image_plot = pg.PlotItem()
         self.image_plot.showAxis("bottom", True)
         self.image_plot.showAxis("left", True)
         self._pixel_axes_binning = None
         self.image_view = pg.ImageView(view=self.image_plot)
         right_panel.addWidget(self.image_view, 3)
+        self._init_live_view_colormap()
 
         # ROI overlay
         self.roi = pg.RectROI(
@@ -670,6 +688,26 @@ class MainWindow(QMainWindow):
                 yRange=(y0, y0 + height),
                 padding=0,
             )
+
+    def _init_live_view_colormap(self):
+        """Show and apply the saved live-view colormap, then track changes."""
+        select_colormap(
+            self.colormap_combo,
+            load_colormap(getattr(self, "cfg", None), LIVE_VIEW_COLORMAP_KEY),
+        )
+        self._apply_live_view_colormap(self.colormap_combo.currentText())
+        self.colormap_combo.currentTextChanged.connect(
+            self._on_live_view_colormap_changed
+        )
+
+    def _apply_live_view_colormap(self, name):
+        # Set on the ImageView's own LUT, so it recolours the frame already
+        # shown (stream running or not) and persists across setImage() calls.
+        self.image_view.setColorMap(colormap_for(name))
+
+    def _on_live_view_colormap_changed(self, name):
+        self._apply_live_view_colormap(name)
+        save_colormap(getattr(self, "cfg", None), LIVE_VIEW_COLORMAP_KEY, name)
 
     def _update_pixel_axes(self, binning):
         """Label plot axes with effective-pixel units when binning changes."""

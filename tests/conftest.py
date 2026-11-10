@@ -18,6 +18,7 @@ ALLOWED_FILES = frozenset(
         "test_andor_binning.py",
         "test_baseline_correction.py",
         "test_camera_ownership.py",
+        "test_colormap_selectors.py",
         "test_odmr_acquisition_roi.py",
         "test_exposure_propagation.py",
         "test_image_cube_preallocation.py",
