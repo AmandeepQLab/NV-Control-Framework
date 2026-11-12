@@ -17,6 +17,7 @@ from experiments.zero_field_experiment import ZeroFieldExperiment
 from config.config_manager import ConfigManager
 from hardware.hardware_manager import HardwareManager
 from gui.odmr_window import ODMRWindow
+from gui.odmr_analysis_window import ODMRAnalysisWindow
 from gui.zero_field_window import ZeroFieldWindow
 from framework.camera_ownership import (
     apply_live_acquisition_state,
@@ -93,6 +94,7 @@ class MainWindow(QMainWindow):
 
         self.state = "IDLE"
         self.odmr_window = None
+        self.odmr_analysis_window = None
         # self.acquisition_state is constructed below, once the exposure/
         # binning/baseline spinboxes exist -- built from their displayed
         # values so the GUI display is the single source of truth for the
@@ -1019,7 +1021,9 @@ class MainWindow(QMainWindow):
             camera=self.camera,
             acquisition_state_getter=self.get_acquisition_state,
         )
-
+        self.odmr_window.analysis_requested.connect(
+            self.open_odmr_analysis_window
+        )
         window = self.odmr_window
         window.run_started.connect(
             lambda: self._experiment_window_started(
@@ -1031,6 +1035,21 @@ class MainWindow(QMainWindow):
         )
 
         self.odmr_window.show()
+
+    def open_odmr_analysis_window(self):
+        """Show the reusable offline ODMR analysis window."""
+        if self.odmr_analysis_window is None:
+            self.odmr_analysis_window = ODMRAnalysisWindow(parent=self)
+            self.odmr_analysis_window.destroyed.connect(
+                self._odmr_analysis_window_destroyed
+            )
+
+        self.odmr_analysis_window.show()
+        self.odmr_analysis_window.raise_()
+        self.odmr_analysis_window.activateWindow()
+
+    def _odmr_analysis_window_destroyed(self, _object=None):
+        self.odmr_analysis_window = None
     # =====================================================
     # ZERO-FIELD IMAGING WINDOW
     # =====================================================

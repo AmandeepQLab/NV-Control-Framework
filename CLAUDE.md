@@ -131,6 +131,29 @@ Both selectors offer the same list: `gui/display_settings.py::COLORMAP_NAMES` (G
   - Invalid input raises `ValueError`. Optimizer failure returns an unsuccessful `TwoLorentzianFitResult`, never made-up values.
 - `fit_global_odmr_spectrum()` fits the finite-pixel spatial mean of a `(frequency, y, x)` final-mean cube; `global_mean_odmr_spectrum()` computes that mean. `TwoLorentzianInitialGuess` holds reusable starting values.
 
+## Offline ODMR analysis window
+
+**What it is.** `gui/odmr_analysis_window.py::ODMRAnalysisWindow` analyses a saved `odmr_statistics.h5`. It touches **no hardware** and is not an experiment window, so it has no `run_started`/`worker_thread()`/`request_stop()` and is not in `MainWindow`'s worker registry.
+
+**How it is opened.**
+- From the ODMR window's "ODMR Analysis" button: `ODMRPanel.analysis_requested` → `ODMRWindow.analysis_requested` → `MainWindow.open_odmr_analysis_window()`. There is one instance, parented to `MainWindow`, re-shown if already open.
+- Standalone: `python odmr_analysis_main.py`.
+
+**Workflow.** Each step is enabled by the window's `ODMRAnalysisState`.
+1. **Open ODMR HDF5.** Runs `load_odmr_statistics()` + `calculate_odmr_statistics()`.
+2. **Fit Global Spectrum.** Runs `fit_global_odmr_spectrum()` on `final_mean`.
+3. **Fit Pixels.** Runs `analysis/odmr_pixel_fit.py::fit_odmr_pixels()`, which uses the successful global fit as the template.
+   - It runs on a `QThread` (`gui/odmr_analysis_worker.py::ODMRPixelFitWorker`).
+   - Each pixel needs at least 8 finite samples.
+   - Per-pixel outcomes go into a `PixelFitStatus` map, and one pixel's failure never aborts the rest.
+4. **Reconstruct Bz.** `analysis/odmr_magnetic.py::reconstruct_bz()` computes `(f₊ − f₋) / (2γ)` with γ = 2.8024951 MHz/G, then divides by cos θ with θ = 54.7356°. It reports a **magnitude** in Gauss with propagated uncertainty: no field sign, no background subtraction.
+
+**Display.**
+- Maps: f₋, f₊, splitting, RMSE, fit status, and Bz magnitude. Clicking a pixel shows its spectrum and fit.
+- The colormap list is the window's own (Viridis…Cividis) and is not persisted; see "Display settings".
+
+**Closing and reloading during a pixel fit.** Closing is deferred until the fit's thread finishes. Loading another file is refused while it runs.
+
 ## Dead code — do not build on these
 
 Confirmed unused by the running application; each is either an abandoned duplicate or a stub with no subclasses:
@@ -203,7 +226,7 @@ These are characterized properties of the current rig/sample, not code facts —
 
 ## Testing safety — read before running pytest with `--hardware`
 
-`tests/` contains 90 test files (excluding `__init__.py`/`conftest.py`). Only 33 are real, hardware-free pytest tests — see `tests/conftest.py::ALLOWED_FILES` for the current, authoritative list rather than a copy here that will drift the next time a file is added to it (as just happened for this change). **The other ~57 are ad-hoc scripts that command real lab hardware — the Andor camera, the SG386 microwave source over VISA, the Swabian pulse streamer, the Helmholtz power supplies — unconditionally at module import time, not just inside a test function.** Several have no `if __name__ == "__main__":` guard at all: importing them fires a relay, streams a pulse, or turns on a power-supply output as a side effect of Python loading the file.
+`tests/` contains 93 test files (excluding `__init__.py`/`conftest.py`). Only 36 are real, hardware-free pytest tests — see `tests/conftest.py::ALLOWED_FILES` for the current, authoritative list rather than a copy here that will drift the next time a file is added to it (as just happened for this change). **The other ~57 are ad-hoc scripts that command real lab hardware — the Andor camera, the SG386 microwave source over VISA, the Swabian pulse streamer, the Helmholtz power supplies — unconditionally at module import time, not just inside a test function.** Several have no `if __name__ == "__main__":` guard at all: importing them fires a relay, streams a pulse, or turns on a power-supply output as a side effect of Python loading the file.
 
 `pytest.ini` (`testpaths = tests`) plus `tests/conftest.py`'s `pytest_ignore_collect` hook gate this: a bare `pytest` run only collects the files named in `ALLOWED_FILES`. The gate is an allowlist, not a denylist — anything not explicitly named there is excluded from collection entirely, so it is never imported. Passing `--hardware` lifts the restriction and collects everything, including every hardware-commanding script.
 

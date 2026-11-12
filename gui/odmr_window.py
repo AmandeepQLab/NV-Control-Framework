@@ -54,6 +54,7 @@ CAMERA_PER_FRAME_OVERHEAD_S = 0.0132
 class ODMRWindow(QMainWindow):
 
     stop_requested = pyqtSignal()
+    analysis_requested = pyqtSignal()
     # Announce a run's lifetime to MainWindow, which relays it to the magnet
     # control lock. run_finished fires once per run_started, from
     # odmr_finished() -- ODMRWorker._finish() emits finished_signal exactly
@@ -86,6 +87,7 @@ class ODMRWindow(QMainWindow):
         self.panel = ODMRPanel()
         self.setCentralWidget(self.panel)
 
+        self.panel.analysis_requested.connect(self.analysis_requested)
         self.panel.run_stop_button.clicked.connect(self.toggle_odmr)
         self.panel.sequence_button.clicked.connect(self.show_pulse_sequence)
         self.panel.plot_mode_combo.currentTextChanged.connect(self.refresh_plot)

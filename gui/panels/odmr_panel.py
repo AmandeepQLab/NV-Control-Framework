@@ -4,7 +4,7 @@ from PyQt6.QtWidgets import (
     QComboBox, QProgressBar, QTextEdit, QDialog, QScrollArea, QLineEdit,
     QFormLayout, QDialogButtonBox, QMessageBox
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 
 import pyqtgraph as pg
 import numpy as np
@@ -152,6 +152,8 @@ The magnetic image will ultimately be obtained from the spatially resolved final
 
 
 class ODMRPanel(QWidget):
+
+    analysis_requested = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -381,6 +383,10 @@ class ODMRPanel(QWidget):
         odmr_layout.addWidget(self.statistics_group)
         self.statistics_dialog = None
         self.statistics_details_button.clicked.connect(self.show_statistics_explanation)
+
+        self.analysis_button = QPushButton("ODMR Analysis")
+        odmr_layout.addWidget(self.analysis_button)
+        self.analysis_button.clicked.connect(self.analysis_requested.emit)
 
         self.run_stop_button = QPushButton("Run ODMR")
         self.run_stop_button.setStyleSheet(
