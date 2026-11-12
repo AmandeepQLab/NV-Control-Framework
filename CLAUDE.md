@@ -84,6 +84,35 @@ Both selectors offer the same list: `gui/display_settings.py::COLORMAP_NAMES` (G
 - **Save failures** are logged, never raised.
 - Because the file is tracked, changing a colormap at the rig shows up as a working-tree change to `config/setupInfo.json`.
 
+## ODMR per-pixel statistics
+
+**GUI ODMR scans go through `ODMRExperiment.acquire_pixel_statistics()`, not `acquire_configured_point()`/`process_frame()`.** `ODMRWorker` calls it once per frequency point. It sets the scan point and acquires `repeats` OFF/ON pairs via `acquire_repeat_pair()`, which is the same two triggered frames with the same timing-diagnostics stages as before.
+
+- **Per-pixel normalisation.** Each pair is normalised per pixel by `normalize_odmr_pair_per_pixel()`: `100 * (ON - baseline_counts) / (OFF - baseline_counts)`. It is then folded into a running per-pixel mean and sample SD (Welford's algorithm), and the frames are discarded.
+- **Invalid pixels.** OFF pixels at or below the baseline are replaced by the mean of their valid normalised 3×3 neighbours. An invalid pixel with no valid neighbour raises `InvalidPixelNeighborhoodError`. Invalid and repaired counts are recorded per (average, frequency).
+- **The scalar contrast for the live plot keeps the old convention:** the mean of per-repeat ROI-mean ratios (see "per-repeat-ratio averaging" below). `process_frame()`/`acquire_configured_point()` remain for other callers.
+
+**`averages` now means independent full sweeps, not repeats of one point.** Before, `ODMRWorker` looped `averages` times inside each frequency point. Now it walks the whole frequency list once per average.
+- The live curve is the running mean over sweeps acquired so far.
+- `n_points * averages` acquisitions, so `estimate_odmr_time()` is unchanged in form.
+- Every average must have the same repeat count, or the worker raises.
+
+**Statistics cube.**
+- `ODMRWorker` pre-allocates `pixel_data` as float32 `(averages, 2, n_freq, H, W)` at the first point. Statistic index 0 holds the normalised mean and index 1 the repeat SD.
+- At `_finish()` it builds `statistics_cube`, an `ImageCube` with `axis_order ["average", "statistic", "frequency", "y", "x"]`. Only **completed** sweeps are included; a partial sweep after stop/error is dropped. The metadata records completion, stop, and error status plus pixel-repair counts.
+- `ODMRWindow.odmr_finished()` validates it with `framework/analysis/odmr_statistics.py`: `load_odmr_statistics()` and `calculate_odmr_statistics()`.
+- The panel's "ODMR Statistics" box shows availability. Its "How are these calculated?" dialog explains the maths.
+- When saving is on, the cube is saved as `odmr_statistics.h5` in the scan's output folder.
+
+**The maths** is in `calculate_odmr_statistics()`:
+- `final_mean` is the equal-weight mean of per-sweep means, **not** inverse-variance weighted. It is the primary result.
+- `fast_*` comes from repeat-to-repeat SDs within each sweep.
+- `slow_*` is a method-of-moments estimate: between-sweep variance minus the mean fast variance, floored at 0. It needs at least 2 usable averages.
+- `combined_sem` combines the fast and slow SEMs in quadrature.
+- The SD and SEM maps are diagnostics, not the result.
+
+**HDF5 chunking** (`ImageCube._save_hdf5()`): one chunk per 2-D image plane for any number of leading dimensions, `(1, …, 1, H, W)`. Before, it was one chunk per leading index, which made the 5-D statistics cube chunk whole `(2, n_freq, H, W)` blocks.
+
 ## Dead code — do not build on these
 
 Confirmed unused by the running application; each is either an abandoned duplicate or a stub with no subclasses:
@@ -148,7 +177,7 @@ These are characterized properties of the current rig/sample, not code facts —
 
 **10ms and 20ms exposure gave statistically equivalent contrast (2.794% vs 2.814%) at ~20,000 counts on a bright ensemble, repeats=5.** 10ms is preferred for scan speed at this signal level. **This is conditional, not universal**: on a dimmer sample the measurement becomes photon-limited and a longer exposure would win instead. Don't treat 10ms as a correct default independent of signal level.
 
-**Camera baseline (dark counts) ≈ 120, against ~20,000 counts of signal.** Baseline subtraction (`baseline_counts`, see `ODMRExperiment.process_frame()`) changes contrast by ~0.6% at this signal level — below the measurement floor documented below (so it's not distinguishable from noise here), but becomes material once the signal drops below roughly 1000 counts, where 120 is no longer a small correction.
+**Camera baseline (dark counts) ≈ 120, against ~20,000 counts of signal.** Baseline subtraction (`baseline_counts`, see `ODMRExperiment.process_frame()` and `normalize_odmr_pair_per_pixel()`) changes contrast by ~0.6% at this signal level — below the measurement floor documented below (so it's not distinguishable from noise here), but becomes material once the signal drops below roughly 1000 counts, where 120 is no longer a small correction.
 
 **Measurement floor: contrast repeatability is ±5% relative at repeats=5.** Any change claimed to have a smaller effect than that needs repeated runs in a single session, same ROI and laser power, to be credible against this dataset's own noise — a single before/after comparison at this repeats setting cannot distinguish a real few-percent effect from run-to-run noise.
 
@@ -156,7 +185,7 @@ These are characterized properties of the current rig/sample, not code facts —
 
 ## Testing safety — read before running pytest with `--hardware`
 
-`tests/` contains 93 test files (excluding `__init__.py`/`conftest.py`). Only 36 are real, hardware-free pytest tests — see `tests/conftest.py::ALLOWED_FILES` for the current, authoritative list rather than a copy here that will drift the next time a file is added to it (as just happened for this change). **The other ~57 are ad-hoc scripts that command real lab hardware — the Andor camera, the SG386 microwave source over VISA, the Swabian pulse streamer, the Helmholtz power supplies — unconditionally at module import time, not just inside a test function.** Several have no `if __name__ == "__main__":` guard at all: importing them fires a relay, streams a pulse, or turns on a power-supply output as a side effect of Python loading the file.
+`tests/` contains 88 test files (excluding `__init__.py`/`conftest.py`). Only 31 are real, hardware-free pytest tests — see `tests/conftest.py::ALLOWED_FILES` for the current, authoritative list rather than a copy here that will drift the next time a file is added to it (as just happened for this change). **The other ~57 are ad-hoc scripts that command real lab hardware — the Andor camera, the SG386 microwave source over VISA, the Swabian pulse streamer, the Helmholtz power supplies — unconditionally at module import time, not just inside a test function.** Several have no `if __name__ == "__main__":` guard at all: importing them fires a relay, streams a pulse, or turns on a power-supply output as a side effect of Python loading the file.
 
 `pytest.ini` (`testpaths = tests`) plus `tests/conftest.py`'s `pytest_ignore_collect` hook gate this: a bare `pytest` run only collects the files named in `ALLOWED_FILES`. The gate is an allowlist, not a denylist — anything not explicitly named there is excluded from collection entirely, so it is never imported. Passing `--hardware` lifts the restriction and collects everything, including every hardware-commanding script.
 

@@ -10,6 +10,10 @@ from gui.panels.odmr_panel import ODMRPanel
 from gui.odmr_worker import ODMRWorker
 from data.data_manager import DataManager
 from gui.pulse_sequence_window import PulseSequenceWindow
+from framework.analysis.odmr_statistics import (
+    calculate_odmr_statistics,
+    load_odmr_statistics,
+)
 
 from analysis.odmr_fit import fit_single_lorentzian, fit_double_lorentzian
 
@@ -148,6 +152,7 @@ class ODMRWindow(QMainWindow):
 
         self.latest_x = None
         self.latest_y = None
+        self.panel.set_statistics_status("Statistics: No completed acquisition")
 
         self.scan_start_time = time.time()
 
@@ -408,6 +413,24 @@ class ODMRWindow(QMainWindow):
         self.run_finished.emit()
         self.panel.set_running_state(False)
 
+        statistics_cube = getattr(self.odmr_worker, "statistics_cube", None)
+        set_statistics_status = getattr(self.panel, "set_statistics_status", None)
+        update_statistics = getattr(self.panel, "update_statistics", None)
+        if statistics_cube is None:
+            if callable(set_statistics_status):
+                set_statistics_status("Statistics: Not available")
+        elif callable(update_statistics):
+            try:
+                validated_cube = load_odmr_statistics(statistics_cube)
+                statistics_result = calculate_odmr_statistics(validated_cube)
+                update_statistics(statistics_result)
+            except Exception as error:
+                if callable(set_statistics_status):
+                    detail = str(error).splitlines()[0][:120]
+                    set_statistics_status(
+                        f"Statistics: Processing failed ({detail or type(error).__name__})"
+                    )
+
         self.refresh_plot()
         self.panel.fit_button.setEnabled(True)
 
@@ -450,13 +473,15 @@ class ODMRWindow(QMainWindow):
             if actual_exposure_s is not None:
                 self.current_config["camera_exposure_actual_s"] = actual_exposure_s
 
-            self.data_manager.save_odmr(
+            output_folder = self.data_manager.save_odmr(
                 freqs_hz,
                 signal,
                 self.current_config,
                 i_off=i_off,
-                i_on=i_on
+                i_on=i_on,
             )
+            if statistics_cube is not None:
+                statistics_cube.save(output_folder / "odmr_statistics.h5")
 
     # =====================================================
     # ERROR MESSAGE

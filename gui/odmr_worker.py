@@ -8,6 +8,7 @@ from datetime import datetime
 
 from experiments.odmr_experiment import ODMRExperiment
 from framework.camera_ownership import exclusive_camera_access
+from framework.image_cube import ImageCube
 
 
 LOGGER = logging.getLogger(__name__)
@@ -90,6 +91,22 @@ class ODMRWorker(QObject):
         self.i_on_results = np.full(len(self.freqs_sorted), np.nan)
 
         self.n_avg = config.get("averages", 1)
+        self.average_index = 0
+        self.completed_averages = 0
+        self._stop_requested = False
+        self._error_message = None
+        self._is_finished = False
+        self._scalar_counts = np.zeros(len(self.freqs_sorted), dtype=np.int64)
+        self.n_repeats_per_average = []
+        self._repeat_counts_for_average = []
+        self._invalid_pixel_counts = [
+            [None] * len(self.freqs_sorted) for _ in range(self.n_avg)
+        ]
+        self._repaired_pixel_counts = [
+            [None] * len(self.freqs_sorted) for _ in range(self.n_avg)
+        ]
+        self.pixel_data = None
+        self._pixel_shape = None
 
         self.running = True
         self.freq_index = 0
@@ -148,6 +165,7 @@ class ODMRWorker(QObject):
 
     def stop(self):
 
+        self._stop_requested = True
         self.running = False
         self.experiment.stop()
 
@@ -192,24 +210,33 @@ class ODMRWorker(QObject):
 
         try:
 
-            for avg_index in range(self.n_avg):
-
-                if not self.running:
-                    break
-
-                avg_t0 = time.perf_counter() if self._timing else None
-
-                value, i_off, i_on = self.experiment.acquire_configured_point(
-                    f,
-                    return_raw=True
+            avg_t0 = time.perf_counter() if self._timing else None
+            (value, pixel_mean, pixel_sd, repeats_done,
+             invalid_count, repaired_count) = (
+                self.experiment.acquire_pixel_statistics(f)
+            )
+            if self._timing:
+                self._collect_point_timing(
+                    f, self.freq_index, self.average_index, avg_t0
                 )
-
-                if self._timing:
-                    self._collect_point_timing(f, self.freq_index, avg_index, avg_t0)
-
-                values.append(value)
-                i_off_values.append(i_off)
-                i_on_values.append(i_on)
+            if self.pixel_data is None:
+                self._pixel_shape = pixel_mean.shape
+                self.pixel_data = np.full(
+                    (self.n_avg, 2, len(self.freqs_sorted), *self._pixel_shape),
+                    np.nan, dtype=np.float32,
+                )
+            elif pixel_mean.shape != self._pixel_shape:
+                raise ValueError("ODMR pixel frame dimensions changed during acquisition.")
+            sorted_index = self.order[self.freq_index]
+            self._record_pixel_repair_counts(
+                self.average_index, sorted_index, invalid_count, repaired_count
+            )
+            self.pixel_data[self.average_index, 0, sorted_index] = pixel_mean
+            self.pixel_data[self.average_index, 1, sorted_index] = pixel_sd
+            self._repeat_counts_for_average.append(int(repeats_done))
+            values.append(value)
+            i_off_values.append(self.experiment._last_i_off)
+            i_on_values.append(self.experiment._last_i_on)
 
         except Exception as e:
 
@@ -221,6 +248,17 @@ class ODMRWorker(QObject):
             LOGGER.exception(msg)
 
             self.running = False
+            self._error_message = str(e)
+            diagnostics = getattr(
+                self.experiment, "last_pixel_repair_diagnostics", None
+            )
+            if diagnostics is not None:
+                self._record_pixel_repair_counts(
+                    self.average_index,
+                    self.order[self.freq_index],
+                    diagnostics.get("invalid_pixels_encountered", 0),
+                    diagnostics.get("repaired_pixels", 0),
+                )
 
             self.error_signal.emit(msg)
 
@@ -248,9 +286,20 @@ class ODMRWorker(QObject):
         avg_i_off = float(np.mean(i_off_values))
         avg_i_on = float(np.mean(i_on_values))
 
-        self.results[sorted_index] = avg_value
-        self.i_off_results[sorted_index] = avg_i_off
-        self.i_on_results[sorted_index] = avg_i_on
+        count = int(self._scalar_counts[sorted_index])
+        self._scalar_counts[sorted_index] += 1
+        self.results[sorted_index] = (
+            avg_value if count == 0 else self.results[sorted_index]
+            + (avg_value - self.results[sorted_index]) / (count + 1)
+        )
+        self.i_off_results[sorted_index] = (
+            avg_i_off if count == 0 else self.i_off_results[sorted_index]
+            + (avg_i_off - self.i_off_results[sorted_index]) / (count + 1)
+        )
+        self.i_on_results[sorted_index] = (
+            avg_i_on if count == 0 else self.i_on_results[sorted_index]
+            + (avg_i_on - self.i_on_results[sorted_index]) / (count + 1)
+        )
 
         valid = ~np.isnan(self.results)
 
@@ -260,12 +309,87 @@ class ODMRWorker(QObject):
         self.i_off_data = self.i_off_results[valid].tolist()
         self.i_on_data = self.i_on_results[valid].tolist()
 
-        self.point_signal.emit(
-            self.xdata.copy(),
-            self.ydata.copy()
+        self.freq_index += 1
+        if self.freq_index >= len(self.freqs):
+            if len(set(self._repeat_counts_for_average)) != 1:
+                raise RuntimeError(
+                    "Repeat count varied within an average; per-average repeat "
+                    "metadata cannot represent this sweep."
+                )
+            self.completed_averages += 1
+            self.n_repeats_per_average.append(self._repeat_counts_for_average[0])
+            self._repeat_counts_for_average = []
+            self.average_index += 1
+            self.freq_index = 0
+        self.point_signal.emit(self.xdata.copy(), self.ydata.copy())
+        if self.average_index >= self.n_avg:
+            self._finish()
+
+    def _make_statistics_cube(self):
+        if self.pixel_data is None:
+            self.statistics_cube = None
+            return
+        # A partially acquired sweep is intentionally excluded: each leading
+        # plane is a completed, independently swept average. If a frame shape
+        # is known but no sweep completed, retain a zero-length leading axis
+        # so the incomplete status and zero completed count can still persist.
+        completed = self.pixel_data[:self.completed_averages]
+        camera = self.hardware.get("camera")
+        metadata = dict(self.config)
+        metadata.update({
+            "experiment_name": "ODMR",
+            "configured_averages": int(self.n_avg),
+            "completed_averages": int(self.completed_averages),
+            "n_averages": int(self.completed_averages),
+            "configured_repeats": int(self.config.get("repeats", 1)),
+            "n_repeats_per_average": list(self.n_repeats_per_average),
+            "frequency_values_hz": self.freqs_sorted.tolist(),
+            "frequency_acquisition_order_hz": self.freqs.tolist(),
+            "frequency_acquisition_order_indices": self.order.tolist(),
+            "normalization_method": "100 * (ON - baseline_counts) / (OFF - baseline_counts), per pixel per repeat",
+            "experiment_complete": bool(self.completed_averages == self.n_avg),
+            "stopped_by_user": bool(self._stop_requested),
+            "interrupted": bool(self._error_message is not None or self._stop_requested),
+            "error_message": self._error_message,
+            "image_height_px": int(self._pixel_shape[0]),
+            "image_width_px": int(self._pixel_shape[1]),
+            "image_dtype": "float32",
+            "acquisition_roi": self.acquisition_roi,
+            "camera_binning": getattr(camera, "binning", None),
+            "camera_model": type(camera).__name__ if camera is not None else None,
+            "camera_exposure_actual_s": getattr(self.experiment, "actual_exposure_s", None),
+            "invalid_pixel_counts_per_average_frequency": self._invalid_pixel_counts,
+            "repaired_pixel_counts_per_average_frequency": self._repaired_pixel_counts,
+            "invalid_pixels_encountered": sum(
+                count for row in self._invalid_pixel_counts
+                for count in row if count is not None
+            ),
+            "repaired_pixels": sum(
+                count for row in self._repaired_pixel_counts
+                for count in row if count is not None
+            ),
+        })
+        axes = {
+            "axis_order": ["average", "statistic", "frequency", "y", "x"],
+            "average": list(range(self.completed_averages)),
+            "statistic": ["normalized_mean", "normalized_sd"],
+            "frequency": self.freqs_sorted.tolist(),
+            "y": list(range(self._pixel_shape[0])),
+            "x": list(range(self._pixel_shape[1])),
+        }
+        self.statistics_cube = ImageCube(
+            data=completed,
+            axes=axes,
+            metadata=metadata,
+            experiment_type="ODMR",
+            scan_axis_name="frequency",
+            scan_axis_unit="Hz",
+            scan_axis_values=self.freqs_sorted,
         )
 
-        self.freq_index += 1
+    def _record_pixel_repair_counts(self, average_index, frequency_index, invalid, repaired):
+        self._invalid_pixel_counts[average_index][frequency_index] = int(invalid)
+        self._repaired_pixel_counts[average_index][frequency_index] = int(repaired)
 
     def _collect_point_timing(self, freq_hz, point_index, avg_index, avg_t0):
         """Drain the experiment's per-call timing log, tag, and merge it.
@@ -377,8 +501,14 @@ class ODMRWorker(QObject):
 
     def _finish(self):
 
+        if self._is_finished:
+            return
+        self._is_finished = True
+
         if self.timer is not None:
             self.timer.stop()
+
+        self._make_statistics_cube()
 
         # Disarm before anything else, in particular before the camera
         # lease below is released -- that release is what lets live view

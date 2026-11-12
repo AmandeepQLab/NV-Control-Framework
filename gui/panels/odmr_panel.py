@@ -1,10 +1,84 @@
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QDoubleSpinBox, QSpinBox, QGroupBox, QCheckBox,
-    QComboBox, QProgressBar
+    QComboBox, QProgressBar, QTextEdit, QDialog, QScrollArea
 )
+from PyQt6.QtCore import Qt
 
 import pyqtgraph as pg
+import numpy as np
+from PyQt6.QtGui import QFontDatabase
+
+
+class ODMRStatisticsExplanationDialog(QDialog):
+    """Readable explanation of the ODMR statistics hierarchy."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("ODMR Statistics — How are these calculated?")
+        self.resize(720, 680)
+
+        layout = QVBoxLayout(self)
+        text = QTextEdit(self)
+        text.setReadOnly(True)
+        text.setPlainText(_ODMR_STATISTICS_EXPLANATION)
+        text.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        layout.addWidget(text)
+
+
+_ODMR_STATISTICS_EXPLANATION = """What are we measuring?
+
+Each ODMR frequency point is measured repeatedly. A complete frequency sweep is then repeated independently several times:
+
+    Repeats within an average
+            -> mean + SD for that average
+            -> independent averages
+            -> final ODMR mean
+
+Fast noise
+
+Repeat-to-repeat fluctuations within one average represent fast noise. For average a:
+
+    s_a = sample SD of repeats
+    N_a = number of repeats
+    v_fast,a = s_a^2 / N_a
+
+Slow noise
+
+Average-to-average variation contains both genuine slower fluctuations and residual fast sampling noise in each average mean. For equal-weight averages, the slow variance estimate is:
+
+    slow_variance = max(observed_between_average_variance
+                        - mean(v_fast,a), 0)
+
+This is a transparent method-of-moments estimator and can be noisy when only a few independent averages are available.
+
+Final mean
+
+The primary scientific result is the equal-weight combination of completed average means:
+
+    final_mean = mean(mean_a)
+
+This is intentionally not inverse-variance weighted.
+
+Combined uncertainty
+
+For A usable independent averages:
+
+    fast_sem = sqrt(sum(v_fast,a) / A^2)
+    slow_sem = slow_sd / sqrt(A)
+    combined_sem = sqrt(fast_sem^2 + slow_sem^2)
+
+Numerical example
+
+Consider 5 independent averages with 20 repeats per average, average means 0.95, 1.05, 0.97, 1.04, and 0.99, and within-average SD approximately 0.10. The equal-weight final mean is approximately 1.000. Within-average fluctuations illustrate fast noise; variation between the five average means contains the slower component after accounting for fast sampling noise. This example is conceptual, not a precision claim.
+
+Why do we calculate this?
+
+The final mean ODMR dataset is the primary result used for subsequent ODMR fitting and magnetic-image extraction.
+
+Fast/slow SD and SEM quantities are quality and uncertainty diagnostics. They help determine whether additional repeats or additional independent averages are likely to be useful.
+
+The magnetic image will ultimately be obtained from the spatially resolved final ODMR mean, not from the uncertainty maps."""
 
 
 class ODMRPanel(QWidget):
@@ -15,11 +89,21 @@ class ODMRPanel(QWidget):
         main_layout = QHBoxLayout()
         self.setLayout(main_layout)
 
-        control_box = QGroupBox("ODMR Parameters")
-        main_layout.addWidget(control_box, 1)
+        self.control_box = QGroupBox("ODMR Parameters")
 
         odmr_layout = QVBoxLayout()
-        control_box.setLayout(odmr_layout)
+        self.control_box.setLayout(odmr_layout)
+
+        self.control_scroll_area = QScrollArea()
+        self.control_scroll_area.setWidgetResizable(True)
+        self.control_scroll_area.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.control_scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.control_scroll_area.setWidget(self.control_box)
+        main_layout.addWidget(self.control_scroll_area, 1)
 
         self.fstart_spin = self._add_double(odmr_layout, "Start (GHz):", 0, 10, 6, 2.77)
         self.fstop_spin = self._add_double(odmr_layout, "Stop (GHz):", 0, 10, 6, 2.97)
@@ -214,6 +298,17 @@ class ODMRPanel(QWidget):
         fit_result_layout.addWidget(self.fit_label)
         odmr_layout.addWidget(self.fit_group)
 
+        self.statistics_group = QGroupBox("ODMR Statistics")
+        statistics_layout = QVBoxLayout(self.statistics_group)
+        self.statistics_summary_label = QLabel("Statistics: No completed acquisition")
+        self.statistics_summary_label.setWordWrap(True)
+        statistics_layout.addWidget(self.statistics_summary_label)
+        self.statistics_details_button = QPushButton("How are these calculated?")
+        statistics_layout.addWidget(self.statistics_details_button)
+        odmr_layout.addWidget(self.statistics_group)
+        self.statistics_dialog = None
+        self.statistics_details_button.clicked.connect(self.show_statistics_explanation)
+
         self.run_stop_button = QPushButton("Run ODMR")
         self.run_stop_button.setStyleSheet(
             "background-color: green; color: white; font-weight: bold;"
@@ -251,6 +346,53 @@ class ODMRPanel(QWidget):
         plot_layout.addWidget(self.plot)
 
         self.curve = self.plot.plot([], [], pen="y", symbol="o", symbolSize=6)
+
+    def set_statistics_status(self, message):
+        self.statistics_summary_label.setText(message)
+
+    def update_statistics(self, result):
+        """Display processor-provided availability and final-mean validity."""
+        n_averages = result.n_averages
+        repeats = result.n_repeats_per_average
+        if repeats and len(set(repeats)) == 1:
+            repeat_text = str(repeats[0])
+        else:
+            repeat_text = ", ".join(str(value) for value in repeats) or "--"
+
+        final_mean_available = bool(np.isfinite(result.final_mean).any())
+        fast_available = bool(np.isfinite(result.fast_sd).any()) and bool(
+            np.isfinite(result.fast_sem).any()
+        )
+        slow_available = bool(np.isfinite(result.slow_sd).any()) and bool(
+            np.isfinite(result.slow_sem).any()
+        )
+        combined_available = bool(np.isfinite(result.combined_sem).any())
+        total = int(result.final_mean.size)
+        valid = int(np.isfinite(result.final_mean).sum())
+        valid_percent = 100.0 * valid / total if total else 0.0
+        slow_estimable = bool(result.slow_noise_estimable) and bool(
+            np.asarray(result.slow_noise_estimable_per_pixel).any()
+        )
+        slow_status = (
+            "Estimable" if slow_estimable
+            else "Not estimable (<2 usable averages)"
+        )
+        self.statistics_summary_label.setText(
+            f"Completed averages: {n_averages}\n"
+            f"Repeats / average: {repeat_text}\n"
+            f"Final mean: {'Available' if final_mean_available else 'Unavailable'}\n"
+            f"Fast noise: {'Available' if fast_available else 'Unavailable'}\n"
+            f"Slow noise: {slow_status}\n"
+            f"Combined uncertainty: {'Available' if combined_available else 'Unavailable'}\n"
+            f"Valid data: {valid_percent:.1f}% ({valid}/{total})"
+        )
+
+    def show_statistics_explanation(self):
+        if self.statistics_dialog is None:
+            self.statistics_dialog = ODMRStatisticsExplanationDialog(self)
+        self.statistics_dialog.show()
+        self.statistics_dialog.raise_()
+        self.statistics_dialog.activateWindow()
 
     def set_running_state(self, running):
         if running:

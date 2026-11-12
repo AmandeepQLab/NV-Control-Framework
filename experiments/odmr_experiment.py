@@ -14,6 +14,56 @@ from sequencing.pulse_sequence import PulseSequence
 LOGGER = logging.getLogger(__name__)
 
 
+class InvalidPixelNeighborhoodError(RuntimeError):
+    """An invalid OFF pixel has no valid pixel in its immediate neighborhood."""
+
+    def __init__(self, y, x, invalid_count):
+        super().__init__(
+            f"Invalid OFF pixel at (y={y}, x={x}) has no valid neighbor "
+            f"within its 3x3 neighborhood ({invalid_count} invalid pixels)."
+        )
+        self.invalid_count = invalid_count
+
+
+def normalize_odmr_pair_per_pixel(frame_off, frame_on, baseline=0.0):
+    """Normalize an OFF/ON pair and locally repair only invalid OFF pixels.
+
+    Replacement values use valid normalized pixels from the original image,
+    so adjacent invalid pixels never contribute to one another's repair.
+    Returns ``(normalized_image, invalid_count, repaired_count)``.
+    """
+    frame_off = np.asarray(frame_off, dtype=np.float64)
+    frame_on = np.asarray(frame_on, dtype=np.float64)
+    if frame_off.ndim != 2 or frame_on.ndim != 2:
+        raise ValueError("ODMR pixel normalization expects 2-D OFF/ON images.")
+    if frame_off.shape != frame_on.shape:
+        raise ValueError("ODMR OFF/ON frame dimensions differ.")
+
+    valid = frame_off > baseline
+    invalid_yx = np.argwhere(~valid)
+    invalid_count = int(len(invalid_yx))
+    normalized = np.empty(frame_off.shape, dtype=np.float64)
+    normalized[valid] = 100.0 * (frame_on[valid] - baseline) / (frame_off[valid] - baseline)
+    if invalid_count == 0:
+        return normalized, 0, 0
+
+    height, width = frame_off.shape
+    repairs = []
+    for y, x in invalid_yx:
+        y0, y1 = max(0, y - 1), min(height, y + 2)
+        x0, x1 = max(0, x - 1), min(width, x + 2)
+        neighborhood_valid = valid[y0:y1, x0:x1].copy()
+        neighborhood_valid[y - y0, x - x0] = False
+        if not np.any(neighborhood_valid):
+            raise InvalidPixelNeighborhoodError(int(y), int(x), invalid_count)
+        neighbor_values = normalized[y0:y1, x0:x1][neighborhood_valid]
+        repairs.append((int(y), int(x), float(np.mean(neighbor_values))))
+
+    for y, x, value in repairs:
+        normalized[y, x] = value
+    return normalized, invalid_count, len(repairs)
+
+
 class ODMRExperiment(ScanExperiment):
 
     scan_axis_name = "frequency"
@@ -689,62 +739,46 @@ class ODMRExperiment(ScanExperiment):
         per-frame VISA power write.
         """
         pulse = self.hw["pulse_streamer"]
-        timing = self._timing
 
         repeats = self.config.get("repeats", 1)
         frames = []
 
         for r in range(repeats):
-
-            repeat_t0 = time.perf_counter() if timing else None
-
-            # ==========================================
-            # MW OFF FRAME
-            # ==========================================
-
-            seq_off = self.build_sequence(mw_on=False)
-
-            off_t0 = time.perf_counter() if timing else None
-            frame_off = self.acquire_triggered_frame(
-                pulse,
-                seq_off,
-                repeat_index=r,
-                frame_label="off",
-            )
-
-            # ==========================================
-            # MW ON FRAME
-            # ==========================================
-
-            seq_on = self.build_sequence(mw_on=True)
-
-            on_t0 = time.perf_counter() if timing else None
-            frame_on = self.acquire_triggered_frame(
-                pulse,
-                seq_on,
-                repeat_index=r,
-                frame_label="on",
-            )
-
-            if timing:
-                self._timing_log.append({
-                    "repeat_index": r,
-                    "frame": None,
-                    "stage": "off_on_gap",
-                    "t_start_rel_s": off_t0 - self._timing_epoch,
-                    "duration_s": on_t0 - off_t0,
-                })
-                self._timing_log.append({
-                    "repeat_index": r,
-                    "frame": None,
-                    "stage": "repeat_total",
-                    "t_start_rel_s": repeat_t0 - self._timing_epoch,
-                    "duration_s": time.perf_counter() - repeat_t0,
-                })
-
+            frame_off, frame_on = self.acquire_repeat_pair(pulse, r)
             frames.append(np.stack((frame_off, frame_on)))
 
         return np.stack(frames)
+
+    def acquire_repeat_pair(self, pulse, repeat_index):
+        """Acquire and return one OFF/ON pair, preserving timing diagnostics."""
+        timing = self._timing
+        repeat_t0 = time.perf_counter() if timing else None
+        seq_off = self.build_sequence(mw_on=False)
+        off_t0 = time.perf_counter() if timing else None
+        frame_off = self.acquire_triggered_frame(
+            pulse, seq_off, repeat_index=repeat_index, frame_label="off"
+        )
+        seq_on = self.build_sequence(mw_on=True)
+        on_t0 = time.perf_counter() if timing else None
+        frame_on = self.acquire_triggered_frame(
+            pulse, seq_on, repeat_index=repeat_index, frame_label="on"
+        )
+        if timing:
+            self._timing_log.append({
+                "repeat_index": repeat_index,
+                "frame": None,
+                "stage": "off_on_gap",
+                "t_start_rel_s": off_t0 - self._timing_epoch,
+                "duration_s": on_t0 - off_t0,
+            })
+            self._timing_log.append({
+                "repeat_index": repeat_index,
+                "frame": None,
+                "stage": "repeat_total",
+                "t_start_rel_s": repeat_t0 - self._timing_epoch,
+                "duration_s": time.perf_counter() - repeat_t0,
+            })
+        return frame_off, frame_on
 
     # =====================================================
     # SINGLE ODMR POINT (backward-compatible convenience API)
@@ -760,6 +794,74 @@ class ODMRExperiment(ScanExperiment):
             return signal, self._last_i_off, self._last_i_on
 
         return signal
+
+    def acquire_pixel_statistics(self, frequency):
+        """Acquire one frequency's repeats and return pixel-wise mean, SD, N.
+
+        Repeat images are normalized as soon as their OFF/ON pair arrives and
+        then discarded.  The scalar return values retain the legacy display
+        convention (mean of per-repeat scalar contrasts and raw image means).
+        """
+        self.set_scan_point(frequency)
+        pulse = self.hw["pulse_streamer"]
+        repeats = int(self.config.get("repeats", 1))
+        baseline = float(self.config.get("baseline_counts", 0.0))
+        mean = m2 = None
+        i_off_values = []
+        i_on_values = []
+        scalar_values = []
+        count = 0
+        invalid_pixels_encountered = 0
+        repaired_pixels = 0
+        self.last_pixel_repair_diagnostics = {
+            "invalid_pixels_encountered": 0,
+            "repaired_pixels": 0,
+        }
+        for repeat_index in range(repeats):
+            raw_off, raw_on = self.acquire_repeat_pair(pulse, repeat_index)
+            frame_off = np.asarray(raw_off, dtype=np.float64)
+            frame_on = np.asarray(raw_on, dtype=np.float64)
+            try:
+                sample, invalid_count, repaired_count = normalize_odmr_pair_per_pixel(
+                    frame_off, frame_on, baseline
+                )
+            except InvalidPixelNeighborhoodError as error:
+                invalid_pixels_encountered += error.invalid_count
+                self.last_pixel_repair_diagnostics = {
+                    "invalid_pixels_encountered": invalid_pixels_encountered,
+                    "repaired_pixels": repaired_pixels,
+                }
+                raise
+            invalid_pixels_encountered += invalid_count
+            repaired_pixels += repaired_count
+            self.last_pixel_repair_diagnostics = {
+                "invalid_pixels_encountered": invalid_pixels_encountered,
+                "repaired_pixels": repaired_pixels,
+            }
+            count += 1
+            if mean is None:
+                mean = sample.copy()
+                m2 = np.zeros_like(sample, dtype=np.float64)
+            else:
+                delta = sample - mean
+                mean += delta / count
+                m2 += delta * (sample - mean)
+            i_off_values.append(self._mean_fluorescence(frame_off))
+            i_on_values.append(self._mean_fluorescence(frame_on))
+            off_scalar = i_off_values[-1] - baseline
+            on_scalar = i_on_values[-1] - baseline
+            if off_scalar <= 0:
+                raise RuntimeError("Off-resonance signal is at or below camera baseline.")
+            scalar_values.append(100.0 * on_scalar / off_scalar)
+        if count == 0:
+            raise RuntimeError("No ODMR repeats were successfully acquired.")
+        self._last_i_off = float(np.mean(i_off_values))
+        self._last_i_on = float(np.mean(i_on_values))
+        sd = np.sqrt(m2 / (count - 1)) if count > 1 else np.zeros_like(mean)
+        return (
+            float(np.mean(scalar_values)), mean, sd, count,
+            invalid_pixels_encountered, repaired_pixels,
+        )
 
     def acquire_point(self, frequency, return_raw=False):
         """Backward-compatible one-point acquisition with exclusive access."""

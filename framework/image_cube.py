@@ -241,15 +241,14 @@ class ImageCube:
     def _save_hdf5(self, filename):
         data = np.asarray(self.data)
 
-        # One full frame per chunk, matching plane-wise access: reading
-        # plane i decompresses exactly chunk i, never its neighbors.  A 2-D
-        # cube (a single frame, no scan dimension) has no "plane" to
-        # subdivide, so the whole array is one chunk instead.
+        # One image plane per chunk, matching plane-wise access: for arrays
+        # with multiple leading dimensions, each leading-index combination
+        # gets its own image chunk. A 2-D image is one chunk.
         if data.ndim >= 3:
-            chunk_shape = (1,) + data.shape[1:]
+            chunk_shape = (1,) * (data.ndim - 2) + data.shape[-2:]
         else:
             chunk_shape = data.shape
-        if not chunk_shape or any(dim == 0 for dim in chunk_shape):
+        if not chunk_shape or any(dim == 0 for dim in data.shape):
             chunk_shape = None
 
         with h5py.File(filename, "w") as handle:
