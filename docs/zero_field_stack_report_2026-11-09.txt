@@ -1,0 +1,665 @@
+ZERO FIELD EXPERIMENT STACK: READ-ONLY REPORT
+==============================================
+Date: 2026-11-09
+Scope: read-and-report only. No code was changed to produce this report.
+
+Files read as requested, plus the supporting code the ZFE stack depends on
+(needed to answer sections 3, 5 and 6 accurately).
+
+
+1. FILE INVENTORY
+-----------------
+
+experiments/zero_field_experiment.py  (873 lines)
+    ZeroFieldExperiment: runs single-axis field sweeps (one or several),
+    averages frames, writes metadata, streams results.
+
+gui/zero_field_window.py  (486 lines)
+    ZeroFieldWindow: starts and stops the worker, picks the output path,
+    renders the live image and curve, handles "Save Data".
+
+gui/zero_field_worker.py  (285 lines)
+    ZeroFieldWorker (a QObject moved to a QThread): builds the experiment,
+    converts callbacks into Qt signals, does final saves and writes the
+    timing CSV.
+
+hardware/magnet/magnet.py  (212 lines)
+    Magnet: X/Y/Z vector control, SCPI write pacing, coordinated relay
+    startup, shutdown, error-queue polling.
+
+hardware/magnet/magnet_axis.py  (358 lines)
+    MagnetAxis: per-branch calibration, branch selection, safe relay flip,
+    write cache.
+
+hardware/magnet/__init__.py  (6 lines)
+    Re-exports Magnet and MagnetAxis.
+
+hardware/magnet/magnetic_field_calibration.py  -- MISSING
+    There is no separate calibration module. Calibration is parsed and
+    applied inside MagnetAxis (magnet_axis.py:31-46, 82-124).
+
+docs/zero_field_audit_2026-07.md  (472 lines)
+    Physics/logic audit from July 2026, re-verified 2026-08-04, with
+    per-finding status tags.
+
+config/setupInfo.json  (179 lines)
+    Read Helmholtz (lines 82-177) and dataOutput.zeroFieldDirectory
+    (lines 5-7). There is no ZFE-specific config section.
+
+Supporting files also read (all or in part):
+    gui/widgets/zero_field_widget.py (354, where all the controls live)
+    framework/scan_experiment.py (101)
+    framework/base_experiment.py (107)
+    framework/camera_ownership.py (136)
+    framework/analysis/zero_field.py (36)
+    framework/fluorescence.py (14)
+    framework/image_cube.py (save/stream parts)
+    hardware/camera/andor_neo_andor3.py (software acquisition, exposure,
+        binning)
+    hardware/power_supply/base_scpi_power_supply.py
+    hardware/power_supply/e3632a.py
+    ZFE-related parts of gui/main_window.py, gui/magnet_window.py and
+    hardware/hardware_manager.py
+
+
+2. ZFE CALL CHAIN (GUI THREAD -> WORKER THREAD -> DISK)
+-------------------------------------------------------
+
+GUI thread
+
+1. MainWindow.open_zero_field_window() (main_window.py:860) builds
+   ZeroFieldWindow(hw_manager, hardware, camera, get_acquisition_state).
+   The magnet is taken from hardware["magnet"], which HardwareManager built
+   at hardware_manager.py:245-255.
+
+2. The run_stop_button.clicked signal calls ZeroFieldWindow.toggle_scan()
+   (line 116), which calls start_scan() (line 122). start_scan() does the
+   following, in order:
+     - Reads widget.get_config().
+     - If saving is on, calls ensure_writable_directory(output_directory).
+     - Gets acquisition_state_getter() (that is,
+       MainWindow.get_acquisition_state()) and takes its acquisition_roi.
+     - Builds output_path: zero_field_<ts>.h5 for a single scan,
+       zero_field_<ts>_average.h5 for multiple scans, or None when saving
+       is off.
+     - Builds metadata = {scan_parameters, camera_parameters}.
+     - Creates QThread(self) and ZeroFieldWorker(...), calls moveToThread,
+       wires 7 signals, then calls thread.start().
+
+Worker thread
+
+3. thread.started calls ZeroFieldWorker.start() (zero_field_worker.py:76).
+   It decides whether to stream (_is_hdf5_path) and whether this is a
+   single-scan direct write (_single_scan_direct), then constructs
+   ZeroFieldExperiment(...). The worker never passes zero_other_axes or
+   check_power_supply_errors, so both keep their constructor defaults
+   (True and False). It then calls experiment.run().
+
+4. ZeroFieldExperiment.run() (zero_field_experiment.py:399):
+     - Enters exclusive_camera_access(camera). This takes the process-wide
+       experiment_lock, calls live_view_controller.suspend(), and calls
+       camera.stop_stream() if the camera was streaming.
+     - Calls camera.set_roi(acquisition_roi).
+     - If timing is on, calls camera.enable_timing_diagnostics(True) and
+       magnet.enable_timing_diagnostics(True).
+     - Calls camera.reset_acquisition_counts(), then
+       camera.begin_software_acquisition(). On the Andor this sets
+       TriggerMode=Software, flushes, calls queueBuffer(1) and runs
+       AcquisitionStart, once for the whole run.
+     - For each scan:
+         * Fires scan_started_callback, which goes
+           worker._on_scan_started -> scan_started_signal ->
+           window.handle_scan_started.
+         * Calls _run_single_sweep(scan_index) (line 577), which does the
+           following:
+             - Creates a fresh ImageCube.
+             - Calls setup_scan() (line 253), which runs these steps:
+                 . magnet.enable(), which calls Magnet._initialize_relays()
+                   and then MagnetAxis.enable() on each of the 3 axes, each
+                   followed by _pace_after_write.
+                 . Optionally magnet.check_error_queues().
+                 . magnet.get_vector(); the result is recorded as the entry
+                   vector.
+                 . magnet.set_vector(0,0,0), which is calibrated
+                   compensation, not 0 A.
+                 . Builds the np.linspace scan vector.
+                 . Calls _set_static_metadata().
+             - If streaming, calls stream_scan_path(scan_index) (either
+               worker._output_path_as_stream_target or
+               worker._raw_scan_path), then
+               ImageCube.open_streaming_write(...).
+             - Runs the point loop (see section 3).
+             - In finally:
+                 . Truncates scan_axis_values and field_values_gauss to the
+                   number of frames actually acquired.
+                 . Calls writer.update_metadata({"stopped_by_user": ...}),
+                   then writer.finalize() if the sweep completed or
+                   writer.close() if not. close() truncates the datasets.
+                 . Calls cleanup_scan(): optionally check_error_queues,
+                   then magnet.disable(), which runs
+                   axis.electrical_zero(disable_output=True) on all three
+                   axes.
+                 . Calls BaseExperiment.cleanup(), which only sets
+                   state=FINISHED. It does NOT reset running, so the
+                   multi-scan loop continues.
+         * Calls _finalize_image_cube_metadata() and
+           _validate_image_cube().
+         * If the sweep is incomplete, it breaks out of the loop. Otherwise
+           it creates the average (_new_averaged_cube) or updates it
+           (_update_running_average).
+         * Handles the per-scan stream file: keep it (raw-scan mode, or
+           when it IS the output) or unlink() it.
+         * Calls _set_averaging_metadata(), then scan_completed_callback,
+           which goes to worker._on_scan_completed. For a multi-scan run
+           this calls _atomic_save_hdf5(average, output_path) (writes
+           *.partial.h5 and then replace). It then emits
+           scan_completed_signal -> window.handle_scan_completed ->
+           mean_fluorescence_vs_field() -> widget.update_live_data().
+     - Inner finally: camera.end_software_acquisition(), then turns timing
+       diagnostics off.
+     - Leaving the lease calls state_restorer() (Main Window re-applies its
+       camera settings), then camera.start_stream() if the camera was
+       streaming, then controller.resume(), then releases the lock.
+
+5. Back in worker.start():
+     - Single-scan direct: merge_hdf5_metadata(output_path, cube.metadata),
+       which patches only the metadata JSON.
+     - Multi-scan: _atomic_save_hdf5(cube, output_path) one final time.
+     - Non-.h5 output: cube.save(). This branch is unreachable because
+       _OUTPUT_EXTENSION = ".h5".
+     - Then emits finished_signal(cube, fields, signals, stopped), which
+       goes to window.scan_finished and to thread.quit.
+     - On an exception it emits error_signal, then
+       finished_signal(None, ..., True).
+     - The finally block always runs _write_timing_file(), which does
+       nothing unless timing is on.
+
+
+3. SINGLE SCAN-POINT WALKTHROUGH
+--------------------------------
+
+This is the loop body at zero_field_experiment.py:617-662. The examples use
+the default GUI values: X axis, -2 to +2 G, 5 points, 100 ms settling,
+1 average.
+
+1. Stop check.
+   The loop checks "if self.stop_requested or not self.running: break".
+   This is the only stop check per point.
+
+2. Target vector.
+   set_scan_point(field) copies _configured_field_mT and replaces the swept
+   axis with field * 0.1 mT. The non-swept axes come from setup_scan():
+   {0,0,0} when zero_other_axes=True, which is always the case from the
+   GUI.
+
+3. Magnet command (Magnet.set_vector, magnet.py:82-99).
+   - Preflight: axis.plan_field(value) runs on all three axes before any
+     I/O. It selects the branch, computes current, checks max_current,
+     checks relay availability, and checks synchronization. A bad target
+     raises before any axis is touched.
+   - Per axis, in order: axis.set_field(value, keep_output_enabled=True).
+       * Branch selection (_select_branch, magnet_axis.py:97-124). The
+         positive branch can reach targets >= its offset; the negative
+         branch can reach targets <= its offset. Inside the overlap, the
+         axis keeps its current direction. Inside a gap, it stays at 0 A on
+         the current branch.
+       * Same branch: _cache_matches(current) compares against
+         _last_confirmed_current and _last_confirmed_polarity. On a hit
+         there is no write and no sleep. On a miss, _write_current() calls
+         power_supply.set_current(), which sends one "APPL MAX,<I>" over
+         9600-baud serial.
+       * Branch change: _switch_polarity() (magnet_axis.py:202-230) runs
+         this sequence:
+             APPL MAX,0
+             sleep 50 ms
+             OUTP OFF
+             sleep max(discharge 50 ms, pacing 50 ms)
+             pulse_streamer.set_digital_output(ch, state) + sync_outputs()
+             settle sleep 50 ms
+             APPL MAX,<I>
+             sleep 50 ms
+             OUTP ON
+         That is 4 SCPI writes and about 200 ms of sleeps.
+   - Pacing: after any axis that actually wrote, Magnet._pace_after_write
+     sleeps scpi_write_delay_s (0.05 s from config). A cache hit never
+     sleeps.
+   - Typical point: only the swept axis writes: 1 SCPI write plus 50 ms.
+     The non-swept axes hit the cache because setup_scan()'s
+     set_vector(0,0,0) already confirmed them.
+   - Relay flip points with the current calibration: X flips going up at
+     about +0.128 G (negative offset 0.012819 mT) and going down at about
+     +0.121 G. Z flips around +1.17 to +1.18 G. Y has a gap between 0.0623
+     and 0.0662 G, where it holds 0 A. A default -2 to +2 G sweep on X
+     therefore includes one relay flip.
+   - Model state stored: current_field = model_field and
+     current_current = current. Both are model values, not measurements.
+
+4. Settling.
+   time.sleep(settling_time_ms / 1000). This is open-loop, one sleep that
+   can't be interrupted, and it is the same length whether or not a relay
+   flip just happened.
+
+5. Camera.
+   acquire_frame() (zero_field_experiment.py:360-386) runs "averages" times.
+   Each time it calls camera.grab_software_frame(timeout_ms=10000), which:
+     - sends SoftwareTrigger,
+     - calls waitBuffer(copy=True, requeue=True),
+     - rejects any frame returned faster than 0.5 x exposure as stale,
+     - runs _buffer_to_image.
+   The camera stays armed for the entire run. It falls back to
+   camera.snap() only if the driver has no held-open API.
+
+6. Repeat averaging.
+   np.mean(np.stack(frames), axis=0) gives a float64 per-pixel mean. The
+   individual frames are then discarded.
+
+7. Storage.
+   image_cube.add(averaged_image) appends with np.concatenate. If
+   streaming, writer.write_plane(point_index, img) writes one gzip chunk,
+   flushes, rewrites the metadata JSON with planes_written, and flushes
+   again.
+
+8. Processing.
+   process_frame() only stores latest_image and returns None, so
+   scan_signal is a list of Nones.
+
+9. Emission.
+   emit_live_update(field, None) calls worker._on_live_update(field, image).
+   That computes mean_fluorescence(image) (the full-frame mean, since the
+   ROI is applied in hardware) and emits three signals:
+     - live_update_signal(field, signal, image) ->
+       window.handle_live_update. This copies the image, keeps the first
+       image as the "Difference Image" reference, and renders.
+     - fluorescence_update_signal(fields, signals) -> redraws the curve.
+     - progress_signal.
+   emit_progress() itself does nothing.
+
+10. What's saved per point.
+    Only the averaged plane (when streaming) and planes_written. The field
+    recorded for the point is the REQUESTED gauss value from the linspace.
+
+
+4. KNOWN OPEN ISSUES: STATUS CHECK
+----------------------------------
+
+Issue 1: Non-swept axes preserved, not forced to zero
+  CLAUDE.md says:
+    Non-swept axes are preserved from the pre-scan state, not forced to
+    zero.
+  Code now:
+    zero_other_axes=True is the constructor default
+    (zero_field_experiment.py:52). ZeroFieldWorker.start() never passes it
+    (zero_field_worker.py:89-129), and the axis tooltip says the other axes
+    are zeroed (zero_field_widget.py:67-73). setup_scan()
+    (zero_field_experiment.py:274-321) calls set_vector(0,0,0), which is
+    CALIBRATED B=0 (compensation current on the negative branch), not 0 A.
+    Preserving the axes is still possible, but only programmatically
+    (zero_other_axes=False) and it logs a warning.
+  Status: FIXED for the GUI path; CLAUDE.md is stale.
+    The audit's matching items (sections 3, 10.2-10.3) are stale too: they
+    cite Magnet._determine_global_polarity() and a mixed-sign rejection,
+    neither of which exists anymore, since polarity is now per-axis.
+
+Issue 2: Stop is cooperative
+  CLAUDE.md says:
+    Stop is cooperative. Sleeps and acquisitions are not interrupted.
+  Code now:
+    The only check is at the top of the point loop
+    (zero_field_experiment.py:618-619) and the scan loop (line 455).
+    time.sleep at line 633 can't be interrupted, and the averages loop in
+    acquire_frame() (lines 374-385) never checks for stop.
+  Status: STILL OPEN.
+    What has improved is the RESULT of a stop: partial cubes are truncated,
+    stopped_by_user is recorded, and a partial sweep is never folded into
+    the average.
+
+Issue 3a: No field readback
+  CLAUDE.md says:
+    No field readback; settling is open-loop.
+  Code now:
+    MagnetAxis.get_field() (magnet_axis.py:325-327) returns current_field,
+    a model value. E3632A.get_current() returns the cached self.current.
+    The only response ever read from the supplies is SYST:ERR? in
+    check_error_queue().
+  Status: STILL OPEN.
+
+Issue 3b: Exposure/binning metadata is cached
+  CLAUDE.md says:
+    Exposure and binning metadata are the driver's cached value, not an
+    independent SDK query.
+  Code now:
+    _camera_setting() (zero_field_experiment.py:862-864) reads
+    camera.exposure_time and camera.binning.
+    AndorNeoAndor3.set_exposure() (andor_neo_andor3.py:499-511) fills
+    exposure_time from getFloat("ExposureTime"), so the stored value is an
+    SDK readback, but taken when exposure was last set, not when the scan
+    runs. binning is the REQUESTED value, stored after the SDK accepted it
+    (around line 627).
+  Status: PARTIALLY ADDRESSED.
+    Exposure is cached from a readback; binning is a cached request.
+
+Issue 4: Per-point repeat frames discarded
+  CLAUDE.md says:
+    Per-point repeat frames are discarded after averaging.
+  Code now:
+    acquire_frame() returns np.mean(np.stack(frames))
+    (zero_field_experiment.py:386), and nothing else keeps the individual
+    frames.
+  Status: STILL OPEN.
+
+The other claim in that section of CLAUDE.md, that the camera-contention
+and ROI-validation findings are fixed, checks out: see run() lines 406-408
+and validate_roi at line 94 of zero_field_experiment.py.
+
+
+5. GUI CONTROLS AND PARAMETERS
+------------------------------
+
+All controls are in gui/widgets/zero_field_widget.py. "Validated" means
+checked by something beyond the spinbox range.
+
+Save data
+  Controls:  whether any file is written
+  Default:   on
+  Range:     bool
+  Validated: when on, the window calls ensure_writable_directory at start.
+             Turning it off shows a one-time warning.
+
+Output directory (Browse)
+  Controls:  destination folder
+  Default:   dataOutput.zeroFieldDirectory = "data" (relative to repo root)
+  Validated: checked when browsing and again at start.
+
+Start Field (G)
+  Controls:  field_start
+  Default:   -2.0
+  Range:     +/-10000, 4 decimals
+  Validated: NO. Nothing checks it against max_current before the scan
+             starts.
+
+Stop Field (G)
+  Controls:  field_stop
+  Default:   +2.0
+  Range:     +/-10000, 4 decimals
+  Validated: NO (same). Descending sweeps and start == stop are both
+             accepted.
+
+Number of Points
+  Controls:  field_points
+  Default:   5
+  Range:     1-100000
+  Validated: the experiment checks >= 1. With field_points = 1, the
+             linspace returns only start and the stop value is silently
+             ignored.
+
+Sweep Axis
+  Controls:  field_axis
+  Default:   X
+  Range:     X / Y / Z
+  Validated: the experiment checks it is X, Y or Z.
+
+Settling Time (ms)
+  Controls:  fixed wait after each field command
+  Default:   100
+  Range:     0-600000
+  Validated: spinbox range only. A value <= 0 skips the sleep.
+
+Number of Averages
+  Controls:  frames averaged per point
+  Default:   1
+  Range:     1-100000
+  Validated: the experiment checks >= 1.
+
+Enable averaging
+  Controls:  multi-scan mode
+  Default:   off
+  Range:     bool
+  Validated: experiment type-checks it.
+
+Number of Scans
+  Controls:  num_scans (only applies when averaging is on)
+  Default:   1
+  Range:     1-100000
+  Validated: experiment checks for an int >= 1.
+
+Save individual scans
+  Controls:  keep each scan's file
+  Default:   off
+  Range:     bool
+  Validated: only enabled when averaging and saving are both on. The worker
+             forces it off if output_path is None. It is DISABLED, NOT
+             UNCHECKED, so it can stay True in the config (see section 7).
+
+Image Display
+  Controls:  Raw or Difference (vs. the first image); display only
+  Default:   Raw
+
+Display Scaling / Min / Max
+  Controls:  display levels; display only
+  Default:   Auto / 0 / 1
+  Range:     +/-1e12
+  Validated: Min < Max is checked when rendering.
+
+Colormap, Line Profile
+  Controls:  display only
+  Default:   Gray / off
+
+Not exposed in the GUI:
+  - zero_other_axes: always True.
+  - check_power_supply_errors: only via NV_ZFE_CHECK_PS_ERRORS=1.
+  - timing_diagnostics: only via NV_ZFE_TIMING=1.
+  - Exposure, binning and ROI: these come from Main Window's
+    AcquisitionState.
+
+The real field limits come from max_current = 5 A on every axis: about
++/-44 G on X, +/-37 G on Y, and about -39 to +41 G on Z. Those limits are
+only enforced per point, by plan_field(), DURING the scan.
+
+
+6. DATA OUTPUT
+--------------
+
+Files (all HDF5, .h5):
+
+  Saving on, single scan:
+    <dir>/zero_field_<ts>.h5 is streamed plane by plane. finalize() sets
+    scan_complete=True; on a stop or error, close() truncates the file
+    instead. merge_hdf5_metadata then patches the final metadata in.
+
+  Saving on, N scans:
+    <dir>/zero_field_<ts>_scan_NNN.h5 is streamed for EVERY scan for crash
+    safety, then unlinked once folded into the average unless "Save
+    individual scans" is on.
+    <dir>/zero_field_<ts>_average.h5 is rewritten atomically after every
+    completed scan and again at the end.
+
+  Saving off:
+    Nothing is written. "Save Data" later serializes the in-memory cube
+    with ImageCube.save(). When saving was on, "Save Data" is just
+    shutil.copy2 of the existing file.
+
+  NV_ZFE_TIMING=1:
+    data/zero_field_timing_<ts>.csv, relative to the PROCESS CWD, not the
+    configured output directory (zero_field_worker.py:178).
+
+HDF5 layout:
+  - data: float64, since frames are averaged. Gzip level 4, one chunk per
+    plane.
+  - scan_axis_values
+  - metadata_json and axes_json (string datasets)
+  - scan_axis_name and scan_axis_unit (attrs)
+
+Metadata recorded per scan or cube:
+
+  From the window:
+    scan_parameters (the whole widget config dict);
+    camera_parameters {exposure_s, binning, acquisition_roi} from Main
+    Window's AcquisitionState. These are the REQUESTED settings.
+
+  Static:
+    experiment_name, acquisition_started_at_utc, acquisition_roi,
+    camera_exposure_s, camera_binning, camera_model, field_axis,
+    field_values_gauss, field_point_count, field_start_gauss,
+    field_stop_gauss, settling_time_ms, averages_per_point,
+    zero_other_axes, initial_magnet_vector_mT, non_swept_axis_field_mT,
+    power_supply_models, magnet_configuration (a deep copy of the
+    Helmholtz config, including both calibration branches and
+    scpi_write_delay_s)
+
+  Shape:
+    image_height_px, image_width_px, image_dtype
+
+  Averaging:
+    averaging_enabled, num_scans, save_raw_scans, completed_scans,
+    experiment_complete, stopped_by_user, scan_entry_magnet_vectors_mT,
+    raw_scan_filenames (only when raw saving is on)
+
+  Streaming:
+    planes_written, scan_complete
+
+Values that are model, commanded or cached rather than read from hardware:
+  - field_values_gauss and scan_axis_values: the REQUESTED linspace. These
+    aren't even the model field: in Y's branch gap the model field is the
+    intercept, but the requested value is what gets recorded.
+  - initial_magnet_vector_mT and scan_entry_magnet_vectors_mT:
+    MagnetAxis.current_field model values.
+  - non_swept_axis_field_mT: commanded values.
+  - camera_exposure_s: an SDK readback cached at the last set_exposure().
+  - camera_binning: the requested value, cached.
+  - camera_parameters.*: GUI state.
+
+Never recorded:
+  per-point polarity or branch, per-point coil current, relay-flip events,
+  per-point timestamps, the full per-point 3-axis vector, and the
+  definition used for "fluorescence".
+
+
+7. GAPS AND WEAK POINTS (OWN ASSESSMENT)
+---------------------------------------
+
+ACTIVE RISKS
+
+1. Nothing stops the Magnet Control window from driving the magnet during
+   a ZFE scan.
+   gui/magnet_window.py calls magnet.enable(), disable(), axis.set_field()
+   and set_vector() directly (lines ~405-425, 590, 616). No lock exists in
+   hardware/magnet/ or in SerialDevice
+   (hardware/interfaces/serial_device.py). Two consequences:
+     - Concurrent jogging interleaves unpaced SCPI writes on the same
+       9600-baud ports, the same kind of traffic that caused the overrun
+       fixed on 2026-09-13.
+     - Pressing "Power off" mid-scan turns the outputs off, and the scan
+       keeps running. set_field(..., keep_output_enabled=True) writes
+       current into an off supply (magnet_axis.py:232-274) and records the
+       target as the model field, so the file looks like a normal scan.
+
+2. Closing the main window while a ZFE scan is running.
+   MainWindow.closeEvent (main_window.py ~905-940) only checks whether ODMR
+   is running. It then calls zero_field_window.close() and ignores whether
+   that close was refused, then immediately calls hw_manager.shutdown().
+   Shutdown runs magnet.disable() and disconnects the supplies from the GUI
+   thread while the worker thread may still be in the middle of set_vector
+   or grab_software_frame. Nothing waits for the worker thread to finish.
+   ZeroFieldWindow.closeEvent (zero_field_window.py:473-486) also accepts
+   the close right after requesting a stop.
+
+3. Field range is only checked during the scan.
+   The spinboxes allow +/-10000 G (zero_field_widget.py:53-58), but the
+   coils reach only about 37-44 G. plan_field() raises at the first point
+   it can't reach (magnet_axis.py:146-147). The worker then emits
+   finished(None) (zero_field_worker.py:154-158), so the in-memory result
+   is lost from the GUI. A single-scan streamed file survives truncated; a
+   multi-scan run loses the scan in progress.
+
+4. RAM use grows quadratically in copy cost.
+   ImageCube.add() concatenates on every point (image_cube.py:75-95), so
+   each point copies the whole float64 cube, and the full cube stays in RAM
+   even while streaming. Multi-scan runs hold an extra float64 average on
+   top. A full 2560x2160 frame is about 44 MB as float64, so 100 points is
+   about 4.4 GB, plus transient copies of the same size. The GUI allows
+   100000 points.
+
+5. The recorded field axis can differ from the field actually modelled,
+   and the file can't show it.
+     - In Y's branch gap (0.0623-0.0662 G), the model field is the
+       intercept but the requested value is recorded (magnet_axis.py:143
+       vs. zero_field_experiment.py:323-333).
+     - In the overlap regions (X: 0.121-0.128 G; Z: 1.172-1.177 G), the
+       branch used depends on sweep history, and branch/polarity isn't
+       recorded per point.
+   The magnitudes are small, but they sit right in the near-zero region a
+   ZFE scan is meant to resolve.
+
+6. A relay flip mid-sweep gets the same settling time as a normal step.
+   _switch_polarity cuts and then restores coil current
+   (magnet_axis.py:202-230), which is a much larger transient than an
+   incremental step. Its 50 ms delays are documented as needing physical
+   verification. The point right after a flip gets the ordinary
+   settling_time_ms (zero_field_experiment.py:628-635), and nothing in the
+   data marks it.
+
+WORTH DISCUSSING / UNPOLISHED
+
+7. Each scan in a multi-scan run fully disables and re-enables the magnet
+   (setup_scan line 257, cleanup_scan line 343 of
+   zero_field_experiment.py). Coils go to 0 A with outputs off between
+   scans; then set_vector(0,0,0) may flip relays again. So point 0 of every
+   scan comes after a step up from 0 A, unlike every other point. This is
+   safe, but it may hurt scan-to-scan comparability at the first point.
+
+8. The "entry vector" is recorded after magnet.enable() has already run
+   (zero_field_experiment.py line 257 vs. line 269). The comment at line
+   266 says it is what was there "before this scan touches anything". On a
+   first enable with unknown relay state, enable() zeroes and forces the
+   positive branch. For scans 2 and later it is always the post-disable()
+   intercept values. Either way it verifies less than the widget tooltip
+   implies.
+
+9. A stopped multi-scan leaves a stray partial file.
+   The incomplete scan's _scan_NNN.h5 stays on disk: run() breaks at
+   zero_field_experiment.py:484-487 before reaching the unlink at
+   lines 523-530. This happens even when "Save individual scans" is off,
+   and the file isn't listed in raw_scan_filenames.
+
+10. The streaming writer rewrites metadata by deleting and recreating it on
+    every plane (image_cube.py:513-520, called at line ~562). That is
+    exactly the pattern merge_hdf5_metadata's own docstring
+    (image_cube.py:394-418) rejects because a crash in between leaves no
+    metadata dataset. The window is small, but this is the crash-safety
+    path.
+
+11. Stop latency has no practical bound.
+    Settling can be up to 600 s and averages up to 100000 per point, and
+    neither can be interrupted. This is the known stop issue, but the GUI
+    ranges make it unbounded in practice.
+
+12. The timing CSV mislabels its camera fields.
+    Its header says exposure and binning are the "actual camera read-back"
+    (zero_field_worker.py:204-207). They are cached attributes, and binning
+    is the requested value.
+
+13. "Save individual scans" can stay True when it doesn't apply.
+    It is disabled rather than unchecked (zero_field_widget.py:330-337). If
+    averaging is off, metadata records save_raw_scans: True and no raw
+    files exist.
+
+14. zero_other_axes=False can crash.
+    In that path, abs(None) raises a TypeError if any axis's get_field() is
+    None after a failed write (zero_field_experiment.py:301-306). The GUI
+    can't reach this path today.
+
+15. A ZFE scan started during an ODMR scan waits silently.
+    It blocks on experiment_lock at zero_field_experiment.py:406 while the
+    GUI shows "Running", with no feedback. If Stop is pressed while it's
+    blocked, the ROI is still set and the camera still armed once the lock
+    is released, before the stop is noticed.
+
+16. "Saved" can be reported for an empty file.
+    The status line says "saved <name>" whenever output_path is set
+    (zero_field_window.py:351-354), even if the run was stopped before any
+    frame was acquired.
+
+17. The docs are behind the code.
+    The CLAUDE.md non-swept-axes item and audit sections 3 / 10.2-10.3
+    describe behaviour (preserved axes, global polarity) the code no longer
+    has.

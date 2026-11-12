@@ -1,0 +1,261 @@
+WORKING TREE REPORT -- uncommitted changes on dev
+Date: 2026-11-10
+Base: dev = origin/dev = 4955aed (feat(gui): add persisted colormap selector to the live view)
+Nothing was committed, staged, or modified while preparing this report
+(apart from writing this file).
+
+
+SUMMARY
+=======
+
+Everything Claude did as a feature in this session is already committed and
+pushed (a05c5e4 .. 4955aed). Claude has no remaining changes in any tracked
+file. Claude's only uncommitted work is:
+  - one untracked report it wrote (docs/zero_field_stack_report_2026-11-09.txt)
+  - small test-only edits inside three of your untracked ODMR test files
+  - one cosmetic reorder in tests/conftest.py, caused by how earlier
+    commits were staged
+
+Everything else in the working tree is yours.
+
+
+git status (abridged)
+=====================
+
+  deleted:    PROJECT_STATUS_REPORT.md
+  modified:   analysis/odmr_fit.py
+  modified:   config/setupInfo.json
+  modified:   experiments/odmr_experiment.py
+  modified:   framework/image_cube.py
+  modified:   gui/main_window.py
+  modified:   gui/odmr_window.py
+  modified:   gui/odmr_worker.py
+  modified:   gui/panels/odmr_panel.py
+  modified:   tests/conftest.py
+  untracked:  18 files (listed in group 3)
+
+
+git diff --stat
+===============
+
+  PROJECT_STATUS_REPORT.md       | 810 ------------------------------
+  analysis/odmr_fit.py           | 420 +++++++++++++++-
+  config/setupInfo.json          |   4 +-
+  experiments/odmr_experiment.py | 198 +++++---
+  framework/image_cube.py        |  11 +-
+  gui/main_window.py             |  21 +-
+  gui/odmr_window.py             |  67 ++-
+  gui/odmr_worker.py             | 178 +++++--
+  gui/panels/odmr_panel.py       | 229 ++++++++-
+  tests/conftest.py              |  10 +-
+  10 files changed, 1044 insertions(+), 904 deletions(-)
+
+
+GROUP 1 -- FILES THAT ARE PURELY CLAUDE'S
+=========================================
+
+Tracked files:
+  None. Every tracked-file change Claude made has been committed.
+
+Untracked files:
+  docs/zero_field_stack_report_2026-11-09.txt
+    The ZFE stack audit report from 2026-11-09. It is wholly Claude's
+    and safe to commit as-is.
+
+
+GROUP 2 -- MIXED FILES (Claude's + yours)
+=========================================
+
+tests/conftest.py
+-----------------
+Hunk (ALLOWED_FILES, lines 20-42):
+
+  YOURS -- adds the 8 ODMR test files:
+    + "test_odmr_analysis_gui.py",
+    + "test_odmr_fit.py",
+    + "test_odmr_preliminary_fit_gui.py",
+    + "test_odmr_magnetic.py",
+    + "test_odmr_pixel_statistics.py",
+    + "test_odmr_pixel_fit.py",
+    + "test_odmr_statistics.py",
+    + "test_odmr_statistics_gui.py",
+  These were already in your working copy before Claude's work started:
+  conftest.py showed as modified in the session-start git status.
+
+  CLAUDE'S (cosmetic) -- swaps two lines:
+    - "test_magnet_scpi_traffic.py",
+      "test_main_window_close_safety.py",
+    + "test_magnet_scpi_traffic.py",
+  This happened when commit d98023d was staged. Claude added
+  test_main_window_close_safety.py at one position in the working copy,
+  but the commit placed it after test_magnet_scpi_traffic.py. The entries
+  are the same; only the order differs. ALLOWED_FILES is a frozenset, so
+  the order has no effect. It is safe to commit either way, or to restore
+  the committed order before committing.
+
+Untracked test files containing Claude edits (the rest of each file is yours):
+
+  tests/test_odmr_analysis_gui.py  (hang fix, made at your request)
+    test_pixel_worker_success_runs_off_gui_thread_and_emits_result and
+    test_pixel_worker_failure_emits_error_and_stops_thread:
+      - removed the thread.finished -> deleteLater connections
+      - added self.assertTrue(thread.wait(5000)) after the finished
+        signal (now lines 481 and 518)
+      - added self.assertTrue(thread.isFinished()) (lines 482 and 519)
+      - added the explanatory comment about the QThread/GIL deadlock
+
+  tests/test_odmr_statistics_gui.py, line 140
+  tests/test_odmr_pixel_statistics.py, line 350
+      + run_finished=SimpleNamespace(emit=lambda: None),
+    Added to each file's fake ODMR window/panel object after the
+    magnet-lock commit (a05c5e4). That commit made
+    ODMRWindow.odmr_finished() emit run_finished, and these fakes lacked
+    it. Without the line, both files fail against the committed code.
+
+Files Claude checked and found to contain none of its changes:
+
+  gui/main_window.py
+    ALL YOURS. The 4 remaining hunks are the ODMR analysis window wiring:
+      - import ODMRAnalysisWindow
+      - self.odmr_analysis_window = None
+      - odmr_window.analysis_requested -> open_odmr_analysis_window
+        (this replaces a blank line)
+      - open_odmr_analysis_window() and _odmr_analysis_window_destroyed()
+    Claude's colormap, lock and close-safety code is all in HEAD.
+
+  framework/image_cube.py
+    ALL YOURS. There is one hunk, in _save_hdf5():
+      - chunk_shape = (1,) + data.shape[1:]
+      + chunk_shape = (1,) * (data.ndim - 2) + data.shape[-2:]
+      - if not chunk_shape or any(dim == 0 for dim in chunk_shape):
+      + if not chunk_shape or any(dim == 0 for dim in data.shape):
+    The new shape makes one chunk per 2-D image plane for cubes with more
+    than one leading dimension, presumably for the ODMR statistics cube.
+    Claude's pre-allocation commit (eeca74f) did not touch _save_hdf5.
+
+  config/setupInfo.json
+    ALL YOURS (two hunks, neither from source code edited by Claude):
+      - frequencyGenerators[0].address: 132.64.56.186 -> 132.64.56.39
+        (SG386 address; present since session start)
+      - display.live_view_colormap: "gray" -> "viridis"
+        This was written by the app at runtime when Viridis was picked in
+        the live-view selector after 4955aed. Claude's smoke test ended with
+        the file byte-identical to the commit, so this was a later
+        selection.
+
+  experiments/odmr_experiment.py, gui/odmr_window.py, gui/odmr_worker.py,
+  gui/panels/odmr_panel.py, analysis/odmr_fit.py
+    ALL YOURS. Searched for Claude's committed features (MAGNET_IS_SWEPT,
+    run_started/run_finished, worker_thread, request_stop, closeEvent):
+    0 matches in the remaining diff. Claude's ODMR edits (MAGNET_IS_SWEPT,
+    the run signals, closeEvent) are in HEAD.
+
+  PROJECT_STATUS_REPORT.md (deleted at the repo root)
+    YOURS. See the warning under "Things to decide before committing".
+
+
+GROUP 3 -- NEW, UNTRACKED FILES
+===============================
+
+  Claude's:
+    docs/zero_field_stack_report_2026-11-09.txt
+    docs/working_tree_report_2026-11-10.txt   (this file)
+
+  Yours (with the Claude test edits noted in group 2):
+    analysis/odmr_magnetic.py
+    analysis/odmr_pixel_fit.py
+    framework/analysis/odmr_statistics.py
+    gui/odmr_analysis_window.py
+    gui/odmr_analysis_worker.py
+    gui/panels/odmr_analysis_panel.py
+    odmr_analysis_main.py
+    docs/CAMERA_BINNING_FIX_REPORT.md        (dated 2026-10-04)
+    docs/ODMR_PIPELINE_INVESTIGATION_REPORT.md (dated 2026-10-05)
+    tests/test_odmr_analysis_gui.py          *Claude edit
+    tests/test_odmr_fit.py
+    tests/test_odmr_magnetic.py
+    tests/test_odmr_pixel_fit.py
+    tests/test_odmr_pixel_statistics.py      *Claude edit
+    tests/test_odmr_preliminary_fit_gui.py
+    tests/test_odmr_statistics.py
+    tests/test_odmr_statistics_gui.py        *Claude edit
+
+
+SUGGESTED LOGICAL COMMITS
+=========================
+
+The ODMR work splits into three themes, but gui/odmr_window.py
+(8 hunks), gui/panels/odmr_panel.py (4) and gui/odmr_worker.py (8) mix
+them. Claude has not read those hunks closely enough to promise a clean
+three-way split. Option A is the one Claude can stand behind without more
+checking. Option B needs a per-hunk pass, plus a test run on each
+intermediate tree so that no commit is broken on its own.
+
+Option A -- two commits for the ODMR work, plus housekeeping
+
+  1. feat(odmr): per-pixel statistics, Lorentzian fitting, and offline
+     analysis window
+       experiments/odmr_experiment.py, gui/odmr_worker.py,
+       gui/odmr_window.py, gui/panels/odmr_panel.py, analysis/odmr_fit.py,
+       framework/image_cube.py (_save_hdf5 chunking),
+       framework/analysis/odmr_statistics.py, analysis/odmr_magnetic.py,
+       analysis/odmr_pixel_fit.py, gui/odmr_analysis_window.py,
+       gui/odmr_analysis_worker.py, gui/panels/odmr_analysis_panel.py,
+       odmr_analysis_main.py, gui/main_window.py (analysis-window hunks),
+       the 8 tests/test_odmr_*.py files, and tests/conftest.py (the 8
+       ODMR entries).
+     CLAUDE.md should be updated in the same commit, per its own rule.
+     It does not yet describe any of this. Its test-count line
+     (93 files / 36 real) becomes exact only once these 8 test files are
+     committed.
+
+  2. docs: add ODMR camera-binning and pipeline investigation reports,
+     plus the ZFE stack audit
+       docs/CAMERA_BINNING_FIX_REPORT.md,
+       docs/ODMR_PIPELINE_INVESTIGATION_REPORT.md,
+       docs/zero_field_stack_report_2026-11-09.txt,
+       optionally docs/working_tree_report_2026-11-10.txt
+
+  3. Root PROJECT_STATUS_REPORT.md deletion: a separate commit, but only
+     after deciding where the report should live (see below).
+
+  Not committed: config/setupInfo.json (see below).
+
+Option B -- split commit 1 above into three
+  1a. feat(odmr): per-pixel repeat statistics during acquisition
+      (odmr_experiment, odmr_worker, odmr_statistics, image_cube
+      chunking, statistics hunks in odmr_window/odmr_panel, the
+      test_odmr_statistics* and test_odmr_pixel_statistics tests)
+  1b. feat(odmr): manual initial guesses for single/double Lorentzian fits
+      (analysis/odmr_fit.py, InitialFitParametersDialog and the fit_esr
+      hunks, test_odmr_fit, test_odmr_preliminary_fit_gui)
+  1c. feat(odmr): offline ODMR analysis window with pixel fits and Bz maps
+      (the odmr_analysis_* files, odmr_magnetic, odmr_pixel_fit,
+      odmr_analysis_main, the analysis_requested hunks, the main_window
+      hunks, test_odmr_analysis_gui, test_odmr_pixel_fit,
+      test_odmr_magnetic)
+
+
+THINGS TO DECIDE BEFORE COMMITTING
+==================================
+
+1. PROJECT_STATUS_REPORT.md. Deleting it at the root would remove it from
+   git entirely. A copy exists at docs/PROJECT_STATUS_REPORT.md, but:
+     - .gitignore line 18 ("PROJECT_STATUS_REPORT.md") ignores it at any
+       depth, so the docs/ copy is ignored and would not be committed;
+     - it is not identical to the root version (first difference at line
+       168), so it has been edited since.
+   If the intent is to move it into docs/, the .gitignore rule needs to
+   change (e.g. to "/PROJECT_STATUS_REPORT.md") and the docs/ copy
+   added. Otherwise the deletion drops the report from history going
+   forward.
+
+2. config/setupInfo.json. Both hunks are rig state, not code:
+     - the SG386 address is presumably the address that works on the rig
+       now; commit it only if it should be the shared default;
+     - live_view_colormap = "viridis" is a runtime preference. Committing
+       it changes the default for everyone, so restoring it to "gray" or
+       leaving it uncommitted is probably right.
+
+3. tests/conftest.py ordering hunk (Claude's). It is harmless. Revert it
+   or include it as you prefer.
