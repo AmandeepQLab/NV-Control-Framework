@@ -3,10 +3,10 @@ from experiments.odmr_experiment import ODMRExperiment
 import numpy as np # type: ignore
 import time
 
-from PyQt6.QtWidgets import QMainWindow, QMessageBox # type: ignore
+from PyQt6.QtWidgets import QMainWindow, QMessageBox, QDialog # type: ignore
 from PyQt6.QtCore import QThread, pyqtSignal # type: ignore
 
-from gui.panels.odmr_panel import ODMRPanel
+from gui.panels.odmr_panel import ODMRPanel, InitialFitParametersDialog
 from gui.odmr_worker import ODMRWorker
 from data.data_manager import DataManager
 from gui.pulse_sequence_window import PulseSequenceWindow
@@ -81,6 +81,7 @@ class ODMRWindow(QMainWindow):
         self.odmr_worker = None
         self.odmr_thread = None
         self.odmr_running = False
+        self.initial_fit_guesses = {"Single Lorentzian": None, "Double Lorentzian": None}
 
         self.panel = ODMRPanel()
         self.setCentralWidget(self.panel)
@@ -89,6 +90,7 @@ class ODMRWindow(QMainWindow):
         self.panel.sequence_button.clicked.connect(self.show_pulse_sequence)
         self.panel.plot_mode_combo.currentTextChanged.connect(self.refresh_plot)
         self.panel.fit_button.clicked.connect(self.fit_esr)
+        self.panel.initial_fit_parameters_button.clicked.connect(self.supply_initial_fit_parameters)
 
     # =====================================================
     # RUN / STOP TOGGLE
@@ -370,16 +372,34 @@ class ODMRWindow(QMainWindow):
         try:
 
             fit_type = self.panel.get_fit_type()
+            manual = self.initial_fit_guesses[fit_type]
+            if manual is not None:
+                low, high = float(np.min(self.latest_x)), float(np.max(self.latest_x))
+                locations = [manual["f0"]] if fit_type == "Single Lorentzian" else [manual["f01"], manual["f02"]]
+                if any(location < low or location > high for location in locations):
+                    raise ValueError(f"Resonance locations must lie within the measured range ({low:g}-{high:g} GHz).")
 
             if fit_type == "Single Lorentzian":
+                initial_guess = None if manual is None else [
+                    None, manual["contrast"], manual["f0"],
+                    None if manual["fwhm"] is None else manual["fwhm"] / 1000.0,
+                ]
                 fit = fit_single_lorentzian(
                     self.latest_x,
-                    self.latest_y
+                    self.latest_y,
+                    **({} if initial_guess is None else {"initial_guess": initial_guess})
                 )
             else:
+                initial_guess = None if manual is None else [
+                    None, manual["contrast1"], manual["f01"],
+                    None if manual["fwhm1"] is None else manual["fwhm1"] / 1000.0,
+                    manual["contrast2"], manual["f02"],
+                    None if manual["fwhm2"] is None else manual["fwhm2"] / 1000.0,
+                ]
                 fit = fit_double_lorentzian(
                     self.latest_x,
-                    self.latest_y
+                    self.latest_y,
+                    **({} if initial_guess is None else {"initial_guess": initial_guess})
                 )
 
             self.panel.update_fit_results(fit)
@@ -400,6 +420,14 @@ class ODMRWindow(QMainWindow):
                 "Fit Error",
                 str(e)
             )
+
+    def supply_initial_fit_parameters(self):
+        fit_type = self.panel.get_fit_type()
+        dialog = InitialFitParametersDialog(
+            fit_type, self.initial_fit_guesses[fit_type], self
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.initial_fit_guesses[fit_type] = dialog.parsed_values()
 
     # =====================================================
     # FINISHED

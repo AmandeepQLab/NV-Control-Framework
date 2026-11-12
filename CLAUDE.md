@@ -113,6 +113,24 @@ Both selectors offer the same list: `gui/display_settings.py::COLORMAP_NAMES` (G
 
 **HDF5 chunking** (`ImageCube._save_hdf5()`): one chunk per 2-D image plane for any number of leading dimensions, `(1, …, 1, H, W)`. Before, it was one chunk per leading index, which made the 5-D statistics cube chunk whole `(2, n_freq, H, W)` blocks.
 
+## ODMR fitting
+
+**Live ODMR window fits** use `fit_single_lorentzian()` / `fit_double_lorentzian()` in `analysis/odmr_fit.py`, in GHz and percent. Both take an optional `initial_guess`: a parameter list in fit order where a `None` entry means "use the automatic guess".
+
+- "Supply Initial Fit Parameters" (`InitialFitParametersDialog`) collects values for the currently selected fit type:
+  - resonance location(s) in GHz — required;
+  - contrast (%) and FWHM (MHz) — optional; blank means automatic.
+- The baseline is always automatic.
+- `ODMRWindow.fit_esr()` converts FWHM MHz→GHz and rejects resonance locations outside the measured range.
+- Guesses are kept per fit type in `ODMRWindow.initial_fit_guesses` for that window's lifetime only; they are not persisted.
+
+**Two-Lorentzian spectrum fit (Hz units throughout).** These are used by the offline analysis, not the live window's "Fit Lorentzian" button.
+- `fit_two_lorentzian_spectrum()` fits one spectrum with ordered dips.
+  - Centres are reparameterised through a logit, so f₋ stays inside the measured range and f₊ stays between f₋ and the top of the range.
+  - It needs at least 8 strictly increasing frequencies and finite samples. Non-finite samples are skipped.
+  - Invalid input raises `ValueError`. Optimizer failure returns an unsuccessful `TwoLorentzianFitResult`, never made-up values.
+- `fit_global_odmr_spectrum()` fits the finite-pixel spatial mean of a `(frequency, y, x)` final-mean cube; `global_mean_odmr_spectrum()` computes that mean. `TwoLorentzianInitialGuess` holds reusable starting values.
+
 ## Dead code — do not build on these
 
 Confirmed unused by the running application; each is either an abandoned duplicate or a stub with no subclasses:
@@ -185,7 +203,7 @@ These are characterized properties of the current rig/sample, not code facts —
 
 ## Testing safety — read before running pytest with `--hardware`
 
-`tests/` contains 88 test files (excluding `__init__.py`/`conftest.py`). Only 31 are real, hardware-free pytest tests — see `tests/conftest.py::ALLOWED_FILES` for the current, authoritative list rather than a copy here that will drift the next time a file is added to it (as just happened for this change). **The other ~57 are ad-hoc scripts that command real lab hardware — the Andor camera, the SG386 microwave source over VISA, the Swabian pulse streamer, the Helmholtz power supplies — unconditionally at module import time, not just inside a test function.** Several have no `if __name__ == "__main__":` guard at all: importing them fires a relay, streams a pulse, or turns on a power-supply output as a side effect of Python loading the file.
+`tests/` contains 90 test files (excluding `__init__.py`/`conftest.py`). Only 33 are real, hardware-free pytest tests — see `tests/conftest.py::ALLOWED_FILES` for the current, authoritative list rather than a copy here that will drift the next time a file is added to it (as just happened for this change). **The other ~57 are ad-hoc scripts that command real lab hardware — the Andor camera, the SG386 microwave source over VISA, the Swabian pulse streamer, the Helmholtz power supplies — unconditionally at module import time, not just inside a test function.** Several have no `if __name__ == "__main__":` guard at all: importing them fires a relay, streams a pulse, or turns on a power-supply output as a side effect of Python loading the file.
 
 `pytest.ini` (`testpaths = tests`) plus `tests/conftest.py`'s `pytest_ignore_collect` hook gate this: a bare `pytest` run only collects the files named in `ALLOWED_FILES`. The gate is an allowlist, not a denylist — anything not explicitly named there is excluded from collection entirely, so it is never imported. Passing `--hardware` lifts the restriction and collects everything, including every hardware-commanding script.
 
