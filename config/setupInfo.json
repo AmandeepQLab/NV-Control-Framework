@@ -55,7 +55,7 @@
    "frequencyGenerators":[
       {
         "type": "srs",
-        "address": "132.64.56.186",
+        "address": "132.64.56.39",
         "port": 5025,
         "serialNumber": "SN-NA",
         "minFrequency": 0,
