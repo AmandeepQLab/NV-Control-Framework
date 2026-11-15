@@ -114,8 +114,37 @@ class ZeroFieldWidget(QWidget):
         )
         self.save_raw_scans_check = QCheckBox("Save individual scans")
         averaging_layout.addWidget(self.save_raw_scans_check)
+        alternate_row = QHBoxLayout()
+        self.alternate_direction_check = QCheckBox("Alternate sweep direction")
+        # Scans are numbered from 1 in this window (and in raw file names),
+        # so the tooltip names them that way; see
+        # ZeroFieldExperiment.scan_is_reversed().
+        self.alternate_direction_check.setToolTip(
+            "Scans 1, 3, 5, … sweep start→stop; scans 2, 4, 6, … sweep "
+            "stop→start. Results are averaged by field value, so linear "
+            "drift within a sweep cancels. Use an even number of scans."
+        )
+        alternate_row.addWidget(self.alternate_direction_check)
+        # Non-blocking: an odd scan count still runs, it just can't pair
+        # every forward sweep with a reverse one.
+        self.alternate_direction_warning = QLabel("⚠ Odd number of scans")
+        self.alternate_direction_warning.setStyleSheet("color: #c06000;")
+        self.alternate_direction_warning.setToolTip(
+            "With an odd number of scans there is one more forward sweep than "
+            "reverse sweeps, so linear drift does not fully cancel. The scan "
+            "will still run."
+        )
+        alternate_row.addWidget(self.alternate_direction_warning)
+        alternate_row.addStretch()
+        averaging_layout.addLayout(alternate_row)
         self.averaging_enabled_check.toggled.connect(
             self._set_averaging_controls_enabled
+        )
+        self.alternate_direction_check.toggled.connect(
+            self._update_alternate_direction_warning
+        )
+        self.num_scans_spin.valueChanged.connect(
+            self._update_alternate_direction_warning
         )
         self.averaging_enabled_check.toggled.connect(
             self._update_save_raw_scans_enabled
@@ -259,6 +288,12 @@ class ZeroFieldWidget(QWidget):
             "averaging_enabled": self.averaging_enabled_check.isChecked(),
             "num_scans": self.num_scans_spin.value(),
             "save_raw_scans": self.save_raw_scans_check.isChecked(),
+            # A disabled checkbox keeps its checked state; it must not
+            # silently apply while averaging is off.
+            "alternate_direction": (
+                self.alternate_direction_check.isChecked()
+                and self.alternate_direction_check.isEnabled()
+            ),
             "save_data": self.save_data_check.isChecked(),
         }
 
@@ -330,11 +365,24 @@ class ZeroFieldWidget(QWidget):
         )
         self.line_profile_curve.setData(distances, values)
 
-    def update_scan_progress(self, current, total):
-        self.current_scan_label.setText(f"Current scan: {current} / {total}")
+    def update_scan_progress(self, current, total, direction=None):
+        text = f"Current scan: {current} / {total}"
+        if direction is not None:
+            text += f" ({direction})"
+        self.current_scan_label.setText(text)
 
     def _set_averaging_controls_enabled(self, enabled):
         self.num_scans_spin.setEnabled(enabled)
+        self.alternate_direction_check.setEnabled(enabled)
+        self._update_alternate_direction_warning()
+
+    def _update_alternate_direction_warning(self, _value=None):
+        """Show the odd-scan-count warning only when it applies."""
+        self.alternate_direction_warning.setVisible(
+            self.alternate_direction_check.isChecked()
+            and self.alternate_direction_check.isEnabled()
+            and self.num_scans_spin.value() % 2 == 1
+        )
 
     def _update_save_raw_scans_enabled(self, _value=None):
         """"Save individual scans" is meaningless with saving off, and

@@ -33,6 +33,28 @@ _HDF5_AXES_JSON_KEY = "axes_json"
 # today.
 _NPZ_DATA_MEMBER_NAME = "data"
 
+# Names the HDF5 layout already uses; an extra dataset may not take one.
+_HDF5_RESERVED_KEYS = frozenset({
+    _HDF5_DATA_KEY,
+    _HDF5_SCAN_AXIS_VALUES_KEY,
+    _HDF5_METADATA_JSON_KEY,
+    _HDF5_AXES_JSON_KEY,
+})
+
+# Prefix for extra datasets inside a legacy .npz archive, keeping them
+# apart from the archive's own fixed member names.
+_NPZ_EXTRA_PREFIX = "extra_dataset__"
+
+
+def _validate_extra_dataset_name(name):
+    if (
+        not isinstance(name, str)
+        or not name
+        or "/" in name
+        or name in _HDF5_RESERVED_KEYS
+    ):
+        raise ValueError(f"Invalid ImageCube extra dataset name: {name!r}")
+
 
 def _decode_h5_string(value):
     """Normalize an h5py-returned string, which may arrive as bytes."""
@@ -59,7 +81,13 @@ class ImageCube:
         scan_axis_unit=None,
         scan_axis_values=None,
         expected_planes=None,
+        extra_datasets=None,
     ):
+
+        # Named arrays saved alongside ``data`` as their own top-level HDF5
+        # datasets (e.g. a Zero Field average's forward_average /
+        # reverse_average), and read back by load(). Empty for most cubes.
+        self.extra_datasets = {} if extra_datasets is None else dict(extra_datasets)
 
         # When the plane count is known upfront (a scan with a fixed number
         # of points), add() fills a buffer allocated once on the first frame
@@ -227,8 +255,13 @@ class ImageCube:
 
     def _save_npz(self, filename):
 
+        extras = {}
+        for name, value in self.extra_datasets.items():
+            _validate_extra_dataset_name(name)
+            extras[_NPZ_EXTRA_PREFIX + name] = np.asarray(value)
         np.savez(
             filename,
+            **extras,
             data=self.data,
             axes=np.array(self.axes, dtype=object),
             metadata=np.array(self.metadata, dtype=object),
@@ -261,6 +294,19 @@ class ImageCube:
                     shuffle=True,
                 )
             handle.create_dataset(_HDF5_DATA_KEY, data=data, **dataset_kwargs)
+
+            for name, value in self.extra_datasets.items():
+                _validate_extra_dataset_name(name)
+                value = np.asarray(value)
+                extra_kwargs = {}
+                if value.ndim >= 3 and all(dim > 0 for dim in value.shape):
+                    extra_kwargs.update(
+                        chunks=(1,) * (value.ndim - 2) + value.shape[-2:],
+                        compression="gzip",
+                        compression_opts=4,
+                        shuffle=True,
+                    )
+                handle.create_dataset(name, data=value, **extra_kwargs)
 
             # ``np.asarray(None, dtype=np.float64)`` silently yields
             # ``array(nan)`` rather than raising, so a ``None`` cube would
@@ -310,7 +356,13 @@ class ImageCube:
 
         with np.load(filename, allow_pickle=True) as saved:
 
+            extra_datasets = {
+                key[len(_NPZ_EXTRA_PREFIX):]: saved[key]
+                for key in saved.files
+                if key.startswith(_NPZ_EXTRA_PREFIX)
+            }
             return ImageCube(
+                extra_datasets=extra_datasets,
                 data=saved["data"],
                 axes=saved["axes"].item(),
                 metadata=saved["metadata"].item(),
@@ -347,6 +399,12 @@ class ImageCube:
                 _decode_h5_string(handle[_HDF5_METADATA_JSON_KEY][()])
             )
             axes = json.loads(_decode_h5_string(handle[_HDF5_AXES_JSON_KEY][()]))
+            extra_datasets = {
+                name: handle[name][()]
+                for name in handle.keys()
+                if name not in _HDF5_RESERVED_KEYS
+                and isinstance(handle[name], h5py.Dataset)
+            }
 
             experiment_type = (
                 None if handle.attrs.get("experiment_type_is_none", False)
@@ -371,6 +429,7 @@ class ImageCube:
             scan_axis_name=scan_axis_name,
             scan_axis_unit=scan_axis_unit,
             scan_axis_values=scan_axis_values,
+            extra_datasets=extra_datasets,
         )
 
     # =====================================================

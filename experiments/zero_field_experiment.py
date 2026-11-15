@@ -60,6 +60,7 @@ class ZeroFieldExperiment(ScanExperiment):
         timing_diagnostics=False,
         check_power_supply_errors=False,
         post_flip_settling_ms=0.0,
+        alternate_direction=False,
     ):
         config = {
             "settling_time_ms": settling_time_ms,
@@ -86,6 +87,8 @@ class ZeroFieldExperiment(ScanExperiment):
             raise ValueError("save_raw_scans must be a boolean.")
         if not isinstance(zero_other_axes, bool):
             raise ValueError("zero_other_axes must be a boolean.")
+        if not isinstance(alternate_direction, bool):
+            raise ValueError("alternate_direction must be a boolean.")
         post_flip_settling_ms = float(post_flip_settling_ms)
         if not np.isfinite(post_flip_settling_ms) or post_flip_settling_ms < 0:
             raise ValueError("post_flip_settling_ms must be non-negative and finite.")
@@ -112,6 +115,19 @@ class ZeroFieldExperiment(ScanExperiment):
         self.raw_scan_saver = raw_scan_saver
         self.raw_scan_filenames = []
         self.zero_other_axes = zero_other_axes
+        # Bidirectional sweeps: only meaningful with multi-scan averaging.
+        # See scan_is_reversed() for which scans run stop -> start.
+        self.alternate_direction = alternate_direction
+        self._alternating = alternate_direction and averaging_enabled
+        # Direction of the sweep currently being acquired.
+        self._sweep_reversed = False
+        # Running averages of forward-only and reverse-only completed scans,
+        # in start -> stop field order; only kept while alternating.
+        self._direction_averages = {"forward": None, "reverse": None}
+        self._direction_counts = {"forward": 0, "reverse": 0}
+        # One entry per completed (averaged) scan, in scan order.
+        self._scan_directions = []
+        self._scan_point_times_s = []
         # Optional callable: scan_index -> Path (or None to skip streaming
         # for that scan). When set, each scan's frames are written to disk
         # incrementally as they're acquired -- HDF5 only, since streaming
@@ -166,6 +182,10 @@ class ZeroFieldExperiment(ScanExperiment):
         self.model_field_values_gauss = []
         self.model_field_vector_mT = []
         self.model_polarity = []
+        # Acquisition time of each point, in seconds since its sweep started,
+        # in acquisition order. Reset per sweep.
+        self.point_time_s = []
+        self._sweep_t0 = None
 
         # Whether this run successfully armed the camera's held-open
         # software acquisition (see run()/acquire_frame()) -- mirrors
@@ -353,11 +373,14 @@ class ZeroFieldExperiment(ScanExperiment):
             axis: resolved_field_mT[axis] for axis in non_swept_axes
         }
 
-        self.scan_vector = np.linspace(
+        forward = np.linspace(
             self.field_start,
             self.field_stop,
             self.field_points,
         )
+        # A reverse sweep commands the same fields in stop -> start order;
+        # everything per point (flips, settling, model fields) follows it.
+        self.scan_vector = forward[::-1].copy() if self._sweep_reversed else forward
         if self._acquisition_started_at is None:
             self._acquisition_started_at = datetime.now(timezone.utc).isoformat()
         self._set_static_metadata()
@@ -405,6 +428,87 @@ class ZeroFieldExperiment(ScanExperiment):
             "model_field_values_gauss": list(self.model_field_values_gauss),
             "model_field_vector_mT": [list(v) for v in self.model_field_vector_mT],
             "model_polarity": [list(p) for p in self.model_polarity],
+            "point_time_s": list(self.point_time_s),
+        }
+
+    # Per-point lists that follow the field order of a sweep, and so are
+    # reversed (with the image planes) to align a reverse sweep by field.
+    # point_time_s is deliberately absent: it stays in acquisition order.
+    _FIELD_ORDERED_KEYS = (
+        "field_values_gauss",
+        "relay_flip_occurred",
+        "relay_flip_axes",
+        "model_field_values_gauss",
+        "model_field_vector_mT",
+        "model_polarity",
+    )
+
+    # Keys describing one sweep only; dropped from a multi-scan average,
+    # which records them per scan instead (scan_point_times_s,
+    # scan_directions).
+    _PER_SWEEP_ONLY_KEYS = ("point_time_s", "sweep_direction")
+
+    @staticmethod
+    def scan_is_reversed(scan_index, alternate_direction):
+        """Whether 1-based *scan_index* sweeps stop -> start.
+
+        With alternation on, scan 1 sweeps start -> stop and scans 2, 4,
+        6, ... sweep stop -> start, so a single scan, and the first scan of
+        every average, is a forward sweep.
+        """
+        return bool(alternate_direction) and scan_index % 2 == 0
+
+    @classmethod
+    def _field_ordered(cls, acquired_cube, reversed_sweep):
+        """Return *acquired_cube* aligned to start -> stop field order.
+
+        A forward sweep is returned as-is. A reverse sweep gets a new cube
+        whose image planes (a reversed view, no copy) and per-point field
+        lists are flipped, so index j means the same field in both
+        directions. point_time_s stays in acquisition order.
+        """
+        if not reversed_sweep:
+            return acquired_cube
+        metadata = dict(acquired_cube.metadata)
+        for key in cls._FIELD_ORDERED_KEYS:
+            if key in metadata:
+                metadata[key] = list(metadata[key])[::-1]
+        return ImageCube(
+            data=acquired_cube.data[::-1],
+            axes=acquired_cube.axes,
+            metadata=metadata,
+            experiment_type=acquired_cube.experiment_type,
+            scan_axis_name=acquired_cube.scan_axis_name,
+            scan_axis_unit=acquired_cube.scan_axis_unit,
+            scan_axis_values=list(acquired_cube.scan_axis_values)[::-1],
+        )
+
+    def _record_completed_scan(self, averaged_cube, ordered_cube, reversed_sweep):
+        """Per-scan bookkeeping for a multi-scan average: timestamps,
+        directions, and the forward-only / reverse-only running averages."""
+        self._scan_point_times_s.append(
+            list(ordered_cube.metadata.get("point_time_s", []))
+        )
+        if not self._alternating:
+            return
+        direction = "reverse" if reversed_sweep else "forward"
+        self._scan_directions.append(direction)
+        self._direction_counts[direction] += 1
+        if self._direction_averages[direction] is None:
+            self._direction_averages[direction] = np.array(
+                ordered_cube.data, dtype=np.float64, copy=True
+            )
+        else:
+            self._update_running_average(
+                self._direction_averages[direction],
+                ordered_cube.data,
+                self._direction_counts[direction],
+            )
+        # A direction with no completed scan gets no dataset at all.
+        averaged_cube.extra_datasets = {
+            f"{name}_average": average
+            for name, average in self._direction_averages.items()
+            if average is not None
         }
 
     @staticmethod
@@ -589,6 +693,10 @@ class ZeroFieldExperiment(ScanExperiment):
                             self.scan_started_callback(scan_index, scan_count)
 
                         scan_t0 = time.perf_counter() if self._timing else None
+                        reversed_sweep = self.scan_is_reversed(
+                            scan_index, self._alternating
+                        )
+                        self._sweep_reversed = reversed_sweep
                         self._run_single_sweep(scan_index)
                         if self._timing:
                             self._timing_scan_index = scan_index
@@ -617,20 +725,29 @@ class ZeroFieldExperiment(ScanExperiment):
                             break
 
                         completed_scans += 1
+                        # Average by field, not by acquisition order: a
+                        # reverse sweep is flipped to start -> stop first, so
+                        # the averaged cube is always in field order.
+                        ordered_cube = self._field_ordered(acquired_cube, reversed_sweep)
                         if averaged_cube is None:
                             averaged_cube = (
                                 acquired_cube
                                 if scan_count == 1
-                                else self._new_averaged_cube(acquired_cube)
+                                else self._new_averaged_cube(ordered_cube)
                             )
                         else:
                             self._update_running_average(
-                                averaged_cube.data, acquired_cube.data, completed_scans
+                                averaged_cube.data, ordered_cube.data, completed_scans
                             )
-                            self._merge_relay_flips(averaged_cube, acquired_cube)
+                            self._merge_relay_flips(averaged_cube, ordered_cube)
                             self._merge_model_fields(
-                                averaged_cube, acquired_cube, completed_scans
+                                averaged_cube, ordered_cube, completed_scans
                             )
+                        if scan_count > 1:
+                            self._record_completed_scan(
+                                averaged_cube, ordered_cube, reversed_sweep
+                            )
+                        del ordered_cube
                         LOGGER.info("Running average updated.")
 
                         if stream_path is not None and self.stream_path_is_output:
@@ -730,6 +847,8 @@ class ZeroFieldExperiment(ScanExperiment):
         self.model_field_values_gauss = []
         self.model_field_vector_mT = []
         self.model_polarity = []
+        self.point_time_s = []
+        self._sweep_t0 = time.perf_counter()
 
         # Set before setup_scan() (not just in the point loop below) so
         # setup_scan()'s own magnet.set_vector() call -- when
@@ -791,8 +910,11 @@ class ZeroFieldExperiment(ScanExperiment):
                     if timing:
                         self._record_timing("post_flip_settling_sleep", None, t0)
 
-                # Acquire averaged fluorescence image.
+                # Acquire averaged fluorescence image. Its time is the
+                # midpoint of the acquisition, relative to the sweep start.
+                acquire_t0 = time.perf_counter()
                 averaged_image = self.acquire_frame()
+                point_time = 0.5 * (acquire_t0 + time.perf_counter()) - self._sweep_t0
 
                 # Store measurement exactly once for this field value.
                 self.image_cube.add(averaged_image)
@@ -801,6 +923,7 @@ class ZeroFieldExperiment(ScanExperiment):
                 self.model_field_values_gauss.append(model_gauss)
                 self.model_field_vector_mT.append(model_vector_mT)
                 self.model_polarity.append(model_polarity)
+                self.point_time_s.append(point_time)
                 if self._stream_writer is not None:
                     t0 = time.perf_counter() if timing else None
                     self._stream_writer.write_plane(point_index, averaged_image)
@@ -860,7 +983,7 @@ class ZeroFieldExperiment(ScanExperiment):
             for per_point in (
                 self.relay_flip_occurred, self.relay_flip_axes,
                 self.model_field_values_gauss, self.model_field_vector_mT,
-                self.model_polarity,
+                self.model_polarity, self.point_time_s,
             ):
                 del per_point[frame_count:]
             flip_metadata = self._per_point_metadata()
@@ -885,10 +1008,17 @@ class ZeroFieldExperiment(ScanExperiment):
                 self.cleanup()
 
     def _new_averaged_cube(self, acquired_cube):
+        # Per-sweep keys (one scan's timestamps and direction) would mislabel
+        # the average; it records them per scan instead.
+        metadata = {
+            key: value
+            for key, value in copy.deepcopy(acquired_cube.metadata).items()
+            if key not in self._PER_SWEEP_ONLY_KEYS
+        }
         return ImageCube(
             data=np.array(acquired_cube.data, dtype=np.float64, copy=True),
             axes=copy.deepcopy(acquired_cube.axes),
-            metadata=copy.deepcopy(acquired_cube.metadata),
+            metadata=metadata,
             experiment_type=acquired_cube.experiment_type,
             scan_axis_name=acquired_cube.scan_axis_name,
             scan_axis_unit=acquired_cube.scan_axis_unit,
@@ -936,6 +1066,16 @@ class ZeroFieldExperiment(ScanExperiment):
         # consistent everywhere.
         if self.save_raw_scans and not self.stream_path_is_output:
             metadata["raw_scan_filenames"] = list(self.raw_scan_filenames)
+        if scan_count > 1:
+            # One list per completed scan, each in that scan's acquisition
+            # order, for offline drift fitting.
+            metadata["scan_point_times_s"] = [
+                list(times) for times in self._scan_point_times_s
+            ]
+        if scan_count > 1 and self._alternating:
+            metadata["scan_directions"] = list(self._scan_directions)
+            metadata["forward_scan_count"] = self._direction_counts["forward"]
+            metadata["reverse_scan_count"] = self._direction_counts["reverse"]
         image_cube.metadata = metadata
 
     def _set_static_metadata(self):
@@ -973,6 +1113,20 @@ class ZeroFieldExperiment(ScanExperiment):
                         "request on either branch, so this is what shows "
                         "which branch was used."
                     ),
+                    "point_time_s": (
+                        "Acquisition time of each point (midpoint of its "
+                        "frame acquisition), in s since that scan's sweep "
+                        "started, in acquisition order. A multi-scan average "
+                        "stores one list per scan as scan_point_times_s."
+                    ),
+                    "field_order": (
+                        "A single scan and every per-scan raw file are in "
+                        "acquisition order (sweep_direction says which, when "
+                        "alternate_direction is on). A multi-scan average, "
+                        "including forward_average/reverse_average, is always "
+                        "in start -> stop field order, matching "
+                        "field_values_gauss, regardless of sweep direction."
+                    ),
                 },
                 "field_point_count": self.field_points,
                 "field_start_gauss": self.field_start,
@@ -982,6 +1136,7 @@ class ZeroFieldExperiment(ScanExperiment):
                 "averages_per_point": self.averages,
                 "camera_model": type(self.camera).__name__,
                 "zero_other_axes": self.zero_other_axes,
+                "alternate_direction": self._alternating,
                 "initial_magnet_vector_mT": (
                     dict(self._initial_magnet_vector_mT)
                     if self._initial_magnet_vector_mT is not None
@@ -990,6 +1145,10 @@ class ZeroFieldExperiment(ScanExperiment):
                 "non_swept_axis_field_mT": dict(self._resolved_non_swept_field_mT),
             }
         )
+        if self._alternating:
+            metadata["sweep_direction"] = (
+                "reverse" if self._sweep_reversed else "forward"
+            )
         power_supply_models = self._power_supply_models()
         if power_supply_models:
             metadata["power_supply_models"] = power_supply_models

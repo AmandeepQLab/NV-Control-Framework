@@ -105,6 +105,23 @@ def _reject_incomplete_hdf5(path, metadata, allow_partial_scans):
         )
 
 
+def _reject_reverse_sweep(path, metadata):
+    """Refuse a raw scan acquired stop -> start (alternate_direction mode).
+
+    Raw per-scan files keep acquisition order, and this module averages
+    plane i of every file together, so a reverse scan would be averaged
+    against the wrong fields. The run's own average file is already aligned
+    by field and holds forward_average/reverse_average.
+    """
+    if metadata.get("sweep_direction") == "reverse":
+        raise ValueError(
+            f"{path}: this scan was swept stop -> start (sweep_direction = "
+            "'reverse'), so its planes are in reverse field order. Plane-wise "
+            "averaging here would misalign fields; use the run's average "
+            "file, which is already aligned by field."
+        )
+
+
 def _atomic_save_npy(path, array):
     """Write *array* to *path* so a completed file is never truncated.
 
@@ -173,6 +190,7 @@ class _Hdf5PlaneSource:
             self.dtype = handle["data"].dtype
             metadata = json.loads(_decode(handle["metadata_json"][()]))
         _reject_incomplete_hdf5(self.path, metadata, allow_partial_scans)
+        _reject_reverse_sweep(self.path, metadata)
 
     def read_plane(self, index):
         return np.asarray(ImageCube.load_plane(self.path, index))

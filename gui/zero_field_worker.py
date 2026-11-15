@@ -108,6 +108,7 @@ class ZeroFieldWorker(QObject):
                 scan_completed_callback=self._on_scan_completed,
                 averaging_enabled=self.config.get("averaging_enabled", False),
                 num_scans=self.config.get("num_scans", 1),
+                alternate_direction=self.config.get("alternate_direction", False),
                 # "Save individual scans" is meaningless without a
                 # destination -- force off regardless of widget state so
                 # _save_raw_scan's self.output_path.with_name(...) can never
@@ -204,6 +205,7 @@ class ZeroFieldWorker(QObject):
                 f"# averaging_enabled={self.config.get('averaging_enabled', False)}",
                 f"# num_scans={self.config.get('num_scans', 1)}",
                 f"# save_raw_scans={self.config.get('save_raw_scans', False)}",
+                f"# alternate_direction={self.config.get('alternate_direction', False)}",
                 f"# zero_other_axes={self.experiment.zero_other_axes}",
                 f"# acquisition_roi={self.acquisition_roi}",
                 f"# camera_exposure_s={exposure_s} (actual camera read-back; "

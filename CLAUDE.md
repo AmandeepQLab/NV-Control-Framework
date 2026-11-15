@@ -192,6 +192,48 @@ All three are calibration-model values, **not measurements** (there is no field 
 
 **Zero Field cubes are pre-allocated, not grown per point.** `ZeroFieldExperiment._run_single_sweep()` builds its `ImageCube` with `expected_planes=self.field_points`; the first `add()` allocates one float64 `(field_points, H, W)` buffer and later frames are written in place. (Plain `ImageCube` without `expected_planes` still concatenates per frame — O(N²·frame) copies — and keeps the frame's dtype.) Consequences to keep in mind: `ImageCube.data` is now a **property** returning a view of only the filled planes, so `data.shape[0]` is still the acquired-frame count after an early stop; assigning `cube.data = ...` replaces the buffer and drops pre-allocation. `_run_single_sweep()`'s `finally` calls `image_cube.truncate(frame_count)`, which copies the acquired planes out and frees the unused remainder after an early stop (a no-op for a complete sweep). Because the whole cube is allocated at the first point, a sweep whose full cube can't fit in RAM now fails at the first point instead of partway through. More frames than declared logs a warning and falls back to concatenation. The multi-scan average cube is unchanged (one copy of a completed cube).
 
+## Zero Field bidirectional sweeps (`alternate_direction`)
+
+**Why it exists.** At the rig, slow fluorescence drift within one sweep (0.4–0.6%) is larger than the ~0.3% zero-field dip. If every scan sweeps the same way, drift that repeats per scan survives averaging and looks like field dependence. Pairing a forward and a reverse sweep and averaging by field cancels drift that is linear in time.
+
+**How it is switched on.**
+- GUI: "Alternate sweep direction" in "Multi-Scan Averaging" (`ZeroFieldWidget.alternate_direction_check`, default off).
+  - It is enabled only while "Enable averaging" is checked.
+  - `get_config()["alternate_direction"]` is `isChecked() and isEnabled()`, so a disabled-but-checked box reports False.
+  - With an odd "Number of Scans" a non-blocking "⚠ Odd number of scans" label appears; the scan still runs.
+- Experiment: `ZeroFieldExperiment(alternate_direction=False)`, passed through by `ZeroFieldWorker`. It only takes effect together with `averaging_enabled`; `_alternating` is the effective flag.
+
+**Which scans reverse.** `ZeroFieldExperiment.scan_is_reversed(scan_index, alternate)`, with the same 1-based `scan_index` as the GUI's "Current scan" label and the `_scan_NNN` raw file names. Scan 1 sweeps start→stop; scans 2, 4, 6, … sweep stop→start. So a single scan, and the first scan of every average, is always forward. The "Current scan" label adds "(start→stop)"/"(stop→start)" while alternating.
+
+**What a reverse sweep does.** `setup_scan()` sets `scan_vector` to the reversed linspace. Everything per point runs unchanged in sweep order: flip detection, post-flip settling, model snapshot, live updates (plotted at their real field values, so the live curve fills in from the stop end), and streaming.
+
+**Averaging is by field, not by acquisition order.** Before a completed scan is folded in, `_field_ordered()` flips a reverse scan's image planes (a reversed view, no copy) and every per-point list in `_FIELD_ORDERED_KEYS`: `field_values_gauss`, `relay_flip_occurred`, `relay_flip_axes`, `model_field_values_gauss`, `model_field_vector_mT`, `model_polarity`. The existing merge rules then apply unchanged: running mean for images and model fields, union for flips, "mixed" for differing polarity.
+- The averaged cube, `field_values_gauss` and `scan_axis_values` are therefore always in start→stop order.
+- Consequence for flips: a flip is flagged on the point after it in sweep order, so one physical relay crossing is flagged on adjacent field indices in the two directions. The average's union shows both.
+- Consequence for polarity: in a branch overlap the relay branch depends on sweep direction, so overlap points can legitimately become "mixed".
+
+**Per-scan raw files** (streamed or `save_raw_scans`) keep acquisition order: a reverse file's `scan_axis_values`/`field_values_gauss` run stop→start. They record `sweep_direction` (`"forward"`/`"reverse"`), only while alternating. `analysis/zero_field_averaging.py` averages plane *i* of every file, so it **refuses** a raw `.h5` with `sweep_direction == "reverse"` (`_reject_reverse_sweep()`). Use the run's own average file instead.
+
+**New data in the average file** (multi-scan runs only; with Number of Scans = 1 there is no average, just the single forward scan's file).
+- **Datasets, while alternating:** `forward_average` and `reverse_average` — running means of forward-only and reverse-only completed scans, start→stop order, same shape as `data`. A direction with no completed scan has no dataset. They let analysis see the drift directly: forward and reverse are tilted opposite ways. With equal counts, `data` = their mean.
+  - They are stored through `ImageCube.extra_datasets`, a generic dict of named arrays. `_save_hdf5()` writes each as a top-level dataset, and `load()` returns every non-reserved top-level dataset in it. Names may not be `data`, `scan_axis_values`, `metadata_json`, `axes_json` or contain `/`. `.npz` stores them as `extra_dataset__<name>`. Streamed files never have any.
+- **Metadata, while alternating:** `scan_directions` (one `"forward"`/`"reverse"` per completed scan), `forward_scan_count`, `reverse_scan_count`.
+- **Metadata, every multi-scan average:** `scan_point_times_s` — one list per completed scan, each in that scan's acquisition order.
+- `point_time_s` and `sweep_direction` are per-scan only (`_PER_SWEEP_ONLY_KEYS`) and are dropped from a multi-scan average.
+
+**Per-point timestamps.** Every sweep records `point_time_s`: the midpoint of each point's frame acquisition, in s since that sweep began (just before `setup_scan()`), in acquisition order, truncated on an early stop like the other per-point lists. Single-scan files and raw scan files carry it.
+
+**Other metadata.**
+- `alternate_direction` (the effective flag) is in the static metadata of every run.
+- `field_value_definitions` gained `point_time_s` and `field_order`: a multi-scan average is start→stop regardless of sweep direction; single scans and raw files are in acquisition order.
+
+**With the mode off, output is unchanged.** It was checked file-by-file against the previous commit with a deterministic run (single scan, multi-scan average, and raw files). Data, field axis, flips and polarity were identical. The only additions are `alternate_direction`, `point_time_s`, `scan_point_times_s` (multi-scan average) and the two new `field_value_definitions` entries.
+
+**Unchanged.**
+- A partial scan (stop or error) is never folded into any average, including the direction averages.
+- Pre-scan field-range validation checks the same two endpoints.
+- No magnet or hardware file is involved.
+
 ## Known hardware quirks (ODMR timing)
 
 **`trigger_delay_s` below ~0.02s triggers a reproducible ~400ms per-frame stall, cause unknown.** Confirmed from `data/odmr_timing_*.csv` timing-diagnostics recordings: at `trigger_delay_s = 0.0`, roughly 1 frame in 9 (10.4-10.8% in two independent recorded runs) takes ~400-430ms instead of the normal ~90ms — a distinct second mode in the `repeat_total` distribution, not scattered jitter. At `trigger_delay_s >= 0.02s` the second mode disappears entirely (tightest recorded spread: ~130-133ms, no bimodality). This has not been root-caused — candidates include the Andor SDK3 buffer/trigger-arming not having settled from the previous frame, but this is speculation, not confirmed. **Do not push `trigger_delay_s` toward 0 to save time even though MW switch-gating contrast is indifferent to it** — the stall more than cancels any savings and makes scan duration unpredictable. `gui/odmr_window.py::estimate_odmr_time()` does not model this (see the comment at its `trigger_delay_s`-dependent term) — its estimate for `trigger_delay_s < 0.02s` will run 15-30% low for this reason, not because the formula itself is wrong.
@@ -226,7 +268,7 @@ These are characterized properties of the current rig/sample, not code facts —
 
 ## Testing safety — read before running pytest with `--hardware`
 
-`tests/` contains 93 test files (excluding `__init__.py`/`conftest.py`). Only 36 are real, hardware-free pytest tests — see `tests/conftest.py::ALLOWED_FILES` for the current, authoritative list rather than a copy here that will drift the next time a file is added to it (as just happened for this change). **The other ~57 are ad-hoc scripts that command real lab hardware — the Andor camera, the SG386 microwave source over VISA, the Swabian pulse streamer, the Helmholtz power supplies — unconditionally at module import time, not just inside a test function.** Several have no `if __name__ == "__main__":` guard at all: importing them fires a relay, streams a pulse, or turns on a power-supply output as a side effect of Python loading the file.
+`tests/` contains 94 test files (excluding `__init__.py`/`conftest.py`). Only 37 are real, hardware-free pytest tests — see `tests/conftest.py::ALLOWED_FILES` for the current, authoritative list rather than a copy here that will drift the next time a file is added to it (as just happened for this change). **The other ~57 are ad-hoc scripts that command real lab hardware — the Andor camera, the SG386 microwave source over VISA, the Swabian pulse streamer, the Helmholtz power supplies — unconditionally at module import time, not just inside a test function.** Several have no `if __name__ == "__main__":` guard at all: importing them fires a relay, streams a pulse, or turns on a power-supply output as a side effect of Python loading the file.
 
 `pytest.ini` (`testpaths = tests`) plus `tests/conftest.py`'s `pytest_ignore_collect` hook gate this: a bare `pytest` run only collects the files named in `ALLOWED_FILES`. The gate is an allowlist, not a denylist — anything not explicitly named there is excluded from collection entirely, so it is never imported. Passing `--hardware` lifts the restriction and collects everything, including every hardware-commanding script.
 

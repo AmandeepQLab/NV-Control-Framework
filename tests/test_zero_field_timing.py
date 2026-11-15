@@ -403,9 +403,11 @@ class NoBehaviorChangeTests(unittest.TestCase):
 
         off_metadata = dict(off_cube.metadata)
         on_metadata = dict(on_cube.metadata)
-        # acquisition_started_at_utc legitimately differs run to run.
-        off_metadata.pop("acquisition_started_at_utc", None)
-        on_metadata.pop("acquisition_started_at_utc", None)
+        # acquisition_started_at_utc and point_time_s (measured per-point
+        # times) legitimately differ run to run.
+        for key in ("acquisition_started_at_utc", "point_time_s"):
+            off_metadata.pop(key, None)
+            on_metadata.pop(key, None)
         self.assertEqual(off_metadata, on_metadata)
 
 

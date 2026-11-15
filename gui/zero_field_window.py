@@ -18,6 +18,7 @@ from gui.display_settings import (
 )
 from gui.widgets.zero_field_widget import ZeroFieldWidget
 from gui.zero_field_worker import ZeroFieldWorker
+from experiments.zero_field_experiment import ZeroFieldExperiment
 from framework.analysis.zero_field import mean_fluorescence_vs_field
 from framework.paths import ensure_writable_directory
 from utils.camera_diagnostics import log_event
@@ -73,6 +74,7 @@ class ZeroFieldWindow(QMainWindow):
         self.scan_signals = []
         self.field_point_count = 0
         self.total_scans = 1
+        self._alternate_direction = False
         self.output_directory = self._resolve_default_output_directory()
         self.output_path = None
         self._scan_timestamp = None
@@ -179,6 +181,9 @@ class ZeroFieldWindow(QMainWindow):
         self.field_point_count = config["field_points"]
         self.total_scans = (
             config["num_scans"] if config["averaging_enabled"] else 1
+        )
+        self._alternate_direction = bool(
+            config.get("alternate_direction", False) and config["averaging_enabled"]
         )
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         # Stored unconditionally (even when saving is off) so "Save Data"
@@ -346,10 +351,21 @@ class ZeroFieldWindow(QMainWindow):
     def handle_progress(self, current, total):
         self.widget.update_progress(current, total)
 
+    def _scan_direction_label(self, scan_index):
+        """"start→stop"/"stop→start" while alternating, else None."""
+        if not self._alternate_direction:
+            return None
+        reversed_sweep = ZeroFieldExperiment.scan_is_reversed(scan_index, True)
+        return "stop→start" if reversed_sweep else "start→stop"
+
     def handle_scan_started(self, current, total):
         self.scan_fields = []
         self.scan_signals = []
-        self.widget.update_scan_progress(current, total)
+        # A reverse scan's live curve is plotted against its real field
+        # values, so it fills in from the stop end.
+        self.widget.update_scan_progress(
+            current, total, self._scan_direction_label(current)
+        )
 
     def _update_displayed_image(self):
         if self._latest_averaged_image is None:
@@ -419,6 +435,8 @@ class ZeroFieldWindow(QMainWindow):
         return averaged_image
 
     def handle_scan_completed(self, image_cube, current, total):
+        # image_cube is the running average, already aligned by field
+        # (start -> stop) whatever direction the scans ran.
         fields, signals = mean_fluorescence_vs_field(image_cube)
         self.scan_fields = fields.tolist()
         self.scan_signals = signals.tolist()
@@ -428,7 +446,9 @@ class ZeroFieldWindow(QMainWindow):
             self.field_point_count,
             self.field_point_count,
         )
-        self.widget.update_scan_progress(current, total)
+        self.widget.update_scan_progress(
+            current, total, self._scan_direction_label(current)
+        )
 
     def scan_finished(self, image_cube, _fields, _signals, stopped):
         self.image_cube = image_cube
