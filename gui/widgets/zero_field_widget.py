@@ -137,6 +137,27 @@ class ZeroFieldWidget(QWidget):
         alternate_row.addWidget(self.alternate_direction_warning)
         alternate_row.addStretch()
         averaging_layout.addLayout(alternate_row)
+        # Works with or without multi-scan averaging, so it is not tied to
+        # the averaging checkbox like the controls above.
+        reference_row = QHBoxLayout()
+        self.reference_enabled_check = QCheckBox("Reference field normalization")
+        self.reference_enabled_check.setToolTip(
+            "Each point is also measured at the reference field and stored "
+            "as signal/reference, so slow drift cancels. Roughly doubles "
+            "acquisition time. Choose a reference far from zero field. "
+            "Picking the sign on the same relay branch as most of the sweep "
+            "avoids repeated relay flips."
+        )
+        reference_row.addWidget(self.reference_enabled_check)
+        reference_row.addStretch()
+        averaging_layout.addLayout(reference_row)
+        self.reference_field_spin = self._add_double(
+            averaging_layout, "Reference field (G)", -10000, 10000, 4, 8.0
+        )
+        self.reference_field_spin.setEnabled(False)
+        self.reference_enabled_check.toggled.connect(
+            self.reference_field_spin.setEnabled
+        )
         self.averaging_enabled_check.toggled.connect(
             self._set_averaging_controls_enabled
         )
@@ -221,7 +242,9 @@ class ZeroFieldWidget(QWidget):
         control_layout.addWidget(self.current_signal_label)
         control_layout.addStretch()
 
+        self._signal_label = self._COUNTS_LABEL
         plot_group = QGroupBox("Zero Field Mean Fluorescence (counts/pixel)")
+        self.plot_group = plot_group
         main_layout.addWidget(plot_group, 4)
         plot_layout = QVBoxLayout(plot_group)
         self.plot = pg.PlotWidget()
@@ -294,8 +317,25 @@ class ZeroFieldWidget(QWidget):
                 self.alternate_direction_check.isChecked()
                 and self.alternate_direction_check.isEnabled()
             ),
+            "reference_enabled": (
+                self.reference_enabled_check.isChecked()
+                and self.reference_enabled_check.isEnabled()
+            ),
+            "reference_field_gauss": self.reference_field_spin.value(),
             "save_data": self.save_data_check.isChecked(),
         }
+
+    # Live-curve labels: raw counts, or signal/reference with the
+    # reference on (see set_signal_mode()).
+    _COUNTS_LABEL = "Mean Fluorescence (counts/pixel)"
+    _RATIO_LABEL = "Signal / reference"
+
+    def set_signal_mode(self, ratio):
+        """Label the live curve as raw counts or as signal/reference."""
+        self._signal_label = self._RATIO_LABEL if ratio else self._COUNTS_LABEL
+        self.plot.setLabel("left", self._signal_label)
+        self.plot_group.setTitle(f"Zero Field {self._signal_label}")
+        self.current_signal_label.setText(f"{self._signal_label}: --")
 
     def reset_scan(self, total, total_scans=1):
         self.curve.setData([], [])
@@ -304,7 +344,7 @@ class ZeroFieldWidget(QWidget):
         self.current_point_label.setText("Current scan point: --")
         self.current_scan_label.setText(f"Current scan: 0 / {total_scans}")
         self.current_field_label.setText("Current magnetic field: -- G")
-        self.current_signal_label.setText("Mean Fluorescence (counts/pixel): --")
+        self.current_signal_label.setText(f"{self._signal_label}: --")
 
     def update_live_data(self, fields, signals, current, total):
         self.update_fluorescence_curve(fields, signals)
@@ -314,9 +354,7 @@ class ZeroFieldWidget(QWidget):
         """Render the raw mean fluorescence values acquired so far."""
         self.curve.setData(fields, signals)
         self.current_field_label.setText(f"Current magnetic field: {fields[-1]:.6g} G")
-        self.current_signal_label.setText(
-            f"Mean Fluorescence (counts/pixel): {signals[-1]:.6g}"
-        )
+        self.current_signal_label.setText(f"{self._signal_label}: {signals[-1]:.6g}")
 
     def update_progress(self, current, total):
         """Advance scan progress after the newest fluorescence point is displayed."""

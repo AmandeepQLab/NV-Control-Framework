@@ -179,7 +179,7 @@ See `docs/zero_field_audit_2026-07.md` for the full physics/logic audit with per
 
 Camera-contention and ROI-validation findings from the same audit are fixed — see "Architecture and call chain" above.
 
-**Field range is validated before a Zero Field scan starts.** `ZeroFieldWindow.start_scan()` calls `_preflight_field_range()` right after reading the widget config, before any state change, thread, or worker exists. It runs each axis's existing `MagnetAxis.plan_field()` (pure calculation, no I/O) for the vector at both sweep endpoints: the swept axis at `field_start`/`field_stop` × 0.1 mT/G, the other axes at 0.0 mT (the GUI always zeroes them). Endpoints suffice because required current on a branch is |target − intercept| / ratio, maximal at an endpoint of a linear sweep. A `ValueError` (out of range / non-finite) shows "Field range out of bounds" with the axis's approximate reachable range in Gauss, derived from `max_current` and both calibration branches, and aborts the start. `RuntimeError`s from `plan_field()` deliberately do **not** block: before the magnet's first `enable()` every relay is unsynchronized and `plan_field()` raises for any nonzero current, a state the scan's own `setup_scan()` resolves — blocking on it would refuse every first scan after launch. Previously an unreachable target raised mid-scan, after data had been acquired.
+**Field range is validated before a Zero Field scan starts.** `ZeroFieldWindow.start_scan()` calls `_preflight_field_range()` right after reading the widget config, before any state change, thread, or worker exists. It runs each axis's existing `MagnetAxis.plan_field()` (pure calculation, no I/O) for the vector at both sweep endpoints: the swept axis at `field_start`/`field_stop` × 0.1 mT/G, the other axes at 0.0 mT (the GUI always zeroes them). Endpoints suffice because required current on a branch is |target − intercept| / ratio, maximal at an endpoint of a linear sweep. With reference normalization on, the reference vector (swept axis at `reference_field_gauss`, others 0.0 mT) is checked the same way, and an unreachable reference is refused with the same dialog. A `ValueError` (out of range / non-finite) shows "Field range out of bounds" with the axis's approximate reachable range in Gauss, derived from `max_current` and both calibration branches, and aborts the start. `RuntimeError`s from `plan_field()` deliberately do **not** block: before the magnet's first `enable()` every relay is unsynchronized and `plan_field()` raises for any nonzero current, a state the scan's own `setup_scan()` resolves — blocking on it would refuse every first scan after launch. Previously an unreachable target raised mid-scan, after data had been acquired.
 
 **Relay flips get extra settling and are marked in the data.** A flip (`_switch_polarity()`: zero/off/discharge/switch/settle/on) is a far larger transient than an incremental step, and flips happen near field zero — X ~0.12 G, Z ~1.17 G, Y's gap ~0.063 G on this rig — exactly where ZFE resolves. `ZeroFieldExperiment(post_flip_settling_ms=...)` (constructor default 0.0; GUI "Post-flip extra settling (ms)", default 500, range 0–60000, passed via `ZeroFieldWorker`) sleeps that much **after** the normal `settling_time_ms` sleep, only at points whose field command flipped a relay; like the normal settling sleep it is not interruptible by stop. Flips from `setup_scan()`'s own `set_vector(0, 0, 0)` (e.g. X/Z moving to their negative branch; every later scan of a multi-scan run, whose previous sweep ended positive) are attributed to point 0, since they occur immediately before it with no settling in between. Per acquired point the experiment records `relay_flip_occurred` (bool) and `relay_flip_axes` (sorted comma-joined names: `"X"`, `"X,Z"`, `""`), truncated with `field_values_gauss` on an early stop. They are stored as **ImageCube metadata lists**, not separate HDF5 datasets — the same mechanism as `field_values_gauss`, so they reach the single-scan streamed file (writer `update_metadata()` + `merge_hdf5_metadata`), raw per-scan files, and the atomic-saved average without any writer or file-format change. They are written in `_run_single_sweep()`'s `finally`, so a hard process kill mid-scan leaves a streamed file without them. In the multi-scan average a point is flagged if a flip preceded it in any averaged scan, with the union of axes. `post_flip_settling_ms` is recorded in metadata.
 
@@ -234,6 +234,66 @@ All three are calibration-model values, **not measurements** (there is no field 
 - Pre-scan field-range validation checks the same two endpoints.
 - No magnet or hardware file is involved.
 
+## Zero Field reference field normalization (`reference_enabled`)
+
+**Why it exists.** At the rig, slow environmental drift is ~1% peak-to-peak over minutes, against ~0.06% point-to-point noise and a ~0.15–0.3% zero-field dip. Bidirectional sweeps cancel only drift that is linear in time, and need many scans. Like ODMR's ON/OFF pairing, this mode measures every point twice: at its field (signal, S) and at a fixed off-resonant reference field (R). It stores the per-pixel ratio, so slow multiplicative drift common to both halves divides out.
+
+**How it is switched on.**
+- GUI: "Reference field normalization" checkbox and "Reference field (G)" spinbox (default +8.0, ±10000, 4 decimals), in "Multi-Scan Averaging" next to "Alternate sweep direction".
+  - It works with or without multi-scan averaging, so it is not tied to the averaging checkbox.
+  - The spinbox is enabled only while the box is checked.
+  - `get_config()["reference_enabled"]` is `isChecked() and isEnabled()`. `reference_field_gauss` is always reported.
+- Experiment: `ZeroFieldExperiment(reference_enabled=False, reference_field_gauss=8.0)`, passed through by `ZeroFieldWorker`.
+
+**Reference vector.** It is the point's vector with the swept axis replaced by `reference_field_gauss`; the non-swept axes keep their usual values (calibrated zero, or the retained vector with `zero_other_axes=False`).
+
+**Acquisition order within a point** (`_run_single_sweep()` → `_acquire_half()` per half).
+- Point index i in **sweep order**: even i measures S then R (`"SR"`); odd i measures R then S (`"RS"`).
+  - Alternation cancels linear drift between halves over neighbouring points.
+  - Consecutive points share a reference half: R at the end of point i, R at the start of point i+1.
+- Each half runs: `set_vector`, normal settling, extra post-flip settling if any relay flipped, then `averages` frames.
+- **Repeated identical command.** When a half commands the same vector as the previous half of the sweep (the R,R pair), `set_vector()` is still called, but the magnet's change-detection cache skips the write. No settling sleep is added, because nothing moved.
+  - This is decided by comparing the commanded vectors in the experiment, since `set_vector()` doesn't report whether it wrote.
+  - S→S between points is a different field, so it settles as usual.
+- Flip detection and post-flip settling apply to every command, signal or reference. Setup-scan flips still fold into the sweep's first command, point 0's S half.
+- With the reference off, `_acquire_half()` runs only the S half, with the same command/snapshot/settle/acquire sequence and timing stage names as before.
+  - The reference half's timing stages are prefixed `reference_`, and include `reference_acquire`.
+
+**Relay-flip cost of a reference on the opposite branch.** A reference whose sign puts the swept axis on the other relay branch from a point's field flips the relay on both halves that change field: R after S, and S after R. Each flip pays the full zero/off/discharge/switch/settle/on sequence plus `post_flip_settling_ms` (GUI default 500 ms).
+- In sim, a symmetric −2…+2 G X sweep with a +8 G reference took 0.71 s per point, against 0.26 s with the reference off (2.7×). The negative half of the sweep flipped on almost every half.
+- A 0.5…2.5 G sweep, on the reference's branch, took 0.27 s against 0.17 s (1.6×). It is under 2× because the R,R repeat neither writes nor settles.
+- So pick the reference's sign on the branch most of the sweep uses. The checkbox tooltip says the same.
+
+**Data.**
+- `data` is unchanged in meaning: the signal planes.
+- Extra datasets (`ImageCube.extra_datasets`), in the **same plane order as `data`** (acquisition order for single scans and raw files, start→stop for a multi-scan average):
+  - `reference` — per-point reference planes.
+  - `ratio` — per-pixel `data / reference`, float64. Where the reference is 0 it is NaN, and the count is logged as a warning per sweep.
+- **Multi-scan average.** `reference` and `ratio` are averaged per field point like `data`. `ratio` is the **mean of per-scan ratios**, the same convention as ODMR's mean(I_on/I_off), so it is not `data / reference` of the averaged planes.
+  - While alternating, also `ratio_forward_average` and `ratio_reverse_average`, next to `forward_average`/`reverse_average`.
+  - Field alignment applies unchanged: `_field_ordered()` reverses `reference`/`ratio` (`_PER_POINT_EXTRA_KEYS`) with the image planes.
+- **Single-scan streaming.** `ImageCubeStreamWriter.write_extra_plane()` writes each point's `reference` and `ratio` planes **before** its data plane, so `planes_written` never counts a point whose extras are missing. `close()` truncates extras to `planes_written` like `data`, so a crash keeps every completed point's three planes. Raw per-scan streamed files carry them too.
+- **Live display.** With the reference on, the fluorescence curve plots the mean ratio per point over finite pixels (`zero_field_worker.mean_ratio()`/`ratio_curve()`; y-axis "Signal / reference"). The completed-scan and final curves come from the cube's `ratio` dataset. The live image still shows the signal frame.
+
+**Metadata.**
+- Static: `reference_enabled` (always written), plus `reference_field_gauss` and the extra `field_value_definitions` entries (only when on).
+- Per point, only when on:
+  - `reference_order` (`"SR"`/`"RS"`)
+  - `reference_point_time_s` (midpoint of the reference acquisition, same clock as `point_time_s`)
+  - `reference_relay_flip_occurred` / `reference_relay_flip_axes`
+  - `reference_model_field_vector_mT` / `reference_model_polarity`
+  - `relay_flip_*` and `model_*` keep describing the S half.
+- All of these except `reference_point_time_s` are field-ordered (`_FIELD_ORDERED_KEYS`).
+- **Merge rules in a multi-scan average** (`_merge_reference_metadata()`): union for flips, running mean for the model vector, "mixed" for polarity, and "mixed" for `reference_order` where scans differed.
+  - With alternate direction and an even point count, every field's order differs between the two directions, so `reference_order` is all "mixed". With an odd count it matches.
+- `reference_point_time_s` is per-scan only (`_PER_SWEEP_ONLY_KEYS`); a multi-scan average stores `scan_reference_point_times_s` instead.
+
+**With the reference off, output is unchanged.** Checked file by file against the previous commit with a deterministic run (single scan, multi-scan average, raw files). Data, field axis, every metadata value and the dataset list were identical; the only addition is `reference_enabled: false`.
+
+**Unchanged.**
+- A stop is still checked only between points, so a point is always complete (both halves) or absent. A partial scan is never folded into an average.
+- No magnet or hardware file is involved.
+
 ## Known hardware quirks (ODMR timing)
 
 **`trigger_delay_s` below ~0.02s triggers a reproducible ~400ms per-frame stall, cause unknown.** Confirmed from `data/odmr_timing_*.csv` timing-diagnostics recordings: at `trigger_delay_s = 0.0`, roughly 1 frame in 9 (10.4-10.8% in two independent recorded runs) takes ~400-430ms instead of the normal ~90ms — a distinct second mode in the `repeat_total` distribution, not scattered jitter. At `trigger_delay_s >= 0.02s` the second mode disappears entirely (tightest recorded spread: ~130-133ms, no bimodality). This has not been root-caused — candidates include the Andor SDK3 buffer/trigger-arming not having settled from the previous frame, but this is speculation, not confirmed. **Do not push `trigger_delay_s` toward 0 to save time even though MW switch-gating contrast is indifferent to it** — the stall more than cancels any savings and makes scan duration unpredictable. `gui/odmr_window.py::estimate_odmr_time()` does not model this (see the comment at its `trigger_delay_s`-dependent term) — its estimate for `trigger_delay_s < 0.02s` will run 15-30% low for this reason, not because the formula itself is wrong.
@@ -268,7 +328,7 @@ These are characterized properties of the current rig/sample, not code facts —
 
 ## Testing safety — read before running pytest with `--hardware`
 
-`tests/` contains 94 test files (excluding `__init__.py`/`conftest.py`). Only 37 are real, hardware-free pytest tests — see `tests/conftest.py::ALLOWED_FILES` for the current, authoritative list rather than a copy here that will drift the next time a file is added to it (as just happened for this change). **The other ~57 are ad-hoc scripts that command real lab hardware — the Andor camera, the SG386 microwave source over VISA, the Swabian pulse streamer, the Helmholtz power supplies — unconditionally at module import time, not just inside a test function.** Several have no `if __name__ == "__main__":` guard at all: importing them fires a relay, streams a pulse, or turns on a power-supply output as a side effect of Python loading the file.
+`tests/` contains 95 test files (excluding `__init__.py`/`conftest.py`). Only 38 are real, hardware-free pytest tests — see `tests/conftest.py::ALLOWED_FILES` for the current, authoritative list rather than a copy here that will drift the next time a file is added to it (as just happened for this change). **The other ~57 are ad-hoc scripts that command real lab hardware — the Andor camera, the SG386 microwave source over VISA, the Swabian pulse streamer, the Helmholtz power supplies — unconditionally at module import time, not just inside a test function.** Several have no `if __name__ == "__main__":` guard at all: importing them fires a relay, streams a pulse, or turns on a power-supply output as a side effect of Python loading the file.
 
 `pytest.ini` (`testpaths = tests`) plus `tests/conftest.py`'s `pytest_ignore_collect` hook gate this: a bare `pytest` run only collects the files named in `ALLOWED_FILES`. The gate is an allowlist, not a denylist — anything not explicitly named there is excluded from collection entirely, so it is never imported. Passing `--hardware` lifts the restriction and collects everything, including every hardware-commanding script.
 

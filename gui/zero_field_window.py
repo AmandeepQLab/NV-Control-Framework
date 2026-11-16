@@ -17,7 +17,7 @@ from gui.display_settings import (
     select_colormap,
 )
 from gui.widgets.zero_field_widget import ZeroFieldWidget
-from gui.zero_field_worker import ZeroFieldWorker
+from gui.zero_field_worker import ZeroFieldWorker, ratio_curve
 from experiments.zero_field_experiment import ZeroFieldExperiment
 from framework.analysis.zero_field import mean_fluorescence_vs_field
 from framework.paths import ensure_writable_directory
@@ -75,6 +75,7 @@ class ZeroFieldWindow(QMainWindow):
         self.field_point_count = 0
         self.total_scans = 1
         self._alternate_direction = False
+        self._reference_enabled = False
         self.output_directory = self._resolve_default_output_directory()
         self.output_path = None
         self._scan_timestamp = None
@@ -185,6 +186,8 @@ class ZeroFieldWindow(QMainWindow):
         self._alternate_direction = bool(
             config.get("alternate_direction", False) and config["averaging_enabled"]
         )
+        self._reference_enabled = bool(config.get("reference_enabled", False))
+        self.widget.set_signal_mode(self._reference_enabled)
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         # Stored unconditionally (even when saving is off) so "Save Data"
         # can later synthesize a filename matching what this run would have
@@ -265,19 +268,28 @@ class ZeroFieldWindow(QMainWindow):
         those would refuse every first scan after launch.
         """
         swept = config["field_axis"].lower()
-        for endpoint_gauss in (config["field_start"], config["field_stop"]):
+        targets = [(config["field_start"], False), (config["field_stop"], False)]
+        # With reference normalization on, the reference vector (the swept
+        # axis at reference_field_gauss, the others zeroed as for the sweep)
+        # is commanded at every point and is checked the same way.
+        if config.get("reference_enabled", False):
+            targets.append((config["reference_field_gauss"], True))
+        for target_gauss, is_reference in targets:
             for name in ("x", "y", "z"):
-                target_mT = endpoint_gauss * 0.1 if name == swept else 0.0
+                target_mT = target_gauss * 0.1 if name == swept else 0.0
                 try:
                     getattr(self.magnet, name).plan_field(target_mT)
                 except ValueError as error:
+                    requested = (
+                        f"Reference field: {target_gauss:g} G on {swept.upper()}."
+                        if is_reference else
+                        f"Requested sweep: {config['field_start']:g} G to "
+                        f"{config['field_stop']:g} G on {swept.upper()}."
+                    )
                     QMessageBox.critical(
                         self,
                         "Field range out of bounds",
-                        f"{error}\n\n"
-                        f"Requested sweep: {config['field_start']:g} G to "
-                        f"{config['field_stop']:g} G on {swept.upper()}.\n"
-                        f"{self._axis_limit_note(name)}",
+                        f"{error}\n\n{requested}\n{self._axis_limit_note(name)}",
                     )
                     return False
                 except RuntimeError:
@@ -434,10 +446,17 @@ class ZeroFieldWindow(QMainWindow):
             )
         return averaged_image
 
+    def _curve_from_cube(self, image_cube):
+        """Per-point curve of a cube: mean fluorescence, or with the
+        reference on, the mean signal/reference ratio."""
+        if self._reference_enabled and "ratio" in image_cube.extra_datasets:
+            return ratio_curve(image_cube)
+        return mean_fluorescence_vs_field(image_cube)
+
     def handle_scan_completed(self, image_cube, current, total):
         # image_cube is the running average, already aligned by field
         # (start -> stop) whatever direction the scans ran.
-        fields, signals = mean_fluorescence_vs_field(image_cube)
+        fields, signals = self._curve_from_cube(image_cube)
         self.scan_fields = fields.tolist()
         self.scan_signals = signals.tolist()
         self.widget.update_live_data(
@@ -464,7 +483,7 @@ class ZeroFieldWindow(QMainWindow):
             return
 
         if image_cube.data is not None:
-            fields, signals = mean_fluorescence_vs_field(image_cube)
+            fields, signals = self._curve_from_cube(image_cube)
             self.scan_fields = fields.tolist()
             self.scan_signals = signals.tolist()
             self.widget.update_live_data(

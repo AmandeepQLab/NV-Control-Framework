@@ -61,6 +61,8 @@ class ZeroFieldExperiment(ScanExperiment):
         check_power_supply_errors=False,
         post_flip_settling_ms=0.0,
         alternate_direction=False,
+        reference_enabled=False,
+        reference_field_gauss=8.0,
     ):
         config = {
             "settling_time_ms": settling_time_ms,
@@ -89,6 +91,11 @@ class ZeroFieldExperiment(ScanExperiment):
             raise ValueError("zero_other_axes must be a boolean.")
         if not isinstance(alternate_direction, bool):
             raise ValueError("alternate_direction must be a boolean.")
+        if not isinstance(reference_enabled, bool):
+            raise ValueError("reference_enabled must be a boolean.")
+        reference_field_gauss = float(reference_field_gauss)
+        if not np.isfinite(reference_field_gauss):
+            raise ValueError("reference_field_gauss must be finite.")
         post_flip_settling_ms = float(post_flip_settling_ms)
         if not np.isfinite(post_flip_settling_ms) or post_flip_settling_ms < 0:
             raise ValueError("post_flip_settling_ms must be non-negative and finite.")
@@ -128,6 +135,34 @@ class ZeroFieldExperiment(ScanExperiment):
         # One entry per completed (averaged) scan, in scan order.
         self._scan_directions = []
         self._scan_point_times_s = []
+
+        # In-point reference normalization: every point is also measured at
+        # a fixed reference field on the swept axis, in alternating S,R /
+        # R,S order, and signal/reference is stored per pixel. See
+        # _run_single_sweep().
+        self.reference_enabled = reference_enabled
+        self.reference_field_gauss = reference_field_gauss
+        # Per-point lists for the reference half, reset per sweep.
+        self.reference_order = []
+        self.reference_point_time_s = []
+        self.reference_relay_flip_occurred = []
+        self.reference_relay_flip_axes = []
+        self.reference_model_field_vector_mT = []
+        self.reference_model_polarity = []
+        # Pre-allocated reference / ratio planes of the current sweep.
+        self._reference_cube = None
+        self._ratio_cube = None
+        # Ratio pixels set to NaN because the reference was 0 (this sweep).
+        self._ratio_zero_reference_pixels = 0
+        # Newest ratio plane, for the live display.
+        self.latest_ratio = None
+        # Vector of the previous half's command in this sweep, so a repeated
+        # identical command (no write) gets no settling sleep.
+        self._last_half_vector_mT = None
+        # Multi-scan bookkeeping for the reference: per-scan reference times
+        # and the ratio's forward-only / reverse-only running averages.
+        self._scan_reference_point_times_s = []
+        self._ratio_direction_averages = {"forward": None, "reverse": None}
         # Optional callable: scan_index -> Path (or None to skip streaming
         # for that scan). When set, each scan's frames are written to disk
         # incrementally as they're acquired -- HDF5 only, since streaming
@@ -420,9 +455,15 @@ class ZeroFieldExperiment(ScanExperiment):
         flip report (returning None or a Mock) count as no flip."""
         return frozenset(flipped) if isinstance(flipped, (set, frozenset)) else frozenset()
 
+    def _point_vector_mT(self, value):
+        """The (x, y, z) mT vector set_scan_point(value) commands."""
+        fields_mT = dict(self._configured_field_mT)
+        fields_mT[self.field_axis.lower()] = value * 0.1
+        return (fields_mT["x"], fields_mT["y"], fields_mT["z"])
+
     def _per_point_metadata(self):
         """Per-acquired-point lists recorded alongside field_values_gauss."""
-        return {
+        metadata = {
             "relay_flip_occurred": [bool(f) for f in self.relay_flip_occurred],
             "relay_flip_axes": [",".join(sorted(a)) for a in self.relay_flip_axes],
             "model_field_values_gauss": list(self.model_field_values_gauss),
@@ -430,10 +471,29 @@ class ZeroFieldExperiment(ScanExperiment):
             "model_polarity": [list(p) for p in self.model_polarity],
             "point_time_s": list(self.point_time_s),
         }
+        if self.reference_enabled:
+            metadata.update({
+                "reference_order": list(self.reference_order),
+                "reference_point_time_s": list(self.reference_point_time_s),
+                "reference_relay_flip_occurred": [
+                    bool(f) for f in self.reference_relay_flip_occurred
+                ],
+                "reference_relay_flip_axes": [
+                    ",".join(sorted(a)) for a in self.reference_relay_flip_axes
+                ],
+                "reference_model_field_vector_mT": [
+                    list(v) for v in self.reference_model_field_vector_mT
+                ],
+                "reference_model_polarity": [
+                    list(p) for p in self.reference_model_polarity
+                ],
+            })
+        return metadata
 
     # Per-point lists that follow the field order of a sweep, and so are
     # reversed (with the image planes) to align a reverse sweep by field.
-    # point_time_s is deliberately absent: it stays in acquisition order.
+    # point_time_s / reference_point_time_s are deliberately absent: they
+    # stay in acquisition order. Reference keys exist only with reference on.
     _FIELD_ORDERED_KEYS = (
         "field_values_gauss",
         "relay_flip_occurred",
@@ -441,12 +501,21 @@ class ZeroFieldExperiment(ScanExperiment):
         "model_field_values_gauss",
         "model_field_vector_mT",
         "model_polarity",
+        "reference_order",
+        "reference_relay_flip_occurred",
+        "reference_relay_flip_axes",
+        "reference_model_field_vector_mT",
+        "reference_model_polarity",
     )
+
+    # Extra datasets holding one plane per point, in the same order as
+    # ``data``; reversed with it and averaged per field point like it.
+    _PER_POINT_EXTRA_KEYS = ("reference", "ratio")
 
     # Keys describing one sweep only; dropped from a multi-scan average,
     # which records them per scan instead (scan_point_times_s,
-    # scan_directions).
-    _PER_SWEEP_ONLY_KEYS = ("point_time_s", "sweep_direction")
+    # scan_reference_point_times_s, scan_directions).
+    _PER_SWEEP_ONLY_KEYS = ("point_time_s", "sweep_direction", "reference_point_time_s")
 
     @staticmethod
     def scan_is_reversed(scan_index, alternate_direction):
@@ -481,34 +550,106 @@ class ZeroFieldExperiment(ScanExperiment):
             scan_axis_name=acquired_cube.scan_axis_name,
             scan_axis_unit=acquired_cube.scan_axis_unit,
             scan_axis_values=list(acquired_cube.scan_axis_values)[::-1],
+            extra_datasets={
+                name: value[::-1]
+                for name, value in acquired_cube.extra_datasets.items()
+                if name in cls._PER_POINT_EXTRA_KEYS
+            },
         )
 
     def _record_completed_scan(self, averaged_cube, ordered_cube, reversed_sweep):
         """Per-scan bookkeeping for a multi-scan average: timestamps,
-        directions, and the forward-only / reverse-only running averages."""
+        directions, and the forward-only / reverse-only running averages
+        (of ``data``, and of ``ratio`` when the reference is on)."""
         self._scan_point_times_s.append(
             list(ordered_cube.metadata.get("point_time_s", []))
         )
+        if self.reference_enabled:
+            self._scan_reference_point_times_s.append(
+                list(ordered_cube.metadata.get("reference_point_time_s", []))
+            )
         if not self._alternating:
             return
         direction = "reverse" if reversed_sweep else "forward"
         self._scan_directions.append(direction)
         self._direction_counts[direction] += 1
-        if self._direction_averages[direction] is None:
-            self._direction_averages[direction] = np.array(
-                ordered_cube.data, dtype=np.float64, copy=True
+        count = self._direction_counts[direction]
+        sources = [(self._direction_averages, ordered_cube.data)]
+        if self.reference_enabled and "ratio" in ordered_cube.extra_datasets:
+            sources.append(
+                (self._ratio_direction_averages, ordered_cube.extra_datasets["ratio"])
             )
-        else:
-            self._update_running_average(
-                self._direction_averages[direction],
-                ordered_cube.data,
-                self._direction_counts[direction],
-            )
+        for averages, current in sources:
+            if averages[direction] is None:
+                averages[direction] = np.array(current, dtype=np.float64, copy=True)
+            else:
+                self._update_running_average(averages[direction], current, count)
         # A direction with no completed scan gets no dataset at all.
-        averaged_cube.extra_datasets = {
-            f"{name}_average": average
-            for name, average in self._direction_averages.items()
-            if average is not None
+        # reference / ratio (already on averaged_cube) are kept.
+        for prefix, averages in (
+            ("", self._direction_averages),
+            ("ratio_", self._ratio_direction_averages),
+        ):
+            for name, average in averages.items():
+                if average is not None:
+                    averaged_cube.extra_datasets[f"{prefix}{name}_average"] = average
+
+    @classmethod
+    def _update_running_extras(cls, averaged_cube, ordered_cube, scan_count):
+        """Fold one completed scan's reference / ratio planes into the
+        multi-scan average, per field point, like ``data``."""
+        for name in cls._PER_POINT_EXTRA_KEYS:
+            if name in averaged_cube.extra_datasets and name in ordered_cube.extra_datasets:
+                cls._update_running_average(
+                    averaged_cube.extra_datasets[name],
+                    ordered_cube.extra_datasets[name],
+                    scan_count,
+                )
+
+    @staticmethod
+    def _merge_reference_metadata(averaged_cube, acquired_cube, scan_count):
+        """Fold one completed scan's reference-half metadata into the
+        multi-scan average with the same rules as the signal half: union for
+        flips, running mean for model vectors, "mixed" for polarity, and
+        "mixed" for a per-point S/R order that differed between scans."""
+        average = averaged_cube.metadata
+        current = acquired_cube.metadata
+        keys = (
+            "reference_order", "reference_model_field_vector_mT",
+            "reference_model_polarity",
+        )
+        if any(key not in average or key not in current for key in keys):
+            return
+        ZeroFieldExperiment._merge_relay_flips(
+            averaged_cube, acquired_cube, prefix="reference_"
+        )
+        average = averaged_cube.metadata
+
+        def mean(old, new):
+            if old is None or new is None:
+                return None
+            return old + (new - old) / scan_count
+
+        averaged_cube.metadata = {
+            **average,
+            "reference_order": [
+                a if a == b else "mixed"
+                for a, b in zip(average["reference_order"], current["reference_order"])
+            ],
+            "reference_model_field_vector_mT": [
+                [mean(a, b) for a, b in zip(old, new)]
+                for old, new in zip(
+                    average["reference_model_field_vector_mT"],
+                    current["reference_model_field_vector_mT"],
+                )
+            ],
+            "reference_model_polarity": [
+                [a if a == b else "mixed" for a, b in zip(old, new)]
+                for old, new in zip(
+                    average["reference_model_polarity"],
+                    current["reference_model_polarity"],
+                )
+            ],
         }
 
     @staticmethod
@@ -571,24 +712,27 @@ class ZeroFieldExperiment(ScanExperiment):
         }
 
     @staticmethod
-    def _merge_relay_flips(averaged_cube, acquired_cube):
+    def _merge_relay_flips(averaged_cube, acquired_cube, prefix=""):
         """Fold one completed scan's flips into the multi-scan average: a
         point is flagged if a flip preceded it in any averaged scan, with
-        the union of the axes involved."""
+        the union of the axes involved. ``prefix="reference_"`` merges the
+        reference half's flips the same way."""
+        occurred_key = f"{prefix}relay_flip_occurred"
+        axes_key = f"{prefix}relay_flip_axes"
         average = averaged_cube.metadata
         current = acquired_cube.metadata
-        if "relay_flip_occurred" not in average or "relay_flip_occurred" not in current:
+        if occurred_key not in average or occurred_key not in current:
             return
         occurred = [
             bool(a or b)
-            for a, b in zip(average["relay_flip_occurred"], current["relay_flip_occurred"])
+            for a, b in zip(average[occurred_key], current[occurred_key])
         ]
         axes = [
             ",".join(sorted(set(filter(None, a.split(","))) | set(filter(None, b.split(",")))))
-            for a, b in zip(average["relay_flip_axes"], current["relay_flip_axes"])
+            for a, b in zip(average[axes_key], current[axes_key])
         ]
         averaged_cube.metadata = {
-            **average, "relay_flip_occurred": occurred, "relay_flip_axes": axes,
+            **average, occurred_key: occurred, axes_key: axes,
         }
 
     def acquire_frame(self):
@@ -739,8 +883,14 @@ class ZeroFieldExperiment(ScanExperiment):
                             self._update_running_average(
                                 averaged_cube.data, ordered_cube.data, completed_scans
                             )
+                            self._update_running_extras(
+                                averaged_cube, ordered_cube, completed_scans
+                            )
                             self._merge_relay_flips(averaged_cube, ordered_cube)
                             self._merge_model_fields(
+                                averaged_cube, ordered_cube, completed_scans
+                            )
+                            self._merge_reference_metadata(
                                 averaged_cube, ordered_cube, completed_scans
                             )
                         if scan_count > 1:
@@ -848,6 +998,23 @@ class ZeroFieldExperiment(ScanExperiment):
         self.model_field_vector_mT = []
         self.model_polarity = []
         self.point_time_s = []
+        self.reference_order = []
+        self.reference_point_time_s = []
+        self.reference_relay_flip_occurred = []
+        self.reference_relay_flip_axes = []
+        self.reference_model_field_vector_mT = []
+        self.reference_model_polarity = []
+        self._ratio_zero_reference_pixels = 0
+        self.latest_ratio = None
+        self._last_half_vector_mT = None
+        self._reference_cube = (
+            ImageCube(data=None, expected_planes=self.field_points)
+            if self.reference_enabled else None
+        )
+        self._ratio_cube = (
+            ImageCube(data=None, expected_planes=self.field_points)
+            if self.reference_enabled else None
+        )
         self._sweep_t0 = time.perf_counter()
 
         # Set before setup_scan() (not just in the point loop below) so
@@ -886,35 +1053,33 @@ class ZeroFieldExperiment(ScanExperiment):
                 self._timing_field_gauss = field
                 point_t0 = time.perf_counter() if timing else None
 
-                # Apply magnetic field/current.
-                flipped = (
-                    self._as_flip_set(self.set_scan_point(field)) | self._setup_flip_axes
-                )
-                self._setup_flip_axes = frozenset()
-                # What was actually commanded, read before anything else can
-                # change the magnet; stored with the frame below.
-                model_gauss, model_vector_mT, model_polarity = self._model_snapshot()
+                # Signal half only, or -- with the reference on -- signal and
+                # reference halves alternating S,R / R,S by point index, so
+                # linear drift cancels and point i's closing R and point
+                # i+1's opening R share a field, with no magnet move between.
+                reference_first = self.reference_enabled and point_index % 2 == 1
+                if not self.reference_enabled:
+                    halves = ("S",)
+                elif reference_first:
+                    halves = ("R", "S")
+                else:
+                    halves = ("S", "R")
+                acquired = {}
+                for half in halves:
+                    target = field if half == "S" else self.reference_field_gauss
+                    acquired[half] = self._acquire_half(
+                        target, "" if half == "S" else "reference_"
+                    )
 
-                # Wait for field stabilization.
-                if self.settling_time_ms > 0:
-                    t0 = time.perf_counter() if timing else None
-                    time.sleep(self.settling_time_ms / 1000.0)
-                    if timing:
-                        self._record_timing("settling_sleep", None, t0)
-
-                # A relay flip cut and restored coil current: wait longer.
-                # Like the settling sleep above, not interruptible by stop.
-                if flipped and self.post_flip_settling_ms > 0:
-                    t0 = time.perf_counter() if timing else None
-                    time.sleep(self.post_flip_settling_ms / 1000.0)
-                    if timing:
-                        self._record_timing("post_flip_settling_sleep", None, t0)
-
-                # Acquire averaged fluorescence image. Its time is the
-                # midpoint of the acquisition, relative to the sweep start.
-                acquire_t0 = time.perf_counter()
-                averaged_image = self.acquire_frame()
-                point_time = 0.5 * (acquire_t0 + time.perf_counter()) - self._sweep_t0
+                averaged_image, flipped, snapshot, point_time = acquired["S"]
+                model_gauss, model_vector_mT, model_polarity = snapshot
+                if self.reference_enabled:
+                    reference_image, reference_flipped, reference_snapshot, reference_time = (
+                        acquired["R"]
+                    )
+                    # Computed before anything is stored, so a failure here
+                    # can't leave the signal and reference planes misaligned.
+                    ratio = self._ratio_plane(averaged_image, reference_image)
 
                 # Store measurement exactly once for this field value.
                 self.image_cube.add(averaged_image)
@@ -924,6 +1089,24 @@ class ZeroFieldExperiment(ScanExperiment):
                 self.model_field_vector_mT.append(model_vector_mT)
                 self.model_polarity.append(model_polarity)
                 self.point_time_s.append(point_time)
+                if self.reference_enabled:
+                    self._reference_cube.add(reference_image)
+                    self._ratio_cube.add(ratio)
+                    self.reference_order.append("RS" if reference_first else "SR")
+                    self.reference_point_time_s.append(reference_time)
+                    self.reference_relay_flip_occurred.append(bool(reference_flipped))
+                    self.reference_relay_flip_axes.append(reference_flipped)
+                    self.reference_model_field_vector_mT.append(reference_snapshot[1])
+                    self.reference_model_polarity.append(reference_snapshot[2])
+                    self.latest_ratio = ratio
+                    if self._stream_writer is not None:
+                        # Before the data plane: planes_written (bumped by
+                        # write_plane) then never counts a point whose
+                        # reference / ratio planes are missing.
+                        self._stream_writer.write_extra_plane(
+                            "reference", point_index, reference_image
+                        )
+                        self._stream_writer.write_extra_plane("ratio", point_index, ratio)
                 if self._stream_writer is not None:
                     t0 = time.perf_counter() if timing else None
                     self._stream_writer.write_plane(point_index, averaged_image)
@@ -984,8 +1167,31 @@ class ZeroFieldExperiment(ScanExperiment):
                 self.relay_flip_occurred, self.relay_flip_axes,
                 self.model_field_values_gauss, self.model_field_vector_mT,
                 self.model_polarity, self.point_time_s,
+                self.reference_order, self.reference_point_time_s,
+                self.reference_relay_flip_occurred, self.reference_relay_flip_axes,
+                self.reference_model_field_vector_mT, self.reference_model_polarity,
             ):
                 del per_point[frame_count:]
+            if self.reference_enabled:
+                # Same plane count and order as data; none if nothing was
+                # acquired, matching data=None.
+                extras = {}
+                if frame_count:
+                    for name, cube in (
+                        ("reference", self._reference_cube),
+                        ("ratio", self._ratio_cube),
+                    ):
+                        cube.truncate(frame_count)
+                        extras[name] = cube.data
+                self.image_cube.extra_datasets = extras
+                self._reference_cube = None
+                self._ratio_cube = None
+                if self._ratio_zero_reference_pixels:
+                    LOGGER.warning(
+                        "Zero Field scan %d: %d ratio pixel(s) set to NaN "
+                        "because the reference image was 0 there.",
+                        scan_index, self._ratio_zero_reference_pixels,
+                    )
             flip_metadata = self._per_point_metadata()
             self.image_cube.metadata = {**self.image_cube.metadata, **flip_metadata}
             if self._stream_writer is not None:
@@ -1007,6 +1213,75 @@ class ZeroFieldExperiment(ScanExperiment):
             finally:
                 self.cleanup()
 
+    def _acquire_half(self, field_gauss, stage_prefix):
+        """Command *field_gauss*, settle, and acquire one averaged image.
+
+        One "half" of a point: the signal half (the only one with the
+        reference off, behaving exactly as a point always has) or the
+        reference half. Returns (image, flipped_axes, model_snapshot,
+        acquisition_midpoint_s).
+
+        Every command gets flip detection and post-flip settling. With the
+        reference on, a command identical to the previous half's (the R,R
+        between consecutive points) still goes through set_vector() --
+        the magnet's change-detection cache skips the write -- but gets no
+        settling sleep, since nothing moved.
+        """
+        timing = self._timing
+        vector_mT = self._point_vector_mT(field_gauss)
+        repeated = (
+            self.reference_enabled
+            and self._last_half_vector_mT is not None
+            and vector_mT == self._last_half_vector_mT
+        )
+
+        # Apply magnetic field/current. Flips caused by setup_scan() are
+        # folded into the first command of the sweep.
+        flipped = (
+            self._as_flip_set(self.set_scan_point(field_gauss)) | self._setup_flip_axes
+        )
+        self._setup_flip_axes = frozenset()
+        self._last_half_vector_mT = vector_mT
+        # What was actually commanded, read before anything else can
+        # change the magnet; stored with the frame.
+        snapshot = self._model_snapshot()
+
+        # Wait for field stabilization.
+        if self.settling_time_ms > 0 and not repeated:
+            t0 = time.perf_counter() if timing else None
+            time.sleep(self.settling_time_ms / 1000.0)
+            if timing:
+                self._record_timing(f"{stage_prefix}settling_sleep", None, t0)
+
+        # A relay flip cut and restored coil current: wait longer.
+        # Like the settling sleep above, not interruptible by stop.
+        if flipped and self.post_flip_settling_ms > 0:
+            t0 = time.perf_counter() if timing else None
+            time.sleep(self.post_flip_settling_ms / 1000.0)
+            if timing:
+                self._record_timing(f"{stage_prefix}post_flip_settling_sleep", None, t0)
+
+        # Acquire averaged fluorescence image. Its time is the midpoint of
+        # the acquisition, relative to the sweep start.
+        acquire_t0 = time.perf_counter()
+        image = self.acquire_frame()
+        midpoint = 0.5 * (acquire_t0 + time.perf_counter()) - self._sweep_t0
+        if timing and stage_prefix:
+            self._record_timing(f"{stage_prefix}acquire", None, acquire_t0)
+        return image, flipped, snapshot, midpoint
+
+    def _ratio_plane(self, signal, reference):
+        """Per-pixel signal / reference as float64; NaN where reference is 0."""
+        signal = np.asarray(signal, dtype=np.float64)
+        reference = np.asarray(reference, dtype=np.float64)
+        zero = reference == 0
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio = signal / reference
+        if np.any(zero):
+            ratio[zero] = np.nan
+            self._ratio_zero_reference_pixels += int(np.count_nonzero(zero))
+        return ratio
+
     def _new_averaged_cube(self, acquired_cube):
         # Per-sweep keys (one scan's timestamps and direction) would mislabel
         # the average; it records them per scan instead.
@@ -1023,6 +1298,12 @@ class ZeroFieldExperiment(ScanExperiment):
             scan_axis_name=acquired_cube.scan_axis_name,
             scan_axis_unit=acquired_cube.scan_axis_unit,
             scan_axis_values=copy.deepcopy(acquired_cube.scan_axis_values),
+            # Running averages of the reference / ratio planes, owned copies.
+            extra_datasets={
+                name: np.array(value, dtype=np.float64, copy=True)
+                for name, value in acquired_cube.extra_datasets.items()
+                if name in self._PER_POINT_EXTRA_KEYS
+            },
         )
 
     @staticmethod
@@ -1072,11 +1353,52 @@ class ZeroFieldExperiment(ScanExperiment):
             metadata["scan_point_times_s"] = [
                 list(times) for times in self._scan_point_times_s
             ]
+            if self.reference_enabled:
+                metadata["scan_reference_point_times_s"] = [
+                    list(times) for times in self._scan_reference_point_times_s
+                ]
         if scan_count > 1 and self._alternating:
             metadata["scan_directions"] = list(self._scan_directions)
             metadata["forward_scan_count"] = self._direction_counts["forward"]
             metadata["reverse_scan_count"] = self._direction_counts["reverse"]
         image_cube.metadata = metadata
+
+    # field_value_definitions entries added only when the reference is on.
+    _REFERENCE_DEFINITIONS = {
+        "reference": (
+            "Dataset: per-point fluorescence image at the reference field "
+            "(swept axis at reference_field_gauss, other axes as for the "
+            "signal), same plane order and averaging as data."
+        ),
+        "ratio": (
+            "Dataset: per-pixel data / reference for each point (float64). "
+            "NaN where the reference was 0. A multi-scan average is the mean "
+            "of per-scan ratios, as ODMR averages ON/OFF ratios."
+        ),
+        "ratio_forward_average": (
+            "Dataset (alternate_direction on): mean ratio of forward scans, "
+            "start -> stop field order. ratio_reverse_average likewise."
+        ),
+        "reference_order": (
+            "Per point: 'SR' (signal then reference) or 'RS'. Alternates with "
+            "the point index in sweep order; 'mixed' in an average whose "
+            "scans differed."
+        ),
+        "reference_point_time_s": (
+            "Midpoint of each point's reference acquisition, same clock as "
+            "point_time_s. A multi-scan average stores one list per scan as "
+            "scan_reference_point_times_s."
+        ),
+        "reference_relay_flip_occurred": (
+            "Whether the reference half's field command flipped a relay "
+            "(reference_relay_flip_axes: which). relay_flip_* cover the "
+            "signal half."
+        ),
+        "reference_model_field_vector_mT": (
+            "Modelled [x, y, z] field of the reference half, in mT. Not a "
+            "measurement. reference_model_polarity: its relay branches."
+        ),
+    }
 
     def _set_static_metadata(self):
         """Record the known conditions that define this field sweep."""
@@ -1137,6 +1459,7 @@ class ZeroFieldExperiment(ScanExperiment):
                 "camera_model": type(self.camera).__name__,
                 "zero_other_axes": self.zero_other_axes,
                 "alternate_direction": self._alternating,
+                "reference_enabled": self.reference_enabled,
                 "initial_magnet_vector_mT": (
                     dict(self._initial_magnet_vector_mT)
                     if self._initial_magnet_vector_mT is not None
@@ -1149,6 +1472,11 @@ class ZeroFieldExperiment(ScanExperiment):
             metadata["sweep_direction"] = (
                 "reverse" if self._sweep_reversed else "forward"
             )
+        if self.reference_enabled:
+            metadata["reference_field_gauss"] = self.reference_field_gauss
+            definitions = dict(metadata["field_value_definitions"])
+            definitions.update(self._REFERENCE_DEFINITIONS)
+            metadata["field_value_definitions"] = definitions
         power_supply_models = self._power_supply_models()
         if power_supply_models:
             metadata["power_supply_models"] = power_supply_models
@@ -1218,6 +1546,12 @@ class ZeroFieldExperiment(ScanExperiment):
             raise ValueError(
                 "Zero Field image dtype does not match ImageCube metadata."
             )
+        for name in self._PER_POINT_EXTRA_KEYS:
+            extra = image_cube.extra_datasets.get(name)
+            if extra is not None and np.shape(extra) != data.shape:
+                raise ValueError(
+                    f"Zero Field {name} planes do not match the data planes."
+                )
 
     def _camera_setting(self, attribute):
         value = getattr(self.camera, attribute, None)

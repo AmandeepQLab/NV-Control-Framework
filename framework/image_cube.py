@@ -621,6 +621,8 @@ class ImageCubeStreamWriter:
 
         self._dataset = None
         self._frame_shape = None
+        # Extra per-plane datasets (see write_extra_plane), by name.
+        self._extra_datasets = {}
         self._closed = False
         self._handle = h5py.File(filename, "w")
 
@@ -702,6 +704,45 @@ class ImageCubeStreamWriter:
         self._write_metadata_json()
         self._handle.flush()
 
+    def write_extra_plane(self, name, index, frame):
+        """Write plane *index* of the extra dataset *name* and flush it.
+
+        For per-plane companions of ``data`` (e.g. a Zero Field scan's
+        reference / ratio planes), stored as top-level datasets that
+        ImageCube.load() returns in ``extra_datasets``. Created on first use
+        with the frame's shape and dtype. Write a point's extra planes
+        before its data plane: ``planes_written`` (bumped by write_plane)
+        then never counts a plane whose extras are missing, and close()
+        truncates every extra to ``planes_written`` like ``data``.
+        """
+        if self._closed:
+            raise ValueError("Cannot write to a closed ImageCubeStreamWriter.")
+        if not 0 <= index < self.num_planes:
+            raise ValueError(
+                f"Plane index {index} is out of range for {self.num_planes} planes."
+            )
+        _validate_extra_dataset_name(name)
+        frame = np.asarray(frame)
+        dataset = self._extra_datasets.get(name)
+        if dataset is None:
+            dataset = self._handle.create_dataset(
+                name,
+                shape=(self.num_planes,) + frame.shape,
+                dtype=frame.dtype,
+                chunks=(1,) + frame.shape,
+                compression="gzip",
+                compression_opts=4,
+                shuffle=True,
+            )
+            self._extra_datasets[name] = dataset
+        elif dataset.shape[1:] != frame.shape:
+            raise ValueError(
+                f"All streamed {name} planes must have the same shape "
+                f"(expected {dataset.shape[1:]}, got {frame.shape})."
+            )
+        dataset[index] = frame.astype(dataset.dtype, copy=False)
+        self._handle.flush()
+
     def update_metadata(self, metadata):
         """Merge *metadata* into the file's metadata without touching
         ``scan_complete`` -- for bookkeeping only known partway through a
@@ -765,6 +806,11 @@ class ImageCubeStreamWriter:
 
     def _truncate_to_planes_written(self):
         planes_written = self.metadata.get("planes_written", 0)
+        if planes_written != self.num_planes:
+            # Extra planes are written before their data plane, so an extra
+            # can hold one plane more than planes_written; drop it too.
+            for dataset in self._extra_datasets.values():
+                dataset.resize((planes_written,) + dataset.shape[1:])
         if self._dataset is None or planes_written == self.num_planes:
             # Nothing written yet (no dataset was ever created), or already
             # full -- nothing to truncate either way.

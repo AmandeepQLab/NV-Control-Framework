@@ -21,6 +21,23 @@ def _is_hdf5_path(filename):
     return filename is not None and Path(filename).suffix.lower() in (".h5", ".hdf5")
 
 
+def mean_ratio(ratio_plane):
+    """Mean of one signal/reference plane over its finite pixels (NaN marks
+    a zero reference); NaN if none are finite."""
+    values = np.asarray(ratio_plane, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    return float(values.mean()) if values.size else float("nan")
+
+
+def ratio_curve(image_cube):
+    """(fields, mean ratio per point) from a cube's ``ratio`` dataset, in
+    the cube's own plane order -- the reference-mode counterpart of
+    mean_fluorescence_vs_field()."""
+    ratio = image_cube.extra_datasets["ratio"]
+    fields = np.asarray(image_cube.scan_axis_values, dtype=np.float64)[: len(ratio)]
+    return fields, np.array([mean_ratio(plane) for plane in ratio])
+
+
 def _atomic_save_hdf5(cube, path):
     """Save *cube* to *path* via a temp-file-then-rename so a crash exactly
     mid-write can't corrupt whatever was already durably there before.
@@ -109,6 +126,8 @@ class ZeroFieldWorker(QObject):
                 averaging_enabled=self.config.get("averaging_enabled", False),
                 num_scans=self.config.get("num_scans", 1),
                 alternate_direction=self.config.get("alternate_direction", False),
+                reference_enabled=self.config.get("reference_enabled", False),
+                reference_field_gauss=self.config.get("reference_field_gauss", 8.0),
                 # "Save individual scans" is meaningless without a
                 # destination -- force off regardless of widget state so
                 # _save_raw_scan's self.output_path.with_name(...) can never
@@ -206,6 +225,8 @@ class ZeroFieldWorker(QObject):
                 f"# num_scans={self.config.get('num_scans', 1)}",
                 f"# save_raw_scans={self.config.get('save_raw_scans', False)}",
                 f"# alternate_direction={self.config.get('alternate_direction', False)}",
+                f"# reference_enabled={self.config.get('reference_enabled', False)}",
+                f"# reference_field_gauss={self.config.get('reference_field_gauss')}",
                 f"# zero_other_axes={self.experiment.zero_other_axes}",
                 f"# acquisition_roi={self.acquisition_roi}",
                 f"# camera_exposure_s={exposure_s} (actual camera read-back; "
@@ -242,10 +263,15 @@ class ZeroFieldWorker(QObject):
             self.experiment.stop()
 
     def _on_live_update(self, field, image):
-        """Publish the newest stored image's raw fluorescence measurement."""
+        """Publish the newest stored point: raw mean fluorescence, or with
+        the reference on, the mean signal/reference ratio. *image* (the
+        signal frame) is what the live image shows either way."""
         # The camera has already applied the acquisition ROI.  Live analysis
         # therefore operates on the received image without software cropping.
-        signal = self._compute_live_fluorescence(image)
+        if getattr(self.experiment, "reference_enabled", False):
+            signal = mean_ratio(self.experiment.latest_ratio)
+        else:
+            signal = self._compute_live_fluorescence(image)
         self._fields.append(field)
         self._signals.append(signal)
         self.live_update_signal.emit(float(field), float(signal), image)
