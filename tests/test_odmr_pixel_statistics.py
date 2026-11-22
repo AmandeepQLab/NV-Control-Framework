@@ -138,9 +138,22 @@ class PixelNormalizationTests(unittest.TestCase):
         self.assertEqual(ctx.exception.invalid_count, 1)
 
 
+# One application object, owned by this module for the whole run. Before,
+# _qapp() could create one held only by a test's local variable and its
+# signal lambdas (a reference cycle with that test's worker). When the
+# cycle collector destroyed it during a later test, after that test's
+# ODMRWorker was built, Qt deleted the new worker with it ("wrapped C/C++
+# object of type ODMRWorker has been deleted"). That happened only when
+# this file ran on its own: in the full suite another file's
+# process-wide QApplication already exists.
+_APP = None
+
+
 def _qapp():
-    app = QCoreApplication.instance()
-    return app if app is not None else QCoreApplication([])
+    global _APP
+    if _APP is None:
+        _APP = QCoreApplication.instance() or QCoreApplication([])
+    return _APP
 
 
 class WorkerStatisticsTests(unittest.TestCase):
