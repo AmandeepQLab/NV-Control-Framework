@@ -217,30 +217,6 @@ class ImageCube:
         return self.data.ndim
 
     # =====================================================
-    # DISPLAY
-    # =====================================================
-
-    def show(self):
-
-        import matplotlib.pyplot as plt
-
-        if self.ndim == 2:
-
-            plt.imshow(self.data)
-
-        elif self.ndim == 3:
-
-            plt.imshow(self.data[0])
-
-        else:
-
-            raise ValueError(
-                "ImageCube data must be 2D or 3D to display."
-            )
-
-        plt.show()
-
-    # =====================================================
     # SAVE
     # =====================================================
 
