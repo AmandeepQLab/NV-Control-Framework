@@ -577,7 +577,7 @@ class WidgetTests(unittest.TestCase):
         w = self.widget
         config = w.get_config()
         self.assertFalse(config["reference_enabled"])
-        self.assertEqual(config["reference_field_gauss"], 8.0)
+        self.assertEqual(config["reference_field_gauss"], -8.0)
         self.assertFalse(w.reference_field_spin.isEnabled())
         self.assertEqual(w.reference_field_spin.decimals(), 4)
         self.assertEqual(w.reference_field_spin.minimum(), -10000)
@@ -593,7 +593,7 @@ class WidgetTests(unittest.TestCase):
         config = w.get_config()
         self.assertTrue(config["reference_enabled"])
         self.assertEqual(config["reference_field_gauss"], -12.5)
-        w.reference_field_spin.setValue(8.0)
+        w.reference_field_spin.setValue(-8.0)
 
     def test_disabled_but_checked_reports_false(self):
         w = self.widget

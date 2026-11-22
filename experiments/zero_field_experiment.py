@@ -62,7 +62,7 @@ class ZeroFieldExperiment(ScanExperiment):
         post_flip_settling_ms=0.0,
         alternate_direction=False,
         reference_enabled=False,
-        reference_field_gauss=8.0,
+        reference_field_gauss=-8.0,
     ):
         config = {
             "settling_time_ms": settling_time_ms,

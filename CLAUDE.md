@@ -239,11 +239,11 @@ All three are calibration-model values, **not measurements** (there is no field 
 **Why it exists.** At the rig, slow environmental drift is ~1% peak-to-peak over minutes, against ~0.06% point-to-point noise and a ~0.15–0.3% zero-field dip. Bidirectional sweeps cancel only drift that is linear in time, and need many scans. Like ODMR's ON/OFF pairing, this mode measures every point twice: at its field (signal, S) and at a fixed off-resonant reference field (R). It stores the per-pixel ratio, so slow multiplicative drift common to both halves divides out.
 
 **How it is switched on.**
-- GUI: "Reference field normalization" checkbox and "Reference field (G)" spinbox (default +8.0, ±10000, 4 decimals), in "Multi-Scan Averaging" next to "Alternate sweep direction".
+- GUI: "Reference field normalization" checkbox and "Reference field (G)" spinbox (default −8.0, ±10000, 4 decimals), in "Multi-Scan Averaging" next to "Alternate sweep direction".
   - It works with or without multi-scan averaging, so it is not tied to the averaging checkbox.
   - The spinbox is enabled only while the box is checked.
   - `get_config()["reference_enabled"]` is `isChecked() and isEnabled()`. `reference_field_gauss` is always reported.
-- Experiment: `ZeroFieldExperiment(reference_enabled=False, reference_field_gauss=8.0)`, passed through by `ZeroFieldWorker`.
+- Experiment: `ZeroFieldExperiment(reference_enabled=False, reference_field_gauss=-8.0)`, passed through by `ZeroFieldWorker`.
 
 **Reference vector.** It is the point's vector with the swept axis replaced by `reference_field_gauss`; the non-swept axes keep their usual values (calibrated zero, or the retained vector with `zero_other_axes=False`).
 
@@ -262,7 +262,7 @@ All three are calibration-model values, **not measurements** (there is no field 
 **Relay-flip cost of a reference on the opposite branch.** A reference whose sign puts the swept axis on the other relay branch from a point's field flips the relay on both halves that change field: R after S, and S after R. Each flip pays the full zero/off/discharge/switch/settle/on sequence plus `post_flip_settling_ms` (GUI default 500 ms).
 - In sim, a symmetric −2…+2 G X sweep with a +8 G reference took 0.71 s per point, against 0.26 s with the reference off (2.7×). The negative half of the sweep flipped on almost every half.
 - A 0.5…2.5 G sweep, on the reference's branch, took 0.27 s against 0.17 s (1.6×). It is under 2× because the R,R repeat neither writes nor settles.
-- So pick the reference's sign on the branch most of the sweep uses. The checkbox tooltip says the same.
+- So pick the reference's sign on the branch most of the sweep uses. The checkbox tooltip says the same, and recommends a negative reference for Z sweeps around zero. The default is −8.0 G for that reason. The sim timings above used +8 G.
 
 **Data.**
 - `data` is unchanged in meaning: the signal planes.

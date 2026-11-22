@@ -144,15 +144,15 @@ class ZeroFieldWidget(QWidget):
         self.reference_enabled_check.setToolTip(
             "Each point is also measured at the reference field and stored "
             "as signal/reference, so slow drift cancels. Roughly doubles "
-            "acquisition time. Choose a reference far from zero field. "
-            "Picking the sign on the same relay branch as most of the sweep "
-            "avoids repeated relay flips."
+            "acquisition time. Choose a reference far from zero field, on the "
+            "same relay branch as most of the sweep to avoid repeated relay "
+            "flips (for Z sweeps around zero, use a negative reference)."
         )
         reference_row.addWidget(self.reference_enabled_check)
         reference_row.addStretch()
         averaging_layout.addLayout(reference_row)
         self.reference_field_spin = self._add_double(
-            averaging_layout, "Reference field (G)", -10000, 10000, 4, 8.0
+            averaging_layout, "Reference field (G)", -10000, 10000, 4, -8.0
         )
         self.reference_field_spin.setEnabled(False)
         self.reference_enabled_check.toggled.connect(

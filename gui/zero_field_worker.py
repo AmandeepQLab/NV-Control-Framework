@@ -127,7 +127,7 @@ class ZeroFieldWorker(QObject):
                 num_scans=self.config.get("num_scans", 1),
                 alternate_direction=self.config.get("alternate_direction", False),
                 reference_enabled=self.config.get("reference_enabled", False),
-                reference_field_gauss=self.config.get("reference_field_gauss", 8.0),
+                reference_field_gauss=self.config.get("reference_field_gauss", -8.0),
                 # "Save individual scans" is meaningless without a
                 # destination -- force off regardless of widget state so
                 # _save_raw_scan's self.output_path.with_name(...) can never
