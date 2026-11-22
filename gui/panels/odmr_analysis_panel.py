@@ -14,12 +14,16 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from gui.widgets.initial_fit_parameters_dialog import DOUBLE_LORENTZIAN, FIT_TYPES
+
 
 class ODMRAnalysisPanel(QWidget):
     """Controls and displays for global and pixel-wise ODMR analysis."""
 
     open_file_requested = pyqtSignal()
     fit_global_requested = pyqtSignal()
+    initial_fit_parameters_requested = pyqtSignal()
+    fit_type_changed = pyqtSignal(str)
     fit_pixels_requested = pyqtSignal()
     reconstruct_bz_requested = pyqtSignal()
     map_selection_requested = pyqtSignal(str)
@@ -36,18 +40,34 @@ class ODMRAnalysisPanel(QWidget):
         controls_layout = QVBoxLayout(controls)
         self.open_button = QPushButton("Open ODMR HDF5")
         self.fit_button = QPushButton("Fit Global Spectrum")
+        self.initial_fit_parameters_button = QPushButton("Supply Initial Fit Parameters")
         self.fit_pixels_button = QPushButton("Fit Pixels")
         self.reconstruct_bz_button = QPushButton("Reconstruct Bz")
         self.fit_button.setEnabled(False)
         self.fit_pixels_button.setEnabled(False)
         self.reconstruct_bz_button.setEnabled(False)
-        for button in (
-            self.open_button,
-            self.fit_button,
-            self.fit_pixels_button,
-            self.reconstruct_bz_button,
-        ):
-            controls_layout.addWidget(button)
+
+        # Same labels and order as the ODMR window's selector. Double is
+        # preselected because it was this window's only fit before.
+        fit_type_row = QHBoxLayout()
+        fit_type_row.addWidget(QLabel("Fit type:"))
+        self.fit_type_combo = QComboBox()
+        self.fit_type_combo.addItems(list(FIT_TYPES))
+        self.fit_type_combo.setCurrentText(DOUBLE_LORENTZIAN)
+        fit_type_row.addWidget(self.fit_type_combo, 1)
+
+        fit_row = QHBoxLayout()
+        fit_row.addWidget(self.fit_button)
+        fit_row.addWidget(self.initial_fit_parameters_button)
+
+        controls_layout.addWidget(self.open_button)
+        controls_layout.addLayout(fit_type_row)
+        controls_layout.addLayout(fit_row)
+        self.initial_parameters_label = QLabel("")
+        self.initial_parameters_label.setWordWrap(True)
+        controls_layout.addWidget(self.initial_parameters_label)
+        controls_layout.addWidget(self.fit_pixels_button)
+        controls_layout.addWidget(self.reconstruct_bz_button)
         self.status_label = QLabel("Open an ODMR statistics HDF5 file to begin.")
         self.status_label.setWordWrap(True)
         controls_layout.addWidget(self.status_label)
@@ -63,7 +83,7 @@ class ODMRAnalysisPanel(QWidget):
         metadata_layout.addWidget(self.metadata_label)
         control_layout.addWidget(metadata_box)
 
-        fit_box = QGroupBox("Global Two-Lorentzian Fit")
+        fit_box = QGroupBox("Global Fit")
         fit_layout = QVBoxLayout(fit_box)
         self.fit_info_label = QLabel("No global fit available.")
         self.fit_info_label.setWordWrap(True)
@@ -184,6 +204,10 @@ class ODMRAnalysisPanel(QWidget):
 
         self.open_button.clicked.connect(self.open_file_requested.emit)
         self.fit_button.clicked.connect(self.fit_global_requested.emit)
+        self.initial_fit_parameters_button.clicked.connect(
+            self.initial_fit_parameters_requested.emit
+        )
+        self.fit_type_combo.currentTextChanged.connect(self.fit_type_changed.emit)
         self.fit_pixels_button.clicked.connect(self.fit_pixels_requested.emit)
         self.reconstruct_bz_button.clicked.connect(self.reconstruct_bz_requested.emit)
         self.map_combo.currentTextChanged.connect(self.map_selection_requested.emit)
@@ -241,9 +265,17 @@ class ODMRAnalysisPanel(QWidget):
         self.fitted_curve.setData([], [])
         self.fit_info_label.setText(message)
 
-    def set_fit_result(self, result):
+    def get_fit_type(self):
+        return self.fit_type_combo.currentText()
+
+    def set_initial_parameters_text(self, text):
+        self.initial_parameters_label.setText(str(text))
+
+    def set_fit_result(self, result, settings_text=""):
+        """Show a two-Lorentzian result; ``settings_text`` records how it was run."""
+        prefix = f"{settings_text}\n" if settings_text else ""
         if not result.success:
-            self.clear_fit(f"Fit status: {result.status}\n{result.message}")
+            self.clear_fit(f"{prefix}Fit status: {result.status}\n{result.message}")
             return
 
         self.fitted_curve.setData(
@@ -253,6 +285,7 @@ class ODMRAnalysisPanel(QWidget):
             result.frequency_plus_hz - result.frequency_minus_hz
         ) / 1.0e9
         self.fit_info_label.setText(
+            f"{prefix}"
             f"Fit status: {result.status}\n"
             f"f_low: {result.frequency_minus_hz / 1.0e9:.9g} GHz\n"
             f"f_high: {result.frequency_plus_hz / 1.0e9:.9g} GHz\n"
@@ -265,13 +298,29 @@ class ODMRAnalysisPanel(QWidget):
             f"R²: {result.r2:.6g}"
         )
 
-    def set_pixel_fit_summary(self, result):
+    def set_single_fit_result(self, frequency_ghz, fit, settings_text=""):
+        """Show a single-Lorentzian result from ``fit_single_lorentzian`` (GHz)."""
+        prefix = f"{settings_text}\n" if settings_text else ""
+        self.fitted_curve.setData(np.asarray(frequency_ghz), np.asarray(fit["fit_y"]))
+        self.fit_info_label.setText(
+            f"{prefix}"
+            f"f0: {fit['f0']:.9g} GHz\n"
+            f"FWHM: {fit['fwhm'] * 1.0e3:.6g} MHz\n"
+            f"Contrast: {fit['contrast']:.6g}%\n"
+            f"Baseline: {fit['baseline']:.6g}%\n"
+            f"RMSE: {fit['rmse']:.6g}%\n"
+            f"R²: {fit['r2']:.6g}"
+        )
+
+    def set_pixel_fit_summary(self, result, seed_text=""):
         fraction = 100.0 * result.success_fraction
+        seed = f"\n{seed_text}" if seed_text else ""
         self.pixel_fit_summary_label.setText(
             f"Valid spectra: {result.valid_pixel_count}\n"
             f"Successful fits: {result.successful_fit_count}\n"
             f"Failed fits: {result.failed_fit_count}\n"
             f"Success fraction: {fraction:.1f}%"
+            f"{seed}"
         )
 
     def set_selected_pixel_info(self, text):

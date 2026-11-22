@@ -21,6 +21,7 @@ ALLOWED_FILES = frozenset(
         "test_colormap_selectors.py",
         "test_odmr_acquisition_roi.py",
         "test_odmr_analysis_gui.py",
+        "test_odmr_analysis_fit_options.py",
         "test_exposure_propagation.py",
         "test_image_cube_preallocation.py",
         "test_main_window_close_safety.py",

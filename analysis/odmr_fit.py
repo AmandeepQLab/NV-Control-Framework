@@ -422,6 +422,36 @@ def fit_global_odmr_spectrum(final_mean, frequency_hz, initial_guess=None):
     )
 
 
+def two_lorentzian_guess_with_overrides(frequency_hz, spectrum, overrides):
+    """Automatic two-Lorentzian guess with supplied values substituted.
+
+    ``overrides`` is a seven-element sequence in canonical fitter order
+    (baseline, amplitude, centre Hz, FWHM Hz, amplitude, centre Hz, FWHM Hz);
+    ``None`` entries keep the automatic value computed from the finite
+    samples, exactly as :func:`fit_two_lorentzian_spectrum` would. The two
+    (amplitude, centre, FWHM) groups are then ordered by centre, so supplied
+    resonances may be given in either order.
+    """
+    frequency_hz = np.asarray(frequency_hz, dtype=np.float64)
+    spectrum = np.asarray(spectrum, dtype=np.float64)
+    if len(overrides) != 7:
+        raise ValueError("overrides must contain seven parameters.")
+    valid = np.isfinite(spectrum) & np.isfinite(frequency_hz)
+    if valid.sum() < 2:
+        raise ValueError("At least 2 finite spectrum samples are required for a guess.")
+    automatic = _default_two_lorentzian_guess(
+        frequency_hz[valid], spectrum[valid]
+    ).as_array()
+    values = [
+        float(auto) if value is None else float(value)
+        for auto, value in zip(automatic, overrides)
+    ]
+    first, second = values[1:4], values[4:7]
+    if second[1] < first[1]:
+        first, second = second, first
+    return TwoLorentzianInitialGuess(values[0], *first, *second)
+
+
 def global_mean_odmr_spectrum(final_mean):
     """Return the finite-pixel spatial mean at every frequency plane.
 

@@ -5,11 +5,13 @@ from pathlib import Path
 
 import numpy as np
 from PyQt6.QtCore import QThread
-from PyQt6.QtWidgets import QFileDialog, QMainWindow, QMessageBox
+from PyQt6.QtWidgets import QDialog, QFileDialog, QMainWindow, QMessageBox
 
 from analysis.odmr_fit import (
     fit_global_odmr_spectrum,
+    fit_single_lorentzian,
     global_mean_odmr_spectrum,
+    two_lorentzian_guess_with_overrides,
     two_lorentzian_odmr_model,
 )
 from analysis.odmr_magnetic import reconstruct_bz
@@ -20,6 +22,15 @@ from framework.analysis.odmr_statistics import (
 )
 from gui.odmr_analysis_worker import ODMRPixelFitWorker
 from gui.panels.odmr_analysis_panel import ODMRAnalysisPanel
+from gui.widgets.initial_fit_parameters_dialog import (
+    DOUBLE_LORENTZIAN,
+    FIT_TYPES,
+    SINGLE_LORENTZIAN,
+    InitialFitParametersDialog,
+    check_manual_locations_in_range,
+    describe_initial_parameters,
+    manual_initial_guess,
+)
 
 
 class ODMRAnalysisState(str, Enum):
@@ -57,6 +68,10 @@ class ODMRAnalysisWindow(QMainWindow):
         self.setCentralWidget(self.panel)
         self.panel.open_file_requested.connect(self.open_file)
         self.panel.fit_global_requested.connect(self.fit_global_spectrum)
+        self.panel.initial_fit_parameters_requested.connect(
+            self.supply_initial_fit_parameters
+        )
+        self.panel.fit_type_changed.connect(self._update_initial_parameter_text)
         self.panel.fit_pixels_requested.connect(self.fit_pixels)
         self.panel.reconstruct_bz_requested.connect(self.reconstruct_magnetic_map)
         self.panel.map_selection_requested.connect(self.show_selected_map)
@@ -66,7 +81,15 @@ class ODMRAnalysisWindow(QMainWindow):
         self.loaded_odmr_cube = None
         self.statistics_result = None
         self.global_spectrum = None
+        # Two-Lorentzian (Double) result only: it seeds pixel fitting. A
+        # Single Lorentzian result is kept in single_fit_result instead.
         self.global_fit_result = None
+        self.single_fit_result = None
+        # What the last global fit used: {"fit_type", "initial_parameters"}.
+        self.global_fit_settings = None
+        # Manual initial values per fit type, kept for this window's lifetime
+        # (not cleared by loading another file), as in the ODMR window.
+        self.initial_fit_guesses = {fit_type: None for fit_type in FIT_TYPES}
         self.pixel_fit_result = None
         self.magnetic_result = None
         self.selected_pixel = None
@@ -75,7 +98,55 @@ class ODMRAnalysisWindow(QMainWindow):
         self.pixel_worker = None
         self.pixel_thread = None
         self._close_after_pixel_fit = False
+        self._update_initial_parameter_text()
         self._update_actions()
+
+    # ------------------------------------------------------------------
+    # Initial fit parameters
+    # ------------------------------------------------------------------
+
+    def supply_initial_fit_parameters(self):
+        """Open the shared dialog for the selected fit type."""
+        fit_type = self.panel.get_fit_type()
+        dialog = InitialFitParametersDialog(
+            fit_type, self.initial_fit_guesses[fit_type], self, allow_clear=True
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.set_initial_fit_parameters(
+            fit_type, None if dialog.cleared else dialog.parsed_values()
+        )
+
+    def set_initial_fit_parameters(self, fit_type, values):
+        """Store dialog values for ``fit_type``; ``None`` means automatic."""
+        if fit_type not in self.initial_fit_guesses:
+            raise ValueError(f"Unknown fit type: {fit_type}")
+        self.initial_fit_guesses[fit_type] = None if values is None else dict(values)
+        self._update_initial_parameter_text()
+
+    def _initial_parameter_text(self, fit_type):
+        manual = self.initial_fit_guesses[fit_type]
+        text = f"Initial parameters ({fit_type}): {describe_initial_parameters(manual)}."
+        if manual is None:
+            for other in FIT_TYPES:
+                if other != fit_type and self.initial_fit_guesses[other] is not None:
+                    text += f" Values supplied for {other} are not used with {fit_type}."
+        return text
+
+    def _update_initial_parameter_text(self, *_args):
+        self.panel.set_initial_parameters_text(
+            self._initial_parameter_text(self.panel.get_fit_type())
+        )
+
+    def _settings_text(self):
+        settings = self.global_fit_settings
+        if settings is None:
+            return ""
+        return (
+            f"Fit type: {settings['fit_type']}\n"
+            "Initial parameters: "
+            f"{describe_initial_parameters(settings['initial_parameters'])}"
+        )
 
     def open_file(self):
         if self._pixel_fit_active():
@@ -128,22 +199,56 @@ class ODMRAnalysisWindow(QMainWindow):
             return False
 
     def fit_global_spectrum(self):
-        """Fit the loaded final mean using the canonical analysis API."""
+        """Fit the loaded final mean with the selected fit type.
+
+        Double Lorentzian uses the canonical bounded fitter
+        (``fit_global_odmr_spectrum``), whose result seeds pixel fitting.
+        Single Lorentzian uses the ODMR window's ``fit_single_lorentzian``
+        on the global mean spectrum; pixel fitting and Bz need Double.
+        Manual initial parameters for the selected type are used when set.
+        Every failure is reported in the status line and a message box.
+        """
         if self.statistics_result is None or self._pixel_fit_active():
             return None
+        fit_type = self.panel.get_fit_type()
+        manual = self.initial_fit_guesses.get(fit_type)
         self._invalidate_pixel_and_magnetic_results()
         self.global_fit_result = None
+        self.single_fit_result = None
+        self.global_fit_settings = {
+            "fit_type": fit_type,
+            "initial_parameters": None if manual is None else dict(manual),
+        }
         self.state = ODMRAnalysisState.LOADED
         self.panel.clear_fit("Global fit is running…")
-        self.panel.set_status("Fitting the global ODMR spectrum…")
+        self.panel.set_status(f"Fitting the global ODMR spectrum ({fit_type})…")
         self._update_actions()
         try:
+            frequency_hz = self.statistics_result.frequency_values
+            if manual is not None:
+                finite = np.isfinite(self.global_spectrum)
+                measured_ghz = frequency_hz[finite] / 1.0e9
+                check_manual_locations_in_range(
+                    fit_type, manual,
+                    float(np.min(measured_ghz)), float(np.max(measured_ghz)),
+                )
+            if fit_type == SINGLE_LORENTZIAN:
+                return self._fit_global_single(manual)
+
+            kwargs = {}
+            if manual is not None:
+                kwargs["initial_guess"] = two_lorentzian_guess_with_overrides(
+                    frequency_hz,
+                    self.global_spectrum,
+                    _ghz_guess_to_hz(manual_initial_guess(DOUBLE_LORENTZIAN, manual)),
+                )
             result = fit_global_odmr_spectrum(
                 self.statistics_result.final_mean,
-                self.statistics_result.frequency_values,
+                frequency_hz,
+                **kwargs,
             )
             self.global_fit_result = result
-            self.panel.set_fit_result(result)
+            self.panel.set_fit_result(result, self._settings_text())
             if not result.success:
                 self.panel.set_status(f"Global fit failed: {result.message}")
                 QMessageBox.warning(self, "ODMR Fit Error", result.message)
@@ -151,15 +256,45 @@ class ODMRAnalysisWindow(QMainWindow):
                 return result
 
             self.state = ODMRAnalysisState.GLOBAL_FIT_AVAILABLE
-            self.panel.set_status("Global two-Lorentzian fit completed.")
+            self.panel.set_status(
+                f"Global {fit_type} fit completed "
+                f"(initial parameters: {'supplied' if manual else 'automatic'})."
+            )
             self._update_actions()
             return result
         except Exception as error:
-            self.panel.clear_fit(f"Fit failed: {error}")
+            self.global_fit_result = None
+            self.single_fit_result = None
+            settings = self._settings_text()
+            prefix = f"{settings}\n" if settings else ""
+            self.panel.clear_fit(f"{prefix}Fit failed: {error}")
             self.panel.set_status(f"Global fit failed: {error}")
             self._update_actions()
             QMessageBox.warning(self, "ODMR Fit Error", str(error))
             return None
+
+    def _fit_global_single(self, manual):
+        """Single Lorentzian on the global mean, via the ODMR window's fitter."""
+        finite = np.isfinite(self.global_spectrum)
+        frequency_ghz = self.statistics_result.frequency_values[finite] / 1.0e9
+        spectrum = self.global_spectrum[finite]
+        initial_guess = manual_initial_guess(SINGLE_LORENTZIAN, manual)
+        fit = fit_single_lorentzian(
+            frequency_ghz,
+            spectrum,
+            **({} if initial_guess is None else {"initial_guess": initial_guess}),
+        )
+        if not np.all(np.isfinite(np.asarray(fit["params"], dtype=float))):
+            raise RuntimeError("Single Lorentzian fit returned non-finite parameters.")
+        self.single_fit_result = fit
+        self.panel.set_single_fit_result(frequency_ghz, fit, self._settings_text())
+        self.panel.set_status(
+            f"Global {SINGLE_LORENTZIAN} fit completed "
+            f"(initial parameters: {'supplied' if manual else 'automatic'}). "
+            "Pixel fitting and Bz need a Double Lorentzian global fit."
+        )
+        self._update_actions()
+        return fit
 
     def fit_pixels(self):
         """Start per-pixel fitting on a dedicated worker thread."""
@@ -200,7 +335,7 @@ class ODMRAnalysisWindow(QMainWindow):
     def _pixel_fit_finished(self, result):
         self.pixel_fit_result = result
         self.state = ODMRAnalysisState.PIXEL_FIT_AVAILABLE
-        self.panel.set_pixel_fit_summary(result)
+        self.panel.set_pixel_fit_summary(result, self._pixel_seed_text())
         if result.successful_fit_count == 0:
             self.panel.set_selected_map("fit_status")
             self.panel.set_status(
@@ -216,6 +351,18 @@ class ODMRAnalysisWindow(QMainWindow):
         self.panel.set_map_enabled(True)
         self.show_selected_map(self.panel.map_combo.currentText())
         self._update_selected_pixel_display()
+
+    def _pixel_seed_text(self):
+        """Record how pixel fits were seeded (always the global Double fit)."""
+        settings = self.global_fit_settings
+        if settings is None:
+            return "Seeded from the global fit."
+        return (
+            f"Seeded from the global {settings['fit_type']} fit "
+            "(centres and linewidths; baseline and amplitudes per pixel). "
+            "Global fit initial parameters: "
+            f"{describe_initial_parameters(settings['initial_parameters'])}."
+        )
 
     def _pixel_fit_failed(self, error_message):
         self.pixel_fit_result = None
@@ -407,6 +554,8 @@ class ODMRAnalysisWindow(QMainWindow):
         self.statistics_result = None
         self.global_spectrum = None
         self.global_fit_result = None
+        self.single_fit_result = None
+        self.global_fit_settings = None
         self._invalidate_pixel_and_magnetic_results()
         self.state = ODMRAnalysisState.EMPTY
         self.panel.clear_dataset()
@@ -466,3 +615,13 @@ class ODMRAnalysisWindow(QMainWindow):
             return
         super().closeEvent(event)
 
+
+def _ghz_guess_to_hz(guess):
+    """Convert a double-Lorentzian GHz/% guess list to Hz, keeping ``None``.
+
+    Indices 2/5 are centres and 3/6 FWHMs (GHz); amplitudes are unchanged.
+    """
+    return [
+        None if value is None else (value * 1.0e9 if index in (2, 3, 5, 6) else value)
+        for index, value in enumerate(guess)
+    ]

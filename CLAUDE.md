@@ -117,11 +117,11 @@ Both selectors offer the same list: `gui/display_settings.py::COLORMAP_NAMES` (G
 
 **Live ODMR window fits** use `fit_single_lorentzian()` / `fit_double_lorentzian()` in `analysis/odmr_fit.py`, in GHz and percent. Both take an optional `initial_guess`: a parameter list in fit order where a `None` entry means "use the automatic guess".
 
-- "Supply Initial Fit Parameters" (`InitialFitParametersDialog`) collects values for the currently selected fit type:
+- "Supply Initial Fit Parameters" (`InitialFitParametersDialog`, in `gui/widgets/initial_fit_parameters_dialog.py`, shared with the analysis window; `gui/panels/odmr_panel.py` re-exports it) collects values for the currently selected fit type:
   - resonance location(s) in GHz — required;
   - contrast (%) and FWHM (MHz) — optional; blank means automatic.
 - The baseline is always automatic.
-- `ODMRWindow.fit_esr()` converts FWHM MHz→GHz and rejects resonance locations outside the measured range.
+- `ODMRWindow.fit_esr()` converts FWHM MHz→GHz (`manual_initial_guess()`) and rejects resonance locations outside the measured range (`check_manual_locations_in_range()`). Both helpers live in the shared dialog module and are also used by the analysis window.
 - Guesses are kept per fit type in `ODMRWindow.initial_fit_guesses` for that window's lifetime only; they are not persisted.
 
 **Two-Lorentzian spectrum fit (Hz units throughout).** These are used by the offline analysis, not the live window's "Fit Lorentzian" button.
@@ -141,8 +141,10 @@ Both selectors offer the same list: `gui/display_settings.py::COLORMAP_NAMES` (G
 
 **Workflow.** Each step is enabled by the window's `ODMRAnalysisState`.
 1. **Open ODMR HDF5.** Runs `load_odmr_statistics()` + `calculate_odmr_statistics()`.
-2. **Fit Global Spectrum.** Runs `fit_global_odmr_spectrum()` on `final_mean`.
-3. **Fit Pixels.** Runs `analysis/odmr_pixel_fit.py::fit_odmr_pixels()`, which uses the successful global fit as the template.
+2. **Fit Global Spectrum.** Uses the "Fit type:" selector. It has the ODMR window's labels and order (Single, Double) and **defaults to Double**, which was the window's only fit before. See "Global fit options" below.
+3. **Fit Pixels.** Runs `analysis/odmr_pixel_fit.py::fit_odmr_pixels()`. It needs a successful **Double** global fit (`global_fit_result`), which seeds every pixel (`_local_initial_guess()`):
+   - centres and linewidths come from the global fit;
+   - baseline (90th percentile) and amplitudes are estimated per pixel.
    - It runs on a `QThread` (`gui/odmr_analysis_worker.py::ODMRPixelFitWorker`).
    - Each pixel needs at least 8 finite samples.
    - Per-pixel outcomes go into a `PixelFitStatus` map, and one pixel's failure never aborts the rest.
@@ -151,6 +153,21 @@ Both selectors offer the same list: `gui/display_settings.py::COLORMAP_NAMES` (G
 **Display.**
 - Maps: f₋, f₊, splitting, RMSE, fit status, and Bz magnitude. Clicking a pixel shows its spectrum and fit.
 - The colormap list is the window's own (Viridis…Cividis) and is not persisted; see "Display settings".
+
+**Global fit options.**
+- **Double Lorentzian** runs `fit_global_odmr_spectrum()` (bounded, ordered, Hz). Its result is `global_fit_result` and seeds pixel fitting.
+- **Single Lorentzian** runs the ODMR window's `fit_single_lorentzian()` on the finite points of the global mean, in GHz. Its result is `single_fit_result`; `global_fit_result` stays None.
+  - So Fit Pixels and Reconstruct Bz stay disabled after a Single fit, and the status line says so.
+  - The state stays `LOADED`.
+- **"Supply Initial Fit Parameters"** (next to "Fit Global Spectrum") opens the same `InitialFitParametersDialog` as the ODMR window, with the same fields, units and validation.
+  - The analysis window passes `allow_clear=True`, which adds a "Clear / use automatic guesses" button. It accepts without validating, and the window then stores None for that fit type. The ODMR window doesn't pass it, so its dialog has no such button.
+  - Values are kept per fit type in `ODMRAnalysisWindow.initial_fit_guesses` for the window's lifetime. Loading another file does not clear them, and the dialog is pre-filled with them.
+  - The label under the buttons shows what the selected type will use. If only the other type has values, it says they are not used with this type.
+  - Locations outside the measured range are rejected before fitting, as in the ODMR window.
+- **How supplied Double values reach the fitter.** Blank values and the baseline are filled from the automatic guess by `analysis/odmr_fit.py::two_lorentzian_guess_with_overrides()`. Units are converted (GHz/MHz → Hz), and the two dips are ordered by centre, so they may be entered in either order.
+- **Why this exists.** The automatic double guess (`_default_two_lorentzian_guess()`) picks the deepest sample, then the lowest sample at least `max(2, N // 20)` *indices* away. With "dense points near dips" sampling, that is a few MHz, on the same dip. The fit then converges with both Lorentzians on the deeper dip and reports `success`, missing the second dip. Supplied locations avoid this. The automatic guess itself is unchanged.
+- **Failures are always reported** in the status line and a message box: an unsuccessful result, an exception, or an out-of-range location.
+- **Record of what was used.** `global_fit_settings` (`fit_type`, `initial_parameters`) is shown at the top of the "Global Fit" box, including on failure. The pixel-fit summary states the seeding and the global fit's initial parameters. The window has no file export.
 
 **Closing and reloading during a pixel fit.** Closing is deferred until the fit's thread finishes. Loading another file is refused while it runs.
 
@@ -328,7 +345,7 @@ These are characterized properties of the current rig/sample, not code facts —
 
 ## Testing safety — read before running pytest with `--hardware`
 
-`tests/` contains 95 test files (excluding `__init__.py`/`conftest.py`). Only 38 are real, hardware-free pytest tests — see `tests/conftest.py::ALLOWED_FILES` for the current, authoritative list rather than a copy here that will drift the next time a file is added to it (as just happened for this change). **The other ~57 are ad-hoc scripts that command real lab hardware — the Andor camera, the SG386 microwave source over VISA, the Swabian pulse streamer, the Helmholtz power supplies — unconditionally at module import time, not just inside a test function.** Several have no `if __name__ == "__main__":` guard at all: importing them fires a relay, streams a pulse, or turns on a power-supply output as a side effect of Python loading the file.
+`tests/` contains 96 test files (excluding `__init__.py`/`conftest.py`). Only 39 are real, hardware-free pytest tests — see `tests/conftest.py::ALLOWED_FILES` for the current, authoritative list rather than a copy here that will drift the next time a file is added to it (as just happened for this change). **The other ~57 are ad-hoc scripts that command real lab hardware — the Andor camera, the SG386 microwave source over VISA, the Swabian pulse streamer, the Helmholtz power supplies — unconditionally at module import time, not just inside a test function.** Several have no `if __name__ == "__main__":` guard at all: importing them fires a relay, streams a pulse, or turns on a power-supply output as a side effect of Python loading the file.
 
 `pytest.ini` (`testpaths = tests`) plus `tests/conftest.py`'s `pytest_ignore_collect` hook gate this: a bare `pytest` run only collects the files named in `ALLOWED_FILES`. The gate is an allowlist, not a denylist — anything not explicitly named there is excluded from collection entirely, so it is never imported. Passing `--hardware` lifts the restriction and collects everything, including every hardware-commanding script.
 

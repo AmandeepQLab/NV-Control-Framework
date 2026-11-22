@@ -10,74 +10,9 @@ import pyqtgraph as pg
 import numpy as np
 from PyQt6.QtGui import QFontDatabase
 
-
-class InitialFitParametersDialog(QDialog):
-    """Collect optional manual initial values for the preliminary ODMR fit."""
-
-    def __init__(self, fit_type, initial_values=None, parent=None):
-        super().__init__(parent)
-        self.fit_type = fit_type
-        self.setWindowTitle("Supply Initial Fit Parameters")
-        form = QFormLayout(self)
-        self.fields = {}
-        self.labels = {}
-        if fit_type == "Single Lorentzian":
-            specs = [("f0", "Resonance location (GHz):", True),
-                     ("contrast", "Contrast (%):", False),
-                     ("fwhm", "FWHM (MHz):", False)]
-        else:
-            specs = [("f01", "Resonance location 1 (GHz):", True),
-                     ("f02", "Resonance location 2 (GHz):", True),
-                     ("contrast1", "Contrast 1 (%):", False),
-                     ("fwhm1", "FWHM 1 (MHz):", False),
-                     ("contrast2", "Contrast 2 (%):", False),
-                     ("fwhm2", "FWHM 2 (MHz):", False)]
-        initial_values = initial_values or {}
-        for key, label, required in specs:
-            field = QLineEdit(self)
-            field.setPlaceholderText("Required" if required else "Automatic if blank")
-            if initial_values.get(key) is not None:
-                field.setText(str(initial_values[key]))
-            self.fields[key] = field
-            label_widget = QLabel(label, self)
-            self.labels[key] = label_widget
-            form.addRow(label_widget, field)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
-                                   QDialogButtonBox.StandardButton.Cancel, self)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        form.addRow(buttons)
-
-    def parsed_values(self):
-        required = {"f0"} if self.fit_type == "Single Lorentzian" else {"f01", "f02"}
-        values = {}
-        for key, field in self.fields.items():
-            raw = field.text().strip()
-            if not raw:
-                if key in required:
-                    raise ValueError(f"{self.labels[key].text().rstrip(':')} is required.")
-                values[key] = None
-                continue
-            try:
-                value = float(raw)
-            except ValueError:
-                raise ValueError(f"{key} must be a finite numeric value.") from None
-            if not np.isfinite(value):
-                raise ValueError(f"{key} must be a finite numeric value.")
-            if key not in required and value <= 0:
-                raise ValueError(f"{key} must be positive.")
-            values[key] = value
-        if self.fit_type == "Double Lorentzian" and values["f01"] == values["f02"]:
-            raise ValueError("The two resonance locations must be different.")
-        return values
-
-    def accept(self):
-        try:
-            self.parsed_values()
-        except ValueError as error:
-            QMessageBox.warning(self, "Invalid Initial Fit Parameters", str(error))
-            return
-        super().accept()
+# Moved to a shared module (also used by the ODMR analysis window);
+# re-exported here so existing imports keep working.
+from gui.widgets.initial_fit_parameters_dialog import InitialFitParametersDialog  # noqa: F401
 
 
 class ODMRStatisticsExplanationDialog(QDialog):
