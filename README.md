@@ -53,13 +53,12 @@ Activate it (Windows: `.venv\Scripts\activate`; Git Bash: `source .venv/Scripts/
 pip install -r requirements.txt
 ```
 
-`requirements.txt` covers the pure-Python and PyPI dependencies (PyQt6, pyqtgraph, numpy, scipy, PyVISA, pytest, etc.). Three additional packages are required to run against real hardware and are **not** in `requirements.txt`:
+`requirements.txt` pins every package the application and the allowlisted tests import, at the versions tested (Python 3.14.5). That includes `pyserial`, `andor3` (the Andor SDK3 Python wrapper) and `pulsestreamer` (Swabian's Pulse Streamer client), which are all on PyPI. `andor3` and `pulsestreamer` are needed even in `--sim` mode, because the hardware drivers that import them are imported at startup.
 
-- `pyserial` (imported as `serial`) — used by the Helmholtz power-supply drivers. Installable from PyPI (`pip install pyserial`).
-- `andor3` — the Andor SDK3 Python wrapper used by the camera driver. Vendor-provided, not on PyPI.
-- `pulsestreamer` — Swabian Instruments' official SDK for the Pulse Streamer. Vendor-provided, not on PyPI.
+Installed separately, and needed only for real hardware:
 
-None of the three are needed to run in `--sim` mode.
+- the Andor SDK3 runtime (`atcore.dll`), which `andor3` loads when connecting to the camera;
+- a VISA backend for PyVISA (the rig uses NI-VISA), for the SG386.
 
 ## Running
 
