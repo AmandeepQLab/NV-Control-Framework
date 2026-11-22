@@ -2,10 +2,10 @@
 
 Covers MagnetControlWindow's lock/override/post-experiment behaviour,
 MainWindow's experiment bookkeeping, and ZeroFieldWorker.field_updated.
-No pyqtgraph windows are constructed here: test_zero_field_window_save_toggle.py
-documents that constructing more than two ZeroFieldWindows per process
-segfaults at shutdown in this environment, so the window-level run_started/
-run_finished checks live in that file, on its shared instance.
+No pyqtgraph windows are constructed here. That was originally because
+more than two ZeroFieldWindows per process segfaulted at shutdown; since the
+2026-11-22 teardown fix (gui/pyqtgraph_teardown.py) that limit no longer
+reproduces, but these tests were not changed.
 """
 
 import sys

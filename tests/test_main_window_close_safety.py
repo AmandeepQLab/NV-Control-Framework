@@ -181,8 +181,8 @@ class MainWindowCloseSafetyTests(unittest.TestCase):
 
 class ExperimentWindowCloseEventTests(unittest.TestCase):
     """closeEvent() on the real classes, with lightweight stand-ins for
-    the window (constructing extra ZeroFieldWindows segfaults at shutdown
-    in this environment -- see test_zero_field_window_save_toggle.py)."""
+    the window (originally because extra ZeroFieldWindows segfaulted at
+    shutdown; see test_zero_field_window_save_toggle.py, point 2)."""
 
     def _close(self, window_class, running_attr, running):
         window = SimpleNamespace(**{running_attr: running}, request_stop=Mock())

@@ -27,8 +27,9 @@ from framework.image_cube import ImageCube  # noqa: E402
 from gui.widgets.zero_field_widget import ZeroFieldWidget  # noqa: E402
 from gui.zero_field_worker import ZeroFieldWorker  # noqa: E402
 
-# Widgets are created once and never deleted mid-process (pyqtgraph
-# teardown is fragile here; see tests/test_colormap_selectors.py).
+# Widgets are created once and never deleted mid-process. This predates
+# the 2026-11-22 pyqtgraph teardown fix (gui/pyqtgraph_teardown.py) and was
+# kept; it has not been re-tested without it.
 _KEEP_ALIVE = []
 
 FIELD_START, FIELD_STOP = -1.0, 1.0

@@ -257,7 +257,9 @@ class ZeroFieldWidget(QWidget):
         image_group = QGroupBox("Zero Field Image")
         main_layout.addWidget(image_group, 4)
         image_layout = QVBoxLayout(image_group)
-        self.image_view = pg.ImageView()
+        # Own name, not pyqtgraph's shared default "ImageView" (see
+        # gui/pyqtgraph_teardown.py).
+        self.image_view = pg.ImageView(name="ZeroFieldImage")
         image_layout.addWidget(self.image_view)
         self.pixel_inspector_label = QLabel("Pixel: --")
         image_layout.addWidget(self.pixel_inspector_label)

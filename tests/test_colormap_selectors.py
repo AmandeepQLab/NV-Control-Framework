@@ -6,9 +6,9 @@ already on screen -- no scan or stream is running in any test here -- and
 both persist to the "display" section of setupInfo.json.
 
 Colours are checked on the rendered QImage, not just the selected LUT, so
-"the displayed image changed" is what is actually asserted. Only one
-ZeroFieldWindow is built in this file (see the module docstring of
-test_zero_field_window_save_toggle.py for why that matters).
+"the displayed image changed" is what is actually asserted. Every test
+builds and destroys its own window (see gui/pyqtgraph_teardown.py for the
+teardown fix that made that safe).
 """
 
 import json
@@ -19,6 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+from PyQt6.QtCore import QCoreApplication, QEvent
 from PyQt6.QtWidgets import QApplication, QComboBox, QMainWindow
 
 _APP = QApplication.instance() or QApplication(sys.argv)
@@ -83,12 +84,11 @@ def _assert_rgb_close(test, actual, expected, tolerance=6):
         test.assertLessEqual(abs(a - e), tolerance, f"{actual} != {expected}")
 
 
-# GUI objects built here are kept alive for the whole process rather than
-# deleteLater()'d: destroying a ZeroFieldWindow alongside another pyqtgraph
-# ImageView mid-suite reproducibly segfaulted a later test during garbage
-# collection (the same fragility test_zero_field_window_save_toggle.py
-# documents). Nothing is shown, so keeping them is harmless.
-_KEEP_ALIVE = []
+def _dispose(widget):
+    """Close and really destroy a widget now (deferred delete processed)."""
+    widget.close()
+    widget.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
 def _make_live_view(cfg):
@@ -100,7 +100,6 @@ def _make_live_view(cfg):
     main.colormap_combo.addItems(COLORMAP_NAMES)
     main.image_view = pg.ImageView()
     main._init_live_view_colormap()
-    _KEEP_ALIVE.append(main)
     return main
 
 
@@ -116,6 +115,7 @@ class LiveViewColormapTests(unittest.TestCase):
     def test_changing_selector_recolours_displayed_frame_without_stream(self):
         cfg, path = _make_cfg(self._tmp.name)
         main = _make_live_view(cfg)
+        self.addCleanup(_dispose, main)
         self._show_frame(main)
         image_item = main.image_view.getImageItem()
 
@@ -135,6 +135,7 @@ class LiveViewColormapTests(unittest.TestCase):
     def test_saved_colormap_is_applied_on_startup(self):
         cfg, _ = _make_cfg(self._tmp.name, display={LIVE_VIEW_COLORMAP_KEY: "magma"})
         main = _make_live_view(cfg)
+        self.addCleanup(_dispose, main)
         self.assertEqual(main.colormap_combo.currentText(), "Magma")
         self._show_frame(main)
         _assert_rgb_close(
@@ -143,23 +144,19 @@ class LiveViewColormapTests(unittest.TestCase):
 
 
 class ZeroFieldColormapTests(unittest.TestCase):
-    """One ZeroFieldWindow for the whole file (see _KEEP_ALIVE)."""
+    """A fresh ZeroFieldWindow and config file per test."""
 
-    @classmethod
-    def setUpClass(cls):
-        cls._tmp = tempfile.TemporaryDirectory()
-        cls.cfg, cls.path = _make_cfg(cls._tmp.name, display={ZFE_COLORMAP_KEY: "plasma"})
-        cls.window = ZeroFieldWindow(
-            hardware_manager=SimpleNamespace(cfg=cls.cfg),
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.cfg, self.path = _make_cfg(self._tmp.name, display={ZFE_COLORMAP_KEY: "plasma"})
+        self.window = ZeroFieldWindow(
+            hardware_manager=SimpleNamespace(cfg=self.cfg),
             hardware={"magnet": None},
             camera=None,
             acquisition_state_getter=lambda: None,
         )
-        _KEEP_ALIVE.append(cls.window)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls._tmp.cleanup()
+        self.addCleanup(_dispose, self.window)
 
     def test_shared_list_matches_zero_field_reference(self):
         combo = self.window.widget.colormap_combo

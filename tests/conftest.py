@@ -101,6 +101,23 @@ def pytest_ignore_collect(collection_path: pathlib.Path, config):
     return name not in ALLOWED_FILES
 
 
+def pytest_sessionfinish(session, exitstatus):
+    """Empty pyqtgraph's view registry before Qt tears the widgets down.
+
+    Widgets kept alive by the GUI tests are destroyed at interpreter exit,
+    after this hook. Without this, a named ViewBox's destroyed signal can
+    rebuild menus whose QComboBoxes are already deleted and print a
+    RuntimeError after the summary (see gui/pyqtgraph_teardown.py). Only
+    done if a test imported pyqtgraph, so non-GUI runs never import Qt.
+    """
+    import sys
+
+    if "pyqtgraph" in sys.modules:
+        from gui.pyqtgraph_teardown import clear_view_registry
+
+        clear_view_registry()
+
+
 def pytest_report_header(config, start_path):
     if not _restricted(config):
         return None

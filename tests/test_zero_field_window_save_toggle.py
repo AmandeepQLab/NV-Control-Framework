@@ -24,18 +24,17 @@ touches this file next:
    This ordering is a standard requirement for PyQt widgets that query
    display/GL state at import time, not a workaround for a bug in this
    repo's code.
-2. Process-lifetime instability: constructing and closing more than two
-   ZeroFieldWindow instances in one process reliably segfaults at
-   interpreter shutdown in this sandbox (Python 3.14 / PyQt6 / pyqtgraph),
-   even though every individual test's assertions pass before the crash --
-   confirmed by bisection (2 windows: clean exit; 3: segfault). All tests
-   below therefore share ONE ZeroFieldWindow instance for the whole file
-   (setUpClass/tearDownClass), reset to a clean baseline before each test,
-   rather than one window per test. This is reported as a real,
-   environment-specific fragility per instruction, not silently patched
-   around by e.g. retries -- if more GUI tests are added here later and
-   the shared-instance pattern stops being enough, that should surface as
-   a segfault during a full-suite run and should be reported the same way.
+2. Process-lifetime instability (resolved 2026-11-22): constructing and
+   closing more than two ZeroFieldWindow instances in one process used to
+   segfault at interpreter shutdown here (Python 3.14 / PyQt6 / pyqtgraph),
+   so every test shared ONE window. The related, reproducible symptom was
+   pyqtgraph's "wrapped C/C++ object of type QComboBox has been deleted"
+   at Qt teardown, from its process-wide ViewBox registry
+   (gui/pyqtgraph_teardown.py). Since tests/conftest.py empties that
+   registry at session end and each ImageView has its own name, every
+   test builds and destroys its own window (11 per run), clean in 5
+   consecutive full-suite runs. If a teardown crash reappears, report it
+   rather than working around it.
 """
 
 import sys
@@ -45,12 +44,20 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+from PyQt6.QtCore import QCoreApplication, QEvent
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 _APP = QApplication.instance() or QApplication(sys.argv)
 
 from framework.image_cube import ImageCube
 from gui.zero_field_window import ZeroFieldWindow
+
+
+def _dispose(widget):
+    """Close and really destroy a widget now (deferred delete processed)."""
+    widget.close()
+    widget.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
 class FakeAxis:
@@ -90,34 +97,20 @@ class _AcquisitionState:
 
 
 class ZeroFieldWindowSaveToggleTests(unittest.TestCase):
-    """Shares a single ZeroFieldWindow across every test in this class --
-    see the module docstring's point 2 for why."""
+    """A fresh ZeroFieldWindow per test, destroyed afterwards."""
 
-    @classmethod
-    def setUpClass(cls):
-        cls.window = ZeroFieldWindow(
+    def setUp(self):
+        self.window = ZeroFieldWindow(
             hardware_manager=None,
             hardware={"magnet": FakeMagnet()},
             camera=None,
             acquisition_state_getter=lambda: _AcquisitionState(),
         )
-        cls._default_output_directory = cls.window.output_directory
+        self.addCleanup(self._close_window)
 
-    @classmethod
-    def tearDownClass(cls):
-        cls.window.zero_field_running = False
-        cls.window.close()
-
-    def setUp(self):
-        window = self.window
-        window.output_path = None
-        window.image_cube = None
-        window.zero_field_running = False
-        window.thread = None
-        window._scan_timestamp = None
-        window._save_off_warning_shown = False
-        window.output_directory = self._default_output_directory
-        window.widget.save_data_check.setChecked(True)
+    def _close_window(self):
+        self.window.zero_field_running = False
+        _dispose(self.window)
 
     def test_unchecking_save_data_shows_warning_once(self):
         window = self.window

@@ -30,8 +30,9 @@ from gui.zero_field_window import ZeroFieldWindow  # noqa: E402
 from gui.zero_field_worker import ZeroFieldWorker, mean_ratio  # noqa: E402
 from tests.test_zero_field_timing import make_camera, make_magnet  # noqa: E402
 
-# Widgets are created once and never deleted mid-process (pyqtgraph
-# teardown is fragile here; see tests/test_colormap_selectors.py).
+# Widgets are created once and never deleted mid-process. This predates
+# the 2026-11-22 pyqtgraph teardown fix (gui/pyqtgraph_teardown.py) and was
+# kept; it has not been re-tested without it.
 _KEEP_ALIVE = []
 
 FIELD_START, FIELD_STOP = -1.0, 1.0
@@ -287,9 +288,9 @@ class RelayFlipTests(unittest.TestCase):
 
 
 class PreflightTests(unittest.TestCase):
-    """_preflight_field_range() called on a stand-in for the window: a
-    third ZeroFieldWindow per process is unsafe here (see
-    tests/test_zero_field_window_save_toggle.py)."""
+    """_preflight_field_range() called on a stand-in for the window
+    (originally because a third ZeroFieldWindow per process was unsafe;
+    see tests/test_zero_field_window_save_toggle.py, point 2)."""
 
     def _preflight(self, config):
         from tests.test_magnetic_field_gui_units import _make_magnet

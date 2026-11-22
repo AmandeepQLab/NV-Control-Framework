@@ -19,6 +19,7 @@ from hardware.hardware_manager import HardwareManager
 from gui.odmr_window import ODMRWindow
 from gui.odmr_analysis_window import ODMRAnalysisWindow
 from gui.zero_field_window import ZeroFieldWindow
+from gui.pyqtgraph_teardown import clear_view_registry
 from framework.camera_ownership import (
     apply_live_acquisition_state,
     register_camera_state_restorer,
@@ -428,7 +429,9 @@ class MainWindow(QMainWindow):
         self.image_plot.showAxis("bottom", True)
         self.image_plot.showAxis("left", True)
         self._pixel_axes_binning = None
-        self.image_view = pg.ImageView(view=self.image_plot)
+        # Own name, not pyqtgraph's shared default "ImageView" (see
+        # gui/pyqtgraph_teardown.py).
+        self.image_view = pg.ImageView(view=self.image_plot, name="LiveView")
         right_panel.addWidget(self.image_view, 3)
         self._init_live_view_colormap()
 
@@ -1163,6 +1166,11 @@ class MainWindow(QMainWindow):
             self.hw_manager.shutdown()
         except Exception:
             pass
+
+        # Worker threads have stopped (or the close was forced) and the
+        # experiment windows are closed: no display will update again, so
+        # empty pyqtgraph's view registry before Qt destroys the widgets.
+        clear_view_registry()
 
 
 def main():
