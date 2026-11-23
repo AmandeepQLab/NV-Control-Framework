@@ -327,6 +327,28 @@ class ZeroFieldWidget(QWidget):
             "save_data": self.save_data_check.isChecked(),
         }
 
+    def set_config(self, config):
+        """Put a get_config()-shaped dict back into the controls.
+
+        The enabling checkboxes are set before the controls they enable, so
+        get_config() afterwards returns the same values (a False
+        alternate/reference flag leaves its box unchecked).
+        """
+        self.field_start_spin.setValue(config["field_start"])
+        self.field_stop_spin.setValue(config["field_stop"])
+        self.field_points_spin.setValue(config["field_points"])
+        self.field_axis_combo.setCurrentText(config["field_axis"])
+        self.settling_time_spin.setValue(config["settling_time_ms"])
+        self.post_flip_settling_spin.setValue(config["post_flip_settling_ms"])
+        self.averages_spin.setValue(config["averages"])
+        self.save_data_check.setChecked(config["save_data"])
+        self.averaging_enabled_check.setChecked(config["averaging_enabled"])
+        self.num_scans_spin.setValue(config["num_scans"])
+        self.save_raw_scans_check.setChecked(config["save_raw_scans"])
+        self.alternate_direction_check.setChecked(config["alternate_direction"])
+        self.reference_enabled_check.setChecked(config["reference_enabled"])
+        self.reference_field_spin.setValue(config["reference_field_gauss"])
+
     # Live-curve labels: raw counts, or signal/reference with the
     # reference on (see set_signal_mode()).
     _COUNTS_LABEL = "Mean Fluorescence (counts/pixel)"

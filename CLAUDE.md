@@ -52,7 +52,8 @@ Concretely: `gui/odmr_window.py` → `gui/odmr_worker.py` (`QThread`) → `exper
 - **`closeEvent()`.** With no live worker it asks the existing "Exit NV Control" confirmation and shuts down as before (`_shutdown_hardware()`). With one or more live workers it asks "Scan in progress" — "Stop and Close" (default) / "Cancel". Cancel ignores the close; the scan continues. "Stop and Close" ignores this close, calls `request_stop()` on every running window, shows "Stopping scan — please wait…" in the status bar, and connects each worker's `QThread.finished` to `_on_worker_finished_for_close()`, which calls `close()` again once the registry is empty; that second close skips the Exit confirmation (already confirmed) and shuts down. Nothing blocks the GUI thread.
 - **10-second timeout** (`_CLOSE_WAIT_TIMEOUT_MS`). If workers haven't all exited by then, `_on_close_timeout()` logs a warning and forces the close (`_force_close`) — hardware shutdown then **can** race a still-running worker, which is the accepted cost of not hanging forever. A worker finishing after shutdown does not trigger a second shutdown (`_shut_down`).
 - **pyqtgraph registry cleared last.** `_shutdown_hardware()` ends with `gui/pyqtgraph_teardown.py::clear_view_registry()`, after experiment windows are closed and hardware is shut down. It empties pyqtgraph's process-wide `ViewBox.AllViews`/`NamedViews`. Otherwise a named ViewBox destroyed at Qt teardown makes pyqtgraph rebuild other views' context-menu combo boxes, which may already be deleted, and it prints `RuntimeError: wrapped C/C++ object of type QComboBox has been deleted`. Each `ImageView` has its own name (`"LiveView"`, `"ZeroFieldImage"`), not pyqtgraph's shared default `"ImageView"`. Measured: the test suite reproduced the error without the clear; app exit in `--sim` (Zero Field window open) was clean with and without it.
-- **`ZeroFieldWindow.closeEvent()` / `ODMRWindow.closeEvent()`.** While a scan runs: request stop and ignore the close (the window stays open until the scan finishes). Idle: accept, with no dialog — ODMR's former "Are you sure?" question on an idle window was removed, since `_shutdown_hardware()` closes these windows and a modal there would stall shutdown.
+- **Zero Field run queue between runs.** No worker thread exists during a queue's pause, so `closeEvent()` also treats any window in `_running_experiments` whose `queue_active()` is True as busy (`_active_queue_windows()`) and shows the same "Scan in progress" dialog. "Stop and Close" calls `request_stop()` on such a window right away, which ends its queue synchronously; a queue with a run in progress is stopped through the normal worker path. Windows without `queue_active()` (ODMR) are unaffected. See "Zero Field run queue".
+- **`ZeroFieldWindow.closeEvent()` / `ODMRWindow.closeEvent()`.** While a scan runs: request stop and ignore the close (the window stays open until the scan finishes). A Zero Field queue between runs is ended, then the close is accepted. Idle: accept, with no dialog — ODMR's former "Are you sure?" question on an idle window was removed, since `_shutdown_hardware()` closes these windows and a modal there would stall shutdown.
 
 Magnet startup coordinates the shared Pulse Streamer output bank: every axis with unknown relay state is first zeroed and disabled before any relay synchronization. `Magnet.enable()` is required before initial nonzero coil commands. Ordinary later reversals remain local to one axis. Uncommanded or failed field state displays Unknown; transport failures invalidate the affected command cache, shutdown attempts all axes, and failed enable attempts roll back to shutdown.
 
@@ -197,7 +198,7 @@ See `docs/zero_field_audit_2026-07.md` for the full physics/logic audit with per
 
 Camera-contention and ROI-validation findings from the same audit are fixed — see "Architecture and call chain" above.
 
-**Field range is validated before a Zero Field scan starts.** `ZeroFieldWindow.start_scan()` calls `_preflight_field_range()` right after reading the widget config, before any state change, thread, or worker exists. It runs each axis's existing `MagnetAxis.plan_field()` (pure calculation, no I/O) for the vector at both sweep endpoints: the swept axis at `field_start`/`field_stop` × 0.1 mT/G, the other axes at 0.0 mT (the GUI always zeroes them). Endpoints suffice because required current on a branch is |target − intercept| / ratio, maximal at an endpoint of a linear sweep. With reference normalization on, the reference vector (swept axis at `reference_field_gauss`, others 0.0 mT) is checked the same way, and an unreachable reference is refused with the same dialog. A `ValueError` (out of range / non-finite) shows "Field range out of bounds" with the axis's approximate reachable range in Gauss, derived from `max_current` and both calibration branches, and aborts the start. `RuntimeError`s from `plan_field()` deliberately do **not** block: before the magnet's first `enable()` every relay is unsynchronized and `plan_field()` raises for any nonzero current, a state the scan's own `setup_scan()` resolves — blocking on it would refuse every first scan after launch. Previously an unreachable target raised mid-scan, after data had been acquired.
+**Field range is validated before a Zero Field scan starts.** `ZeroFieldWindow._start_run()` (called by `start_scan()` and by the run queue) calls `_preflight_field_range()` first, before any state change, thread, or worker exists; the check itself is `field_range_problem()`. It runs each axis's existing `MagnetAxis.plan_field()` (pure calculation, no I/O) for the vector at both sweep endpoints: the swept axis at `field_start`/`field_stop` × 0.1 mT/G, the other axes at 0.0 mT (the GUI always zeroes them). Endpoints suffice because required current on a branch is |target − intercept| / ratio, maximal at an endpoint of a linear sweep. With reference normalization on, the reference vector (swept axis at `reference_field_gauss`, others 0.0 mT) is checked the same way, and an unreachable reference is refused with the same dialog. A `ValueError` (out of range / non-finite) shows "Field range out of bounds" with the axis's approximate reachable range in Gauss, derived from `max_current` and both calibration branches, and aborts the start. `RuntimeError`s from `plan_field()` deliberately do **not** block: before the magnet's first `enable()` every relay is unsynchronized and `plan_field()` raises for any nonzero current, a state the scan's own `setup_scan()` resolves — blocking on it would refuse every first scan after launch. Previously an unreachable target raised mid-scan, after data had been acquired.
 
 **Relay flips get extra settling and are marked in the data.** A flip (`_switch_polarity()`: zero/off/discharge/switch/settle/on) is a far larger transient than an incremental step, and flips happen near field zero — X ~0.12 G, Z ~1.17 G, Y's gap ~0.063 G on this rig — exactly where ZFE resolves. `ZeroFieldExperiment(post_flip_settling_ms=...)` (constructor default 0.0; GUI "Post-flip extra settling (ms)", default 500, range 0–60000, passed via `ZeroFieldWorker`) sleeps that much **after** the normal `settling_time_ms` sleep, only at points whose field command flipped a relay; like the normal settling sleep it is not interruptible by stop. Flips from `setup_scan()`'s own `set_vector(0, 0, 0)` (e.g. X/Z moving to their negative branch; every later scan of a multi-scan run, whose previous sweep ended positive) are attributed to point 0, since they occur immediately before it with no settling in between. Per acquired point the experiment records `relay_flip_occurred` (bool) and `relay_flip_axes` (sorted comma-joined names: `"X"`, `"X,Z"`, `""`), truncated with `field_values_gauss` on an early stop. They are stored as **ImageCube metadata lists**, not separate HDF5 datasets — the same mechanism as `field_values_gauss`, so they reach the single-scan streamed file (writer `update_metadata()` + `merge_hdf5_metadata`), raw per-scan files, and the atomic-saved average without any writer or file-format change. They are written in `_run_single_sweep()`'s `finally`, so a hard process kill mid-scan leaves a streamed file without them. In the multi-scan average a point is flagged if a flip preceded it in any averaged scan, with the union of axes. `post_flip_settling_ms` is recorded in metadata.
 
@@ -312,6 +313,62 @@ All three are calibration-model values, **not measurements** (there is no field 
 - A stop is still checked only between points, so a point is always complete (both halves) or absent. A partial scan is never folded into an average.
 - No magnet or hardware file is involved.
 
+## Zero Field run queue
+
+**What it is.** Several Zero Field runs with different settings, executed one after another unattended. The "Run Queue" panel is a non-closable bottom dock in `ZeroFieldWindow`. The code is in three places:
+- `gui/zero_field_queue.py` — the GUI-free model: `QueueEntry`, `summarize()`, `validate_config()`, queue files, `QueueLog`;
+- `gui/widgets/zero_field_queue_widget.py` — display and buttons only;
+- the "RUN QUEUE" section of `gui/zero_field_window.py` — editing and execution.
+
+No experiment, worker, magnet or hardware file was changed for it.
+
+**Entries.**
+- "Add to queue" snapshots `ZeroFieldWidget.get_config()` (a deep copy) plus the window's `output_directory`, so later form edits never change an entry.
+- The add runs the same `_preflight_field_range()` as the Run button, with its dialog, and an unreachable entry is not added.
+- Other buttons: Remove (not the running entry), Move up/down, Duplicate, "Clear pending" (pending entries only), and "Load entry into form" (`ZeroFieldWidget.set_config()` plus the output directory).
+- Statuses: pending / running / done / stopped / failed.
+- There is **no duration estimate**. The config does not determine it: exposure lives in the main window, and relay-flip count and SCPI pacing depend on the sweep path.
+
+**Queue files.**
+- "Save queue…" writes JSON: `format: "nv_control.zero_field_queue"`, `version: 1`, `pause_between_runs_s`, `on_failure`, and each entry's `config` + `output_directory`. Run status is not saved.
+- "Load queue…" replaces the list with all-pending entries. It is refused as a whole (nothing partially loaded) if the file is invalid, if any entry is missing a `get_config()` key or has the wrong type (`CONFIG_TYPES`), or if any entry fails the field-range check.
+
+**Execution: one start path.**
+- `start_scan()` is now `_start_run(widget.get_config(), self.output_directory)`, and the queue calls the same `_start_run(entry.config, entry.output_directory, interactive=False)`. The validation, worker, file naming, metadata, signals and cleanup are therefore identical.
+- `interactive=False` changes only one thing: a refusal (field range, unusable directory) is returned as a reason string instead of shown as a modal dialog.
+- The field-range check itself is the module function `field_range_problem()`, which `_preflight_field_range()` wraps with its dialog.
+- The range is checked when an entry is added and again immediately before it starts.
+- Pending entries run in list order; the next one is picked at start time, so reordering pending entries mid-queue changes what runs next.
+- The next entry starts after the previous worker's `QThread.finished` (`_queue_run_thread_finished()`), plus "Pause between runs (s)" (default 0) on a single-shot `QTimer`.
+- File names keep their one-second timestamp. If the next start would reuse the previous run's second, it waits for the next second, so names never collide.
+
+**Outcomes.**
+- **Failed:** the worker raised, or the start was refused.
+  - During a queue, `show_error()` records the message on the entry instead of opening a dialog, so a failure never blocks the queue.
+  - "On failure": "Stop queue" (default) ends the queue; "Skip to next" continues.
+- **Stopped is not a failure.** "Stop current run" stops the worker, marks the entry stopped ("stopped by user") and continues. "Stop queue" stops the run (message "queue stopped") and starts nothing more; remaining entries stay pending. Stopped during a pause, the queue ends at once.
+- `request_stop()` (MainWindow's close path) stops the whole queue while one is active.
+- The normal Run button and "Run queue" are disabled while a queue runs; "Run queue" is also disabled during a single run.
+
+**Magnet lock across the queue.**
+- `run_started` is emitted per run, so `MainWindow` registers every worker thread for close safety.
+- `run_finished` is emitted **once**, when the queue ends: `scan_finished()` calls `_queue_record_finished_run()`, and skips `run_finished` if the queue continues.
+- So `experiment_finished` never fires between queued runs, and the magnet stays locked through runs and pauses.
+- Each run's `run_started` re-emits `experiment_started`, which (as for any start) clears a manual-control override in `MagnetControlWindow`.
+- The post-experiment action runs once, at the queue's end. After Zero Field it is skipped anyway, because the magnet is already disabled.
+- A single run outside a queue emits `run_finished` exactly as before.
+
+**Queue log.**
+- File: `zero_field_queue_<timestamp>.csv`, created when the queue starts, in the first pending entry's output directory. It is UTF-8 with a BOM, so Excel shows "→".
+- Columns (`LOG_COLUMNS`): index (1-based list position when the entry started), status, start_time, end_time, duration_s, output_file, first_frame_mean_counts, summary, message.
+- One row per finished entry (done/stopped/failed, including a start refused by validation), appended and flushed as it finishes, so a crash keeps completed rows.
+- `first_frame_mean_counts` is `mean_fluorescence()` of the first live-update image: scan 1, point 1, the signal frame averaged over that point's repeats.
+- If the log can't be created, the queue still runs and the error is logged.
+
+**Status.** "Queue: run k of N" (N = entries started in this execution plus those still pending), "Queue: pausing …", and a finished summary. The running row is highlighted in bold.
+
+**Tests:** `tests/test_zero_field_queue.py`, which runs real queues on SimCamera and a real `Magnet` over simulated supplies.
+
 ## Known hardware quirks (ODMR timing)
 
 **`trigger_delay_s` below ~0.02s triggers a reproducible ~400ms per-frame stall, cause unknown.** Confirmed from `data/odmr_timing_*.csv` timing-diagnostics recordings: at `trigger_delay_s = 0.0`, roughly 1 frame in 9 (10.4-10.8% in two independent recorded runs) takes ~400-430ms instead of the normal ~90ms — a distinct second mode in the `repeat_total` distribution, not scattered jitter. At `trigger_delay_s >= 0.02s` the second mode disappears entirely (tightest recorded spread: ~130-133ms, no bimodality). This has not been root-caused — candidates include the Andor SDK3 buffer/trigger-arming not having settled from the previous frame, but this is speculation, not confirmed. **Do not push `trigger_delay_s` toward 0 to save time even though MW switch-gating contrast is indifferent to it** — the stall more than cancels any savings and makes scan duration unpredictable. `gui/odmr_window.py::estimate_odmr_time()` does not model this (see the comment at its `trigger_delay_s`-dependent term) — its estimate for `trigger_delay_s < 0.02s` will run 15-30% low for this reason, not because the formula itself is wrong.
@@ -346,7 +403,7 @@ These are characterized properties of the current rig/sample, not code facts —
 
 ## Testing safety — read before running pytest with `--hardware`
 
-`tests/` contains 96 test files (excluding `__init__.py`/`conftest.py`). Only 39 are real, hardware-free pytest tests — see `tests/conftest.py::ALLOWED_FILES` for the current, authoritative list rather than a copy here that will drift the next time a file is added to it (as just happened for this change). **The other ~57 are ad-hoc scripts that command real lab hardware — the Andor camera, the SG386 microwave source over VISA, the Swabian pulse streamer, the Helmholtz power supplies — unconditionally at module import time, not just inside a test function.** Several have no `if __name__ == "__main__":` guard at all: importing them fires a relay, streams a pulse, or turns on a power-supply output as a side effect of Python loading the file.
+`tests/` contains 97 test files (excluding `__init__.py`/`conftest.py`). Only 40 are real, hardware-free pytest tests — see `tests/conftest.py::ALLOWED_FILES` for the current, authoritative list rather than a copy here that will drift the next time a file is added to it (as just happened for this change). **The other ~57 are ad-hoc scripts that command real lab hardware — the Andor camera, the SG386 microwave source over VISA, the Swabian pulse streamer, the Helmholtz power supplies — unconditionally at module import time, not just inside a test function.** Several have no `if __name__ == "__main__":` guard at all: importing them fires a relay, streams a pulse, or turns on a power-supply output as a side effect of Python loading the file.
 
 `pytest.ini` (`testpaths = tests`) plus `tests/conftest.py`'s `pytest_ignore_collect` hook gate this: a bare `pytest` run only collects the files named in `ALLOWED_FILES`. The gate is an allowlist, not a denylist — anything not explicitly named there is excluded from collection entirely, so it is never imported. Passing `--hardware` lifts the restriction and collects everything, including every hardware-commanding script.
 

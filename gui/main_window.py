@@ -565,6 +565,14 @@ class MainWindow(QMainWindow):
     def _on_worker_thread_finished(self):
         self._worker_threads.pop(self.sender(), None)
 
+    def _active_queue_windows(self):
+        """Experiment windows whose run queue is active, including between
+        runs (no worker thread then). Windows without a queue are skipped."""
+        return [
+            window for window in self._running_experiments
+            if getattr(window, "queue_active", lambda: False)()
+        ]
+
     def _ask_stop_and_close(self):
         """True for "Stop and Close", False for "Cancel"."""
         box = QMessageBox(self)
@@ -1102,7 +1110,9 @@ class MainWindow(QMainWindow):
             return
 
         # Gatekeeper: never shut hardware down under a live worker thread.
-        if self._worker_threads and not self._force_close:
+        # A Zero Field run queue between runs has no thread but is still a
+        # running sequence, so it gets the same dialog.
+        if (self._worker_threads or self._active_queue_windows()) and not self._force_close:
             if self._closing_after_stop:
                 # Already stopping; the worker-finished slot or the
                 # timeout will close again.
@@ -1112,6 +1122,11 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
             self._closing_after_stop = True
+            # A queue between runs ends synchronously here; one with a run
+            # in progress is stopped by _begin_stop_and_close() below.
+            for window in self._active_queue_windows():
+                if window not in self._worker_threads.values():
+                    window.request_stop()
             if self._worker_threads:
                 # Defer: close is re-attempted once every worker exits.
                 event.ignore()

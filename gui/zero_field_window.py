@@ -7,8 +7,8 @@ from datetime import datetime
 
 import numpy as np
 
-from PyQt6.QtCore import QThread, pyqtSignal
-from PyQt6.QtWidgets import QFileDialog, QMainWindow, QMessageBox
+from PyQt6.QtCore import QThread, QTimer, Qt, pyqtSignal
+from PyQt6.QtWidgets import QDockWidget, QFileDialog, QMainWindow, QMessageBox
 
 from gui.display_settings import (
     ZFE_COLORMAP_KEY,
@@ -16,10 +16,14 @@ from gui.display_settings import (
     save_colormap,
     select_colormap,
 )
+from gui import zero_field_queue as queue_model
+from gui.widgets.zero_field_queue_widget import ZeroFieldQueueWidget
 from gui.widgets.zero_field_widget import ZeroFieldWidget
+from gui.zero_field_queue import QueueEntry, QueueLog
 from gui.zero_field_worker import ZeroFieldWorker, ratio_curve
 from experiments.zero_field_experiment import ZeroFieldExperiment
 from framework.analysis.zero_field import mean_fluorescence_vs_field
+from framework.fluorescence import mean_fluorescence
 from framework.paths import ensure_writable_directory
 from utils.camera_diagnostics import log_event
 
@@ -35,6 +39,45 @@ _OUTPUT_EXTENSION = ".h5"
 # dataOutput.zeroFieldDirectory key (older configs) -- the same directory
 # this window always used before that key existed.
 _DEFAULT_OUTPUT_DIRECTORY = Path(__file__).resolve().parents[1] / "data"
+
+# Output file names carry this timestamp (one-second resolution), so the
+# run queue never starts two runs within the same second.
+_TIMESTAMP_FORMAT = "%Y-%m-%d_%H-%M-%S"
+
+
+def field_range_problem(magnet, config, axis_limit_note):
+    """(title, text) if the sweep in *config* can't be reached, else None.
+
+    See ZeroFieldWindow._preflight_field_range() for what is checked and
+    why only ValueError counts. Pure calculation: no I/O, no dialog.
+    """
+    swept = config["field_axis"].lower()
+    targets = [(config["field_start"], False), (config["field_stop"], False)]
+    # With reference normalization on, the reference vector (the swept
+    # axis at reference_field_gauss, the others zeroed as for the sweep)
+    # is commanded at every point and is checked the same way.
+    if config.get("reference_enabled", False):
+        targets.append((config["reference_field_gauss"], True))
+    for target_gauss, is_reference in targets:
+        for name in ("x", "y", "z"):
+            target_mT = target_gauss * 0.1 if name == swept else 0.0
+            try:
+                getattr(magnet, name).plan_field(target_mT)
+            except ValueError as error:
+                requested = (
+                    f"Reference field: {target_gauss:g} G on {swept.upper()}."
+                    if is_reference else
+                    f"Requested sweep: {config['field_start']:g} G to "
+                    f"{config['field_stop']:g} G on {swept.upper()}."
+                )
+                return (
+                    "Field range out of bounds",
+                    f"{error}\n\n{requested}\n{axis_limit_note(name)}",
+                )
+            except RuntimeError:
+                # Relay-state precondition, not a range problem.
+                continue
+    return None
 
 
 class ZeroFieldWindow(QMainWindow):
@@ -58,7 +101,8 @@ class ZeroFieldWindow(QMainWindow):
     ):
         super().__init__()
         self.setWindowTitle("Zero-Field Imaging")
-        self.resize(1000, 650)
+        # Taller than the 650 px used before the run queue (a bottom dock).
+        self.resize(1100, 900)
 
         self.hardware_manager = hardware_manager
         self.hardware = hardware
@@ -121,6 +165,8 @@ class ZeroFieldWindow(QMainWindow):
         # produced one.
         self.widget.save_button.setEnabled(False)
 
+        self._init_queue()
+
     def _resolve_default_output_directory(self):
         """Read the configured default zero-field output directory.
 
@@ -148,26 +194,41 @@ class ZeroFieldWindow(QMainWindow):
             self.start_scan()
 
     def start_scan(self):
-        config = self.widget.get_config()
+        self._start_run(self.widget.get_config(), self.output_directory)
+
+    def _start_run(self, config, output_directory, interactive=True):
+        """Validate *config* and start its worker; the one start path for
+        both the Run button and the run queue.
+
+        Returns None once the worker thread has been started, otherwise the
+        reason it was not. interactive=True (the Run button) reports a
+        refusal in a dialog, exactly as before the queue existed; the queue
+        passes False so an unattended run is never blocked by a modal
+        dialog, and records the returned reason instead.
+        """
+        output_directory = Path(output_directory)
 
         # Reject an unreachable sweep before any state changes, any thread
         # exists, or any hardware is touched.
-        if not self._preflight_field_range(config):
-            return
+        if interactive:
+            if not self._preflight_field_range(config):
+                return "Field range out of bounds"
+        else:
+            problem = field_range_problem(self.magnet, config, self._axis_limit_note)
+            if problem is not None:
+                return " ".join(problem[1].split())
 
         # Checked before anything else -- no hardware is touched and no
         # worker/thread is created until the destination is confirmed usable.
         # Skipped entirely when saving is off: there is no destination.
         if config["save_data"]:
             try:
-                ensure_writable_directory(self.output_directory)
+                ensure_writable_directory(output_directory)
             except OSError as error:
-                QMessageBox.critical(
-                    self,
-                    "Zero Field Error",
-                    f"Output directory is not usable: {self.output_directory}\n{error}",
-                )
-                return
+                message = f"Output directory is not usable: {output_directory}\n{error}"
+                if interactive:
+                    QMessageBox.critical(self, "Zero Field Error", message)
+                return " ".join(message.split())
 
         acquisition_state = self.acquisition_state_getter()
         acquisition_roi = acquisition_state.acquisition_roi
@@ -188,7 +249,7 @@ class ZeroFieldWindow(QMainWindow):
         )
         self._reference_enabled = bool(config.get("reference_enabled", False))
         self.widget.set_signal_mode(self._reference_enabled)
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        timestamp = datetime.now().strftime(_TIMESTAMP_FORMAT)
         # Stored unconditionally (even when saving is off) so "Save Data"
         # can later synthesize a filename matching what this run would have
         # used had saving been on.
@@ -200,16 +261,17 @@ class ZeroFieldWindow(QMainWindow):
             # this path, so it's the only file this run produces, not a
             # companion to a separate per-scan file.
             self.output_path = (
-                self.output_directory / f"zero_field_{timestamp}{_OUTPUT_EXTENSION}"
+                output_directory / f"zero_field_{timestamp}{_OUTPUT_EXTENSION}"
             )
         else:
             self.output_path = (
-                self.output_directory / f"zero_field_{timestamp}_average{_OUTPUT_EXTENSION}"
+                output_directory / f"zero_field_{timestamp}_average{_OUTPUT_EXTENSION}"
             )
         self.widget.save_button.setEnabled(False)
         self.widget.reset_scan(config["field_points"], self.total_scans)
         self.widget.set_running_state(True)
         self.zero_field_running = True
+        self._update_queue_controls()
 
         metadata = {
             "scan_parameters": dict(config),
@@ -245,10 +307,16 @@ class ZeroFieldWindow(QMainWindow):
         self.worker.error_signal.connect(self.thread.quit)
         self.worker.field_updated.connect(self.field_updated)
         self.thread.finished.connect(self.thread.deleteLater)
+        if not interactive:
+            # Queue runs only: the next entry starts once this thread has
+            # really exited, not when its finished_signal arrives.
+            self.thread.finished.connect(self._queue_run_thread_finished)
         # Before the thread starts, so the magnet lock is in place before
         # the worker can send any magnet command.
+        self._lock_held = True
         self.run_started.emit()
         self.thread.start()
+        return None
 
     def _preflight_field_range(self, config):
         """Return False (after telling the user) if the sweep can't be reached.
@@ -266,36 +334,15 @@ class ZeroFieldWindow(QMainWindow):
         state, notably "unsynchronized relay" before the magnet's first
         enable(), which the scan's own setup_scan() resolves -- blocking on
         those would refuse every first scan after launch.
+
+        The check itself is field_range_problem(), shared with the run
+        queue, which reports a refusal without a dialog.
         """
-        swept = config["field_axis"].lower()
-        targets = [(config["field_start"], False), (config["field_stop"], False)]
-        # With reference normalization on, the reference vector (the swept
-        # axis at reference_field_gauss, the others zeroed as for the sweep)
-        # is commanded at every point and is checked the same way.
-        if config.get("reference_enabled", False):
-            targets.append((config["reference_field_gauss"], True))
-        for target_gauss, is_reference in targets:
-            for name in ("x", "y", "z"):
-                target_mT = target_gauss * 0.1 if name == swept else 0.0
-                try:
-                    getattr(self.magnet, name).plan_field(target_mT)
-                except ValueError as error:
-                    requested = (
-                        f"Reference field: {target_gauss:g} G on {swept.upper()}."
-                        if is_reference else
-                        f"Requested sweep: {config['field_start']:g} G to "
-                        f"{config['field_stop']:g} G on {swept.upper()}."
-                    )
-                    QMessageBox.critical(
-                        self,
-                        "Field range out of bounds",
-                        f"{error}\n\n{requested}\n{self._axis_limit_note(name)}",
-                    )
-                    return False
-                except RuntimeError:
-                    # Relay-state precondition, not a range problem; see docstring.
-                    continue
-        return True
+        problem = field_range_problem(self.magnet, config, self._axis_limit_note)
+        if problem is None:
+            return True
+        QMessageBox.critical(self, *problem)
+        return False
 
     def _axis_limit_note(self, name):
         """Approximate reachable range of one axis, in Gauss, from its config."""
@@ -332,10 +379,28 @@ class ZeroFieldWindow(QMainWindow):
         return self.thread
 
     def request_stop(self):
-        """Ask the running scan to stop; it finishes asynchronously."""
-        self.stop_scan()
+        """Ask the running scan to stop; it finishes asynchronously.
+
+        While a queue runs this stops the whole queue (the running entry
+        and every remaining one), which is what MainWindow's "Stop and
+        Close" needs."""
+        if self._queue_active:
+            self.stop_queue()
+        else:
+            self.stop_scan()
+
+    def queue_active(self):
+        """True from "Run queue" until the queue has ended, including the
+        pauses between runs when no worker thread exists. MainWindow's close
+        gate treats such a window as busy."""
+        return self._queue_active
 
     def handle_live_update(self, field, signal, image):
+        entry = self._queue_current
+        if entry is not None and entry.first_frame_mean is None:
+            # Mean counts of the first stored point's image (scan 1, point 1;
+            # averaged over that point's repeats), for the queue log.
+            entry.first_frame_mean = float(mean_fluorescence(image))
         log_event("gui_image_update", source="Zero Field experiment", image_target="Zero Field image")
         self._latest_averaged_image = np.array(image, copy=True)
         self._reference_image = self._capture_reference_image(
@@ -474,9 +539,14 @@ class ZeroFieldWindow(QMainWindow):
         self.zero_field_running = False
         # Emitted first so nothing below can prevent the magnet lock from
         # being released. The worker has already finished cleanup_scan()
-        # (magnet.disable()) by the time finished_signal is sent.
-        self.run_finished.emit()
+        # (magnet.disable()) by the time finished_signal is sent. A queue
+        # that goes on to another entry keeps the lock instead: run_finished
+        # is then emitted once, when the queue ends.
+        if not self._queue_record_finished_run(image_cube, stopped):
+            self._lock_held = False
+            self.run_finished.emit()
         self.widget.set_running_state(False)
+        self._update_queue_controls()
         if image_cube is None:
             self.widget.status_label.setText("Status: Error")
             self.widget.save_button.setEnabled(False)
@@ -533,6 +603,13 @@ class ZeroFieldWindow(QMainWindow):
         self.zero_field_running = False
         self.widget.set_running_state(False)
         self.widget.status_label.setText("Status: Error")
+        if self._queue_current is not None:
+            # Unattended: no modal dialog. The message goes to the entry's
+            # status and the queue log when finished_signal arrives.
+            self._queue_current.message = " ".join(str(message).split())
+            self.widget.status_label.setText(f"Status: Error — {message}")
+            self._update_queue_controls()
+            return
         QMessageBox.critical(self, "Zero Field Error", message)
 
     def browse_output_directory(self):
@@ -621,6 +698,386 @@ class ZeroFieldWindow(QMainWindow):
             return
         self.widget.status_label.setText(f"Status: Saved data to {destination}")
 
+    # =========================================================
+    # RUN QUEUE
+    # =========================================================
+    # Each entry runs through _start_run() exactly as the Run button would
+    # (interactive=False only replaces dialogs with a recorded reason).
+    # run_started fires per run, so MainWindow registers every worker
+    # thread; run_finished fires once, when the queue ends, so the magnet
+    # lock is never released between runs.
+
+    def _init_queue(self):
+        self.queue_entries = []
+        self._queue_active = False
+        self._queue_stop_requested = False
+        self._queue_current = None       # entry whose worker is running
+        self._queue_started = []         # entries started by this execution
+        self._queue_log = None
+        self._lock_held = False          # run_started sent, run_finished not yet
+        self._queue_timer = QTimer(self)
+        self._queue_timer.setSingleShot(True)
+        self._queue_timer.timeout.connect(self._start_next_queue_entry)
+
+        self.queue_widget = ZeroFieldQueueWidget()
+        self.queue_dock = QDockWidget("Run Queue", self)
+        self.queue_dock.setObjectName("ZeroFieldRunQueue")
+        # Not closable: there would be no way to get it back.
+        self.queue_dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetMovable
+            | QDockWidget.DockWidgetFeature.DockWidgetFloatable
+        )
+        self.queue_dock.setWidget(self.queue_widget)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.queue_dock)
+
+        q = self.queue_widget
+        q.add_button.clicked.connect(self.add_to_queue)
+        q.remove_button.clicked.connect(self.remove_queue_entry)
+        q.move_up_button.clicked.connect(lambda: self.move_queue_entry(-1))
+        q.move_down_button.clicked.connect(lambda: self.move_queue_entry(+1))
+        q.duplicate_button.clicked.connect(self.duplicate_queue_entry)
+        q.clear_button.clicked.connect(self.clear_pending_entries)
+        q.load_into_form_button.clicked.connect(self.load_entry_into_form)
+        q.save_queue_button.clicked.connect(self.save_queue)
+        q.load_queue_button.clicked.connect(self.load_queue)
+        q.run_queue_button.clicked.connect(self.run_queue)
+        q.stop_current_button.clicked.connect(self.stop_current_run)
+        q.stop_queue_button.clicked.connect(self.stop_queue)
+        q.table.itemSelectionChanged.connect(self._update_queue_controls)
+        self._refresh_queue()
+
+    # ---- editing -------------------------------------------------------
+
+    def add_to_queue(self):
+        """Snapshot the form (and output directory) as a pending entry.
+
+        The same field-range check as the Run button, with its dialog; an
+        unreachable entry is not added. Returns True if it was added."""
+        config = self.widget.get_config()
+        if not self._preflight_field_range(config):
+            return False
+        self.queue_entries.append(QueueEntry.snapshot(config, self.output_directory))
+        self._refresh_queue(select=len(self.queue_entries) - 1)
+        return True
+
+    def _selected_entry(self):
+        row = self.queue_widget.selected_row()
+        if row is None or row >= len(self.queue_entries):
+            return None, None
+        return row, self.queue_entries[row]
+
+    def remove_queue_entry(self):
+        row, entry = self._selected_entry()
+        if entry is None or entry.status == queue_model.RUNNING:
+            return
+        del self.queue_entries[row]
+        self._refresh_queue(select=min(row, len(self.queue_entries) - 1))
+
+    def move_queue_entry(self, step):
+        """Move the selected entry up (-1) or down (+1). The queue runs the
+        first pending entry in list order, so reordering pending entries
+        during a queue changes what runs next."""
+        row, entry = self._selected_entry()
+        target = None if row is None else row + step
+        if entry is None or not 0 <= target < len(self.queue_entries):
+            return
+        entries = self.queue_entries
+        entries[row], entries[target] = entries[target], entries[row]
+        self._refresh_queue(select=target)
+
+    def duplicate_queue_entry(self):
+        row, entry = self._selected_entry()
+        if entry is None:
+            return
+        self.queue_entries.insert(row + 1, entry.duplicate())
+        self._refresh_queue(select=row + 1)
+
+    def clear_pending_entries(self):
+        self.queue_entries = [
+            entry for entry in self.queue_entries
+            if entry.status != queue_model.PENDING
+        ]
+        self._refresh_queue()
+
+    def load_entry_into_form(self):
+        """Copy the selected entry's settings back into the form."""
+        _row, entry = self._selected_entry()
+        if entry is None:
+            return
+        self.widget.set_config(entry.config)
+        self.output_directory = Path(entry.output_directory)
+        self.widget.set_output_directory(self.output_directory)
+
+    def save_queue(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Zero Field Queue",
+            str(self.output_directory / "zero_field_queue.json"),
+            "Queue files (*.json)",
+        )
+        if path:
+            self.save_queue_to(path)
+
+    def save_queue_to(self, path):
+        try:
+            queue_model.save_queue_file(
+                path, self.queue_entries,
+                self.queue_widget.pause_spin.value(),
+                self.queue_widget.on_failure_combo.currentText(),
+            )
+        except OSError as error:
+            QMessageBox.critical(self, "Zero Field Queue", f"Could not save the queue: {error}")
+            return False
+        self.queue_widget.queue_status_label.setText(f"Queue: saved {Path(path).name}")
+        return True
+
+    def load_queue(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Zero Field Queue", str(self.output_directory),
+            "Queue files (*.json)",
+        )
+        if path:
+            self.load_queue_from(path)
+
+    def load_queue_from(self, path):
+        """Replace the list with a queue file's entries, all pending.
+
+        Each entry gets the same field-range check as "Add to queue"; if
+        any is unreachable, or the file is invalid, nothing is loaded."""
+        if self._queue_active:
+            return False
+        try:
+            entries, pause_s, on_failure = queue_model.load_queue_file(path)
+        except (OSError, ValueError) as error:
+            QMessageBox.critical(self, "Zero Field Queue", f"Could not load {path}:\n{error}")
+            return False
+        refused = []
+        for number, entry in enumerate(entries, start=1):
+            problem = field_range_problem(self.magnet, entry.config, self._axis_limit_note)
+            if problem is not None:
+                refused.append(f"Entry {number}: {problem[1]}")
+        if refused:
+            QMessageBox.critical(
+                self, "Field range out of bounds",
+                "The queue was not loaded.\n\n" + "\n\n".join(refused),
+            )
+            return False
+        self.queue_entries = entries
+        self.queue_widget.pause_spin.setValue(pause_s)
+        self.queue_widget.on_failure_combo.setCurrentText(on_failure)
+        self._refresh_queue()
+        self.queue_widget.queue_status_label.setText(f"Queue: loaded {Path(path).name}")
+        return True
+
+    # ---- execution -----------------------------------------------------
+
+    def run_queue(self):
+        """Run every pending entry in list order."""
+        if self._queue_active or self.zero_field_running:
+            return False
+        pending = [e for e in self.queue_entries if e.status == queue_model.PENDING]
+        if not pending:
+            self.queue_widget.queue_status_label.setText("Queue: nothing pending")
+            return False
+        self._queue_active = True
+        self._queue_stop_requested = False
+        self._queue_started = []
+        self._queue_log = self._open_queue_log(Path(pending[0].output_directory))
+        self._update_queue_controls()
+        self._start_next_queue_entry()
+        return True
+
+    def _open_queue_log(self, directory):
+        """zero_field_queue_<timestamp>.csv in the first entry's output
+        directory; None (logged) if it can't be created."""
+        timestamp = datetime.now().strftime(_TIMESTAMP_FORMAT)
+        try:
+            ensure_writable_directory(directory)
+            log = QueueLog(directory / f"zero_field_queue_{timestamp}.csv")
+        except OSError:
+            LOGGER.exception("Could not create the Zero Field queue log in %s", directory)
+            return None
+        LOGGER.info("Zero Field queue log: %s", log.path)
+        return log
+
+    def _start_next_queue_entry(self):
+        if not self._queue_active:
+            return
+        if self._queue_stop_requested:
+            self._end_queue()
+            return
+        entry = next(
+            (e for e in self.queue_entries if e.status == queue_model.PENDING), None
+        )
+        if entry is None:
+            self._end_queue()
+            return
+        now = datetime.now()
+        if now.strftime(_TIMESTAMP_FORMAT) == self._scan_timestamp:
+            # The previous run used this second's timestamp; starting now
+            # would give this run the same file name. Wait for the next second.
+            self._queue_timer.start(1000 - now.microsecond // 1000 + 10)
+            return
+
+        entry.status = queue_model.RUNNING
+        entry.message = ""
+        entry.output_path = ""
+        entry.first_frame_mean = None
+        entry.start_time = now
+        entry.end_time = None
+        entry.log_index = self.queue_entries.index(entry) + 1
+        self._queue_started.append(entry)
+        self._queue_current = entry
+        self._refresh_queue()
+
+        # Field range re-checked here, immediately before the start, as
+        # well as when the entry was added.
+        problem = self._start_run(entry.config, entry.output_directory, interactive=False)
+        if problem is not None:
+            # Refused before any worker existed: nothing to wait for.
+            self._queue_current = None
+            self._finish_queue_entry(entry, queue_model.FAILED, problem)
+            if self._queue_should_continue(entry):
+                self._queue_timer.start(0)
+            else:
+                self._end_queue()
+            return
+        entry.output_path = "" if self.output_path is None else str(self.output_path)
+        self._refresh_queue()
+
+    def _queue_record_finished_run(self, image_cube, stopped):
+        """Called from scan_finished(). Records the queued run's outcome and
+        returns True if the queue goes on to another entry (the magnet lock
+        is then kept); False for a run outside a queue, or the last one."""
+        entry = self._queue_current
+        if not self._queue_active or entry is None:
+            return False
+        self._queue_current = None
+        try:
+            if image_cube is None:
+                status = queue_model.FAILED
+                message = entry.message or "the run raised an error"
+            elif stopped:
+                status = queue_model.STOPPED
+                message = "queue stopped" if self._queue_stop_requested else "stopped by user"
+            else:
+                status, message = queue_model.DONE, ""
+            self._finish_queue_entry(entry, status, message)
+            if self._queue_should_continue(entry):
+                # The next entry starts from _queue_run_thread_finished().
+                return True
+        except Exception:
+            LOGGER.exception("Zero Field queue bookkeeping failed; ending the queue")
+        # The caller (scan_finished) releases the magnet lock.
+        self._end_queue(release_lock=False)
+        return False
+
+    def _queue_run_thread_finished(self):
+        """A queued run's worker thread has exited: after the pause, start
+        the next entry (if the queue is still going)."""
+        if not self._queue_active or self._queue_current is not None:
+            return
+        pause_ms = int(round(self.queue_widget.pause_spin.value() * 1000))
+        self._queue_timer.start(pause_ms)
+        if pause_ms:
+            self.queue_widget.queue_status_label.setText(
+                f"Queue: pausing {pause_ms / 1000:g} s before the next run"
+            )
+
+    def _queue_should_continue(self, finished_entry):
+        if self._queue_stop_requested:
+            return False
+        if (
+            finished_entry.status == queue_model.FAILED
+            and self.queue_widget.on_failure_combo.currentText() == queue_model.ON_FAILURE_STOP
+        ):
+            return False
+        return any(e.status == queue_model.PENDING for e in self.queue_entries)
+
+    def _finish_queue_entry(self, entry, status, message):
+        entry.status = status
+        entry.message = message
+        entry.end_time = datetime.now()
+        if self._queue_log is not None:
+            try:
+                self._queue_log.append(entry)
+            except OSError:
+                LOGGER.exception("Could not append to queue log %s", self._queue_log.path)
+        self._refresh_queue()
+
+    def stop_current_run(self):
+        """Stop the running entry; the queue continues with the next one."""
+        if self._queue_active and self.zero_field_running:
+            self.stop_scan()
+
+    def stop_queue(self):
+        """Stop the running entry and start no more."""
+        if not self._queue_active:
+            return
+        self._queue_stop_requested = True
+        self._queue_timer.stop()
+        if self.zero_field_running:
+            self.stop_scan()  # scan_finished() then ends the queue
+        else:
+            self._end_queue()
+
+    def _end_queue(self, release_lock=True):
+        self._queue_active = False
+        self._queue_timer.stop()
+        self._queue_current = None
+        counts = {
+            status: sum(e.status == status for e in self._queue_started)
+            for status in (queue_model.DONE, queue_model.STOPPED, queue_model.FAILED)
+        }
+        text = (
+            f"Queue: finished — {counts[queue_model.DONE]} done, "
+            f"{counts[queue_model.STOPPED]} stopped, {counts[queue_model.FAILED]} failed"
+        )
+        if self._queue_stop_requested:
+            text += " (queue stopped)"
+        self.queue_widget.queue_status_label.setText(text)
+        if self._queue_log is not None:
+            self.queue_widget.queue_status_label.setToolTip(f"Log: {self._queue_log.path}")
+        if release_lock and self._lock_held:
+            self._lock_held = False
+            self.run_finished.emit()
+        self._refresh_queue()
+
+    # ---- display -------------------------------------------------------
+
+    def _refresh_queue(self, select=None):
+        self.queue_widget.set_entries(self.queue_entries)
+        if select is not None:
+            self.queue_widget.select_row(select)
+        if self._queue_active and self._queue_current is not None:
+            total = len(self._queue_started) + sum(
+                e.status == queue_model.PENDING for e in self.queue_entries
+            )
+            self.queue_widget.queue_status_label.setText(
+                f"Queue: run {len(self._queue_started)} of {total}"
+            )
+        self._update_queue_controls()
+
+    def _update_queue_controls(self):
+        q = self.queue_widget
+        active = self._queue_active
+        row, entry = self._selected_entry()
+        count = len(self.queue_entries)
+        has_pending = any(e.status == queue_model.PENDING for e in self.queue_entries)
+        # The Run button is the single-run path; the queue owns the window
+        # while it runs.
+        self.widget.run_stop_button.setEnabled(not active)
+        q.run_queue_button.setEnabled(not active and not self.zero_field_running and has_pending)
+        q.stop_current_button.setEnabled(active and self.zero_field_running)
+        q.stop_queue_button.setEnabled(active)
+        q.remove_button.setEnabled(entry is not None and entry.status != queue_model.RUNNING)
+        q.move_up_button.setEnabled(row is not None and row > 0)
+        q.move_down_button.setEnabled(row is not None and row < count - 1)
+        q.duplicate_button.setEnabled(entry is not None)
+        q.clear_button.setEnabled(has_pending)
+        q.load_into_form_button.setEnabled(entry is not None)
+        q.save_queue_button.setEnabled(count > 0)
+        q.load_queue_button.setEnabled(not active)
+
     def closeEvent(self, event):
         # MainWindow is the close gatekeeper (it waits for worker threads
         # before shutting hardware down). Here, a running scan is asked to
@@ -630,4 +1087,8 @@ class ZeroFieldWindow(QMainWindow):
             self.request_stop()
             event.ignore()
             return
+        if getattr(self, "_queue_active", False):
+            # Between queued runs: nothing is commanding hardware, so end
+            # the queue (releasing the magnet lock) and close.
+            self.stop_queue()
         event.accept()
