@@ -16,6 +16,7 @@ ALLOWED_FILES = frozenset(
     {
         "test_acquisition_state.py",
         "test_andor_binning.py",
+        "test_app_exit.py",
         "test_baseline_correction.py",
         "test_camera_ownership.py",
         "test_colormap_selectors.py",

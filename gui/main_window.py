@@ -477,6 +477,10 @@ class MainWindow(QMainWindow):
 
         if self.magnet_window is not None:
 
+            # Closing the magnet window only hides it (it is kept so the
+            # post-experiment action still runs), so show it again here.
+            self.magnet_window.show()
+
             self.magnet_window.raise_()
 
             self.magnet_window.activateWindow()
@@ -1152,8 +1156,36 @@ class MainWindow(QMainWindow):
         self._shutdown_hardware()
         event.accept()
 
+    def _close_tool_windows(self):
+        """Close the non-experiment windows on exit.
+
+        Qt quits when the last *visible* top-level window closes, so a
+        visible magnet window used to keep the process running after Exit
+        (hardware was already shut down by then). The magnet window has no
+        closeEvent, so close() only hides it; it is also deleted, which
+        disconnects its experiment_started/finished slots -- a worker that
+        finishes after a forced close then can't trigger its post-experiment
+        magnet command. The analysis window touches no hardware; while a
+        pixel fit runs its closeEvent defers the close until the fit ends,
+        and the process quits then.
+        """
+        magnet_window = getattr(self, "magnet_window", None)
+        if magnet_window is not None:
+            try:
+                magnet_window.close()
+                magnet_window.deleteLater()
+            except Exception:
+                LOGGER.exception("Failed to close the magnet window")
+            self.magnet_window = None
+        analysis_window = getattr(self, "odmr_analysis_window", None)
+        if analysis_window is not None:
+            try:
+                analysis_window.close()
+            except Exception:
+                LOGGER.exception("Failed to close the ODMR analysis window")
+
     def _shutdown_hardware(self):
-        """Stop live view, close experiment windows, shut hardware down."""
+        """Stop live view, close experiment and tool windows, shut hardware down."""
 
         self._shut_down = True
         if self._close_timeout_timer is not None:
@@ -1175,6 +1207,11 @@ class MainWindow(QMainWindow):
                 self.zero_field_window.close()
         except Exception:
             pass
+
+        # Tool windows next: a visible one would keep the process alive
+        # after the main window closes. Before hardware shutdown, so the
+        # magnet window can't command a magnet that is being shut down.
+        self._close_tool_windows()
 
         # Shut down hardware if HardwareManager supports it
         try:
