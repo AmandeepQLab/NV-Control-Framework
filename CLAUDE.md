@@ -353,7 +353,7 @@ No experiment, worker, magnet or hardware file was changed for it.
   - "On failure": "Stop queue" (default) ends the queue; "Skip to next" continues.
 - **Stopped is not a failure.** "Stop current run" stops the worker, marks the entry stopped ("stopped by user") and continues. "Stop queue" stops the run (message "queue stopped") and starts nothing more; remaining entries stay pending. Stopped during a pause, the queue ends at once.
 - `request_stop()` (MainWindow's close path) stops the whole queue while one is active.
-- The normal Run button and "Run queue" are disabled while a queue runs; "Run queue" is also disabled during a single run.
+- The normal Run button and "Run queue" are disabled while a queue runs; "Run queue" is also disabled during a single run. While the queue runs, the Run button is grey and reads "Queue running", with a tooltip pointing to the queue's stop buttons (see "Zero Field window layout").
 
 **Magnet lock across the queue.**
 - `run_started` is emitted per run, so `MainWindow` registers every worker thread for close safety.
@@ -373,6 +373,19 @@ No experiment, worker, magnet or hardware file was changed for it.
 **Status.** "Queue: run k of N" (N = entries started in this execution plus those still pending), "Queue: pausing …", and a finished summary. The running row is highlighted in bold.
 
 **Tests:** `tests/test_zero_field_queue.py`, which runs real queues on SimCamera and a real `Magnet` over simulated supplies.
+
+## Zero Field window layout
+
+- **Left column** (`ZeroFieldWidget.left_panel`):
+  - The run/stop button is fixed at the top.
+  - Every other control is below it in `control_scroll_area`, a `QScrollArea` set up exactly like the ODMR panel's: resizable, vertical scrollbar as needed, horizontal always off. Its widget is the "Zero Field Parameters" group (`controls_group`), with the groups in their original order.
+  - The scroll area's minimum width is the controls' size hint plus the scrollbar, so nothing is clipped horizontally.
+  - The plot, the image and the bottom "Run Queue" dock are outside it.
+- **Run/stop button.** It is one toggle driving `toggle_scan()`. Its styling is shared with the ODMR run button: `gui/widgets/run_button.py::style_run_button()`, where IDLE is green, RUNNING red and BLOCKED grey and disabled. Text and background colours are both explicit, so it reads the same in light and dark themes. The ODMR button keeps its own texts and colours.
+  - Idle: "Start", green. Running: "Stop", red. A running queue: "Queue running", grey, disabled.
+  - It follows the window's `run_started`/`run_finished` signals (`_update_run_button()`), not the click, so completion, stop and error all return it to "Start".
+  - `ZeroFieldWidget.set_running_state()` now only sets the status line.
+- **Default size** is 1100×960. That fits 1920×1080 with the taskbar visible (1032 px available, 991 px with the title bar), and it is clamped to a smaller screen. The window's minimum height is about 540 px, set by the plot and queue areas; below the default height the controls scroll.
 
 ## Known hardware quirks (ODMR timing)
 

@@ -10,6 +10,9 @@ import pyqtgraph as pg
 import numpy as np
 from PyQt6.QtGui import QFontDatabase
 
+from gui.widgets import run_button
+from gui.widgets.run_button import style_run_button
+
 # Moved to a shared module (also used by the ODMR analysis window);
 # re-exported here so existing imports keep working.
 from gui.widgets.initial_fit_parameters_dialog import InitialFitParametersDialog  # noqa: F401
@@ -323,10 +326,8 @@ class ODMRPanel(QWidget):
         odmr_layout.addWidget(self.analysis_button)
         self.analysis_button.clicked.connect(self.analysis_requested.emit)
 
-        self.run_stop_button = QPushButton("Run ODMR")
-        self.run_stop_button.setStyleSheet(
-            "background-color: green; color: white; font-weight: bold;"
-        )
+        self.run_stop_button = QPushButton()
+        style_run_button(self.run_stop_button, run_button.IDLE, "Run ODMR")
         odmr_layout.addWidget(self.run_stop_button)
 
         self.sequence_button = QPushButton("Show Pulse Sequence")
@@ -410,15 +411,9 @@ class ODMRPanel(QWidget):
 
     def set_running_state(self, running):
         if running:
-            self.run_stop_button.setText("Stop ODMR")
-            self.run_stop_button.setStyleSheet(
-                "background-color: red; color: white; font-weight: bold;"
-            )
+            style_run_button(self.run_stop_button, run_button.RUNNING, "Stop ODMR")
         else:
-            self.run_stop_button.setText("Run ODMR")
-            self.run_stop_button.setStyleSheet(
-                "background-color: green; color: white; font-weight: bold;"
-            )
+            style_run_button(self.run_stop_button, run_button.IDLE, "Run ODMR")
 
     def toggle_dense_section(self, checked):
         self.dense_group.setVisible(checked)

@@ -13,12 +13,16 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QProgressBar,
+    QScrollArea,
     QSpinBox,
     QVBoxLayout,
     QWidget,
 )
+from PyQt6.QtCore import Qt
 
 from gui.image_inspection import line_profile, pixel_value
+from gui.widgets import run_button
+from gui.widgets.run_button import style_run_button
 
 
 class ZeroFieldWidget(QWidget):
@@ -29,9 +33,34 @@ class ZeroFieldWidget(QWidget):
 
         main_layout = QHBoxLayout(self)
 
+        # Left column: the run/stop button fixed at the top, and every
+        # other control in a vertically scrolling area below it (the same
+        # QScrollArea set-up as the ODMR panel), so the button stays
+        # visible at any window height.
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.addWidget(left_panel, 1)
+        self.left_panel = left_panel
+
+        self.run_stop_button = QPushButton()
+        self.set_run_button_state(run_button.IDLE)
+        left_layout.addWidget(self.run_stop_button)
+
         controls = QGroupBox("Zero Field Parameters")
-        main_layout.addWidget(controls, 1)
+        self.controls_group = controls
         control_layout = QVBoxLayout(controls)
+
+        self.control_scroll_area = QScrollArea()
+        self.control_scroll_area.setWidgetResizable(True)
+        self.control_scroll_area.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.control_scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.control_scroll_area.setWidget(controls)
+        left_layout.addWidget(self.control_scroll_area, 1)
 
         output_group = QGroupBox("Output Directory")
         output_group_layout = QVBoxLayout(output_group)
@@ -215,12 +244,6 @@ class ZeroFieldWidget(QWidget):
         self.line_profile_check = QCheckBox("Enable Line Profile")
         camera_layout.addWidget(self.line_profile_check)
 
-        self.run_stop_button = QPushButton("Start Scan")
-        self.run_stop_button.setStyleSheet(
-            "background-color: green; color: white; font-weight: bold;"
-        )
-        control_layout.addWidget(self.run_stop_button)
-
         self.save_button = QPushButton("Save Data")
         self.save_button.setEnabled(False)
         control_layout.addWidget(self.save_button)
@@ -241,6 +264,13 @@ class ZeroFieldWidget(QWidget):
         control_layout.addWidget(self.current_field_label)
         control_layout.addWidget(self.current_signal_label)
         control_layout.addStretch()
+        # Horizontal scrolling is off, so the column must be at least as
+        # wide as the controls want, plus room for the vertical scrollbar.
+        self.control_scroll_area.setMinimumWidth(
+            controls.sizeHint().width()
+            + self.control_scroll_area.verticalScrollBar().sizeHint().width()
+            + 2 * self.control_scroll_area.frameWidth()
+        )
 
         self._signal_label = self._COUNTS_LABEL
         plot_group = QGroupBox("Zero Field Mean Fluorescence (counts/pixel)")
@@ -460,14 +490,26 @@ class ZeroFieldWidget(QWidget):
         self.display_max_spin.setEnabled(enabled)
 
     def set_running_state(self, running):
+        """Status line only. The run button follows the window's
+        run_started/run_finished signals instead (set_run_button_state())."""
         if running:
-            self.run_stop_button.setText("Stop Scan")
-            self.run_stop_button.setStyleSheet(
-                "background-color: red; color: white; font-weight: bold;"
-            )
             self.status_label.setText("Status: Running")
-        else:
-            self.run_stop_button.setText("Start Scan")
-            self.run_stop_button.setStyleSheet(
-                "background-color: green; color: white; font-weight: bold;"
-            )
+
+    # Run/stop button texts and the tooltip shown while a queue owns it.
+    RUN_BUTTON_TEXT = {
+        run_button.IDLE: "Start",
+        run_button.RUNNING: "Stop",
+        run_button.BLOCKED: "Queue running",
+    }
+    QUEUE_RUNNING_TOOLTIP = (
+        "A run queue is in progress. Use \"Stop current run\" or \"Stop queue\" "
+        "in the Run Queue panel."
+    )
+
+    def set_run_button_state(self, state):
+        """IDLE: "Start", green. RUNNING: "Stop", red. BLOCKED: disabled,
+        grey, "Queue running" (a queue owns the window)."""
+        style_run_button(
+            self.run_stop_button, state, self.RUN_BUTTON_TEXT[state],
+            self.QUEUE_RUNNING_TOOLTIP if state == run_button.BLOCKED else "",
+        )

@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 # QApplication must exist before pyqtgraph (via the widget) is imported;
 # see tests/test_zero_field_window_save_toggle.py.
-from PyQt6.QtCore import QCoreApplication, QEvent
+from PyQt6.QtCore import QCoreApplication, QEvent, Qt
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 _APP = QApplication.instance() or QApplication(sys.argv[:1])
@@ -25,6 +25,7 @@ _APP = QApplication.instance() or QApplication(sys.argv[:1])
 import gui.zero_field_worker as zero_field_worker_module  # noqa: E402
 from framework.image_cube import ImageCube  # noqa: E402
 from gui import zero_field_queue as queue_model  # noqa: E402
+from gui.widgets.zero_field_widget import ZeroFieldWidget  # noqa: E402
 from gui.zero_field_window import ZeroFieldWindow  # noqa: E402
 from tests.test_main_window_close_safety import _make_main_window  # noqa: E402
 from tests.test_zero_field_timing import make_camera, make_magnet  # noqa: E402
@@ -504,6 +505,136 @@ class MagnetLockTests(QueueWindowTestCase):
             )
         self.assertEqual((first.status, second.status), ("stopped", "pending"))
         self.assertFalse(self.window.queue_active())
+
+
+class ControlPanelLayoutTests(QueueWindowTestCase):
+    """Scrollable control panel and the fixed run/stop button."""
+
+    def test_run_button_is_fixed_and_every_control_group_scrolls(self):
+        w = self.window.widget
+        scroll = w.control_scroll_area
+        self.assertIs(scroll.widget(), w.controls_group)
+        self.assertFalse(scroll.isAncestorOf(w.run_stop_button))
+        self.assertTrue(w.left_panel.isAncestorOf(w.run_stop_button))
+        # Directly above the scroll area in the left column.
+        left = w.left_panel.layout()
+        self.assertIs(left.itemAt(0).widget(), w.run_stop_button)
+        self.assertIs(left.itemAt(1).widget(), scroll)
+        # Every control group, in its original order, inside the scroll area.
+        groups = [
+            left_item.widget().title()
+            for left_item in (
+                w.controls_group.layout().itemAt(i)
+                for i in range(w.controls_group.layout().count())
+            )
+            if left_item.widget() is not None and hasattr(left_item.widget(), "title")
+        ]
+        self.assertEqual(
+            groups,
+            ["Output Directory", "Magnetic Field", "Multi-Scan Averaging",
+             "Camera Acquisition"],
+        )
+        for control in (
+            w.output_directory_edit, w.browse_output_button, w.save_data_check,
+            w.field_start_spin, w.field_axis_combo, w.post_flip_settling_spin,
+            w.averaging_enabled_check, w.alternate_direction_check,
+            w.reference_field_spin, w.display_mode_combo, w.colormap_combo,
+            w.line_profile_check, w.save_button, w.progress_bar,
+            w.status_label, w.current_signal_label,
+        ):
+            self.assertTrue(scroll.isAncestorOf(control), control)
+        # The plot and image stay outside it.
+        self.assertFalse(scroll.isAncestorOf(w.plot))
+        self.assertFalse(scroll.isAncestorOf(w.image_view))
+        self.assertEqual(scroll.horizontalScrollBarPolicy(),
+                         Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.assertEqual(scroll.verticalScrollBarPolicy(),
+                         Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.assertTrue(scroll.widgetResizable())
+
+    def test_controls_fit_the_column_and_scroll_vertically(self):
+        window, w = self.window, self.window.widget
+        window.show()
+        self.addCleanup(window.hide)
+        window.resize(window.width(), 560)
+        _APP.processEvents()
+        scroll = w.control_scroll_area
+        self.assertLessEqual(w.controls_group.width(), scroll.viewport().width())
+        self.assertGreater(scroll.verticalScrollBar().maximum(), 0)
+        scroll.verticalScrollBar().setValue(scroll.verticalScrollBar().maximum())
+        _APP.processEvents()
+        self.assertTrue(w.run_stop_button.isVisible())
+        self.assertFalse(w.run_stop_button.visibleRegion().isEmpty())
+
+    def _assert_button(self, text, colour, enabled=True):
+        button = self.window.widget.run_stop_button
+        self.assertEqual(button.text(), text)
+        self.assertIn(f"QPushButton {{ background-color: {colour};", button.styleSheet())
+        self.assertIn("color: white", button.styleSheet())
+        self.assertEqual(button.isEnabled(), enabled)
+
+    def _start_single_run(self, **form):
+        self.set_form(**form)
+        self.window.widget.run_stop_button.click()  # the toggle_scan() path
+        self._assert_button("Stop", "red")
+
+    def _wait_idle(self):
+        self.assertTrue(_pump_until(lambda: not self.window.zero_field_running))
+        _pump_until(lambda: not _thread_running(self.window), 10)
+
+    def test_button_idle_running_and_back_when_run_completes(self):
+        self._assert_button("Start", "green")
+        self._start_single_run(points=3)
+        self._wait_idle()
+        self._assert_button("Start", "green")
+
+    def test_button_returns_to_start_after_stop(self):
+        self._start_single_run(points=40, settling=20)
+        self.assertTrue(_pump_until(lambda: self.window.scan_signals != []))
+        self.window.widget.run_stop_button.click()  # Stop
+        self._wait_idle()
+        self._assert_button("Start", "green")
+        self.assertTrue(self.window.widget.status_label.text().startswith("Status: Stopped"))
+
+    def test_button_returns_to_start_after_error(self):
+        experiment_class = zero_field_worker_module.ZeroFieldExperiment
+        with patch.object(experiment_class, "run",
+                          side_effect=RuntimeError("simulated failure")):
+            self._start_single_run(points=3)
+            self._wait_idle()
+        self._assert_button("Start", "green")
+        self.critical.assert_called_once()  # single run: error dialog as before
+
+    def test_button_disabled_while_queue_runs(self):
+        self.add(points=3)
+        self.add(points=3)
+        self.window.run_queue()
+        button = self.window.widget.run_stop_button
+        self.assertFalse(button.isEnabled())
+        self.assertEqual(button.text(), "Queue running")
+        self.assertIn("Stop queue", button.toolTip())
+        self.assertIn("QPushButton:disabled { background-color: #707070;",
+                      button.styleSheet())
+        # Still blocked between the two runs.
+        self.assertTrue(_pump_until(
+            lambda: self.window.queue_entries[0].status == "done"))
+        self.assertEqual(button.text(), "Queue running")
+        self.assertTrue(_pump_until(lambda: not self.window.queue_active()))
+        self._assert_button("Start", "green")
+        self.assertEqual(button.toolTip(), "")
+
+    def test_get_config_defaults_unchanged(self):
+        # The defaults get_config() returned before the layout change.
+        widget = ZeroFieldWidget()
+        self.addCleanup(_dispose, widget)
+        self.assertEqual(widget.get_config(), {
+            "field_start": -2.0, "field_stop": 2.0, "field_points": 5,
+            "field_axis": "X", "settling_time_ms": 100,
+            "post_flip_settling_ms": 500, "averages": 1,
+            "averaging_enabled": False, "num_scans": 1, "save_raw_scans": False,
+            "alternate_direction": False, "reference_enabled": False,
+            "reference_field_gauss": -8.0, "save_data": True,
+        })
 
 
 class QueueModelTests(unittest.TestCase):

@@ -17,6 +17,7 @@ from gui.display_settings import (
     select_colormap,
 )
 from gui import zero_field_queue as queue_model
+from gui.widgets import run_button
 from gui.widgets.zero_field_queue_widget import ZeroFieldQueueWidget
 from gui.widgets.zero_field_widget import ZeroFieldWidget
 from gui.zero_field_queue import QueueEntry, QueueLog
@@ -39,6 +40,9 @@ _OUTPUT_EXTENSION = ".h5"
 # dataOutput.zeroFieldDirectory key (older configs) -- the same directory
 # this window always used before that key existed.
 _DEFAULT_OUTPUT_DIRECTORY = Path(__file__).resolve().parents[1] / "data"
+
+_DEFAULT_WINDOW_SIZE = (1100, 960)
+_TITLE_BAR_ALLOWANCE_PX = 40
 
 # Output file names carry this timestamp (one-second resolution), so the
 # run queue never starts two runs within the same second.
@@ -101,8 +105,16 @@ class ZeroFieldWindow(QMainWindow):
     ):
         super().__init__()
         self.setWindowTitle("Zero-Field Imaging")
-        # Taller than the 650 px used before the run queue (a bottom dock).
-        self.resize(1100, 900)
+        # 1100 x 960 fits a 1920 x 1080 screen with the taskbar visible
+        # (1032 px available; 991 px with the title bar). Clamped to a
+        # smaller screen; below that the controls scroll (minimum height
+        # is about 540 px, set by the plot/queue areas, not the controls).
+        available = self.screen().availableGeometry() if self.screen() else None
+        width, height = _DEFAULT_WINDOW_SIZE
+        if available is not None:
+            width = min(width, available.width())
+            height = min(height, available.height() - _TITLE_BAR_ALLOWANCE_PX)
+        self.resize(width, height)
 
         self.hardware_manager = hardware_manager
         self.hardware = hardware
@@ -164,6 +176,13 @@ class ZeroFieldWindow(QMainWindow):
         # user-chosen location; there's nothing to copy until a scan has
         # produced one.
         self.widget.save_button.setEnabled(False)
+
+        # The run/stop button follows the real run state: run_started and
+        # run_finished, which every exit path (completion, stop, error)
+        # reaches -- not the click.
+        self._run_in_progress = False
+        self.run_started.connect(self._on_run_started_for_button)
+        self.run_finished.connect(self._on_run_finished_for_button)
 
         self._init_queue()
 
@@ -1063,9 +1082,7 @@ class ZeroFieldWindow(QMainWindow):
         row, entry = self._selected_entry()
         count = len(self.queue_entries)
         has_pending = any(e.status == queue_model.PENDING for e in self.queue_entries)
-        # The Run button is the single-run path; the queue owns the window
-        # while it runs.
-        self.widget.run_stop_button.setEnabled(not active)
+        self._update_run_button()
         q.run_queue_button.setEnabled(not active and not self.zero_field_running and has_pending)
         q.stop_current_button.setEnabled(active and self.zero_field_running)
         q.stop_queue_button.setEnabled(active)
@@ -1077,6 +1094,27 @@ class ZeroFieldWindow(QMainWindow):
         q.load_into_form_button.setEnabled(entry is not None)
         q.save_queue_button.setEnabled(count > 0)
         q.load_queue_button.setEnabled(not active)
+
+    # ---- run/stop button ------------------------------------------------
+
+    def _on_run_started_for_button(self):
+        self._run_in_progress = True
+        self._update_run_button()
+
+    def _on_run_finished_for_button(self):
+        self._run_in_progress = False
+        self._update_run_button()
+
+    def _update_run_button(self):
+        """The Run button is the single-run path; the queue owns the window
+        while it runs, so the button is then disabled ("Queue running")."""
+        if self._queue_active:
+            state = run_button.BLOCKED
+        elif self._run_in_progress:
+            state = run_button.RUNNING
+        else:
+            state = run_button.IDLE
+        self.widget.set_run_button_state(state)
 
     def closeEvent(self, event):
         # MainWindow is the close gatekeeper (it waits for worker threads
