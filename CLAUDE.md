@@ -101,6 +101,7 @@ Both selectors offer the same list: `gui/display_settings.py::COLORMAP_NAMES` (G
 
 **`averages` now means independent full sweeps, not repeats of one point.** Before, `ODMRWorker` looped `averages` times inside each frequency point. Now it walks the whole frequency list once per average.
 - The live curve is the running mean over sweeps acquired so far.
+- **The ODMR plot is deliberately not live-plotted per point; do not change that.** A half-finished sweep must never be mixed into the displayed running mean. As the code stands, `ODMRWindow` only stores each `point_signal` (whose per-point mean already includes the in-progress sweep) and redraws when the scan finishes (`odmr_finished()`), on Fit, or on a plot-mode change — there is no redraw after each completed sweep, and a plot-mode change mid-scan does draw the partial sweep.
 - `n_points * averages` acquisitions, so `estimate_odmr_time()` is unchanged in form.
 - Every average must have the same repeat count, or the worker raises.
 
