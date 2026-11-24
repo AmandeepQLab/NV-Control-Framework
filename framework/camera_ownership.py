@@ -94,6 +94,18 @@ def exclusive_camera_access(camera):
                     state.experiment_lock.release()
 
 
+def experiment_owns_camera(camera):
+    """Whether an imaging experiment currently holds *camera* (read-only).
+
+    Deliberately lock-free: exclusive_camera_access() holds state_lock
+    while it waits for the GUI thread to suspend the live-view timer, so a
+    GUI-thread caller that blocked on that lock would deadlock. Reading
+    one bool is atomic; the answer may be a moment stale, which display
+    code (the main window's count statistics) tolerates.
+    """
+    return bool(_get_state(camera).experiment_owns_camera)
+
+
 def start_live_stream_if_available(camera):
     """Start live view unless an imaging experiment currently owns *camera*.
 

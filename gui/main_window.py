@@ -22,6 +22,7 @@ from gui.zero_field_window import ZeroFieldWindow
 from gui.pyqtgraph_teardown import clear_view_registry
 from framework.camera_ownership import (
     apply_live_acquisition_state,
+    experiment_owns_camera,
     register_camera_state_restorer,
     register_live_view_controller,
     start_live_stream_if_available,
@@ -33,6 +34,7 @@ from framework.acquisition_state import (
 )
 from framework.roi import validate_roi
 from gui.live_view_controller import LiveViewTimerController
+from gui.widgets.count_statistics_panel import CountStatisticsPanel
 from gui.display_settings import (
     COLORMAP_NAMES,
     LIVE_VIEW_COLORMAP_KEY,
@@ -435,6 +437,14 @@ class MainWindow(QMainWindow):
         right_panel.addWidget(self.image_view, 3)
         self._init_live_view_colormap()
 
+        # Statistics of the live-view mean counts. It only consumes frames
+        # update_image() already received; it never touches the camera.
+        self.count_statistics_panel = CountStatisticsPanel(
+            settings_getter=self.get_acquisition_state,
+            camera_owned=lambda: experiment_owns_camera(self.camera),
+        )
+        right_panel.addWidget(self.count_statistics_panel, 1)
+
         # ROI overlay
         self.roi = pg.RectROI(
             [50, 50],
@@ -687,6 +697,7 @@ class MainWindow(QMainWindow):
         frame = self.camera.get_latest_frame()
 
         if frame is not None:
+            self.count_statistics_panel.add_frame(frame)
             self._update_sensor_dimensions_from_full_frame(frame)
             log_event("gui_image_update", source="live stream", image_target="main live-view image")
             effective_roi = self.acquisition_state.effective_roi
@@ -1193,6 +1204,11 @@ class MainWindow(QMainWindow):
 
         # Stop live view safely
         self.stop_stream()
+
+        # Close the count-statistics CSV log, if one is open.
+        panel = getattr(self, "count_statistics_panel", None)
+        if panel is not None:
+            panel.close_log()
 
         # Close experiment windows; no scan is running by now, so each
         # window accepts its close.

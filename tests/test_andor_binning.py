@@ -1,7 +1,7 @@
 """Hardware-free regression tests for Andor SDK3 binning and AOI limits."""
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -254,6 +254,7 @@ class BinnedImagePresentationTests(unittest.TestCase):
                 self.size = size
 
         harness = type("WindowHarness", (), {})()
+        harness.count_statistics_panel = Mock()  # update_image() feeds it
         harness.acquisition_state = AcquisitionState((402, 300, 1206, 900), 0.02, 2)
         harness._sensor_dimensions = (2048, 2048)
         harness.roi_coordinate_spins = {
@@ -300,6 +301,7 @@ class BinnedImagePresentationTests(unittest.TestCase):
                 self.labels.append((axis, label))
 
         harness = type("WindowHarness", (), {})()
+        harness.count_statistics_panel = Mock()  # update_image() feeds it
         harness.camera = type("Camera", (), {"get_latest_frame": lambda self: frame})()
         harness.acquisition_state = AcquisitionState((402, 300, 1206, 900), 0.02, 2)
         harness.image_view = FakeImageView()
@@ -350,6 +352,7 @@ class BinnedImagePresentationTests(unittest.TestCase):
                 self.labels.append((axis, label))
 
         harness = type("WindowHarness", (), {})()
+        harness.count_statistics_panel = Mock()  # update_image() feeds it
         harness.image_view = FakeImageView()
         harness.image_plot = FakePlot()
         harness._update_pixel_axes = lambda binning: MainWindow._update_pixel_axes(
@@ -379,6 +382,7 @@ class BinnedImagePresentationTests(unittest.TestCase):
     def test_roi_edit_coordinates_convert_back_to_physical_sensor_pixels(self):
         camera = SimCamera(image_shape=(2048, 2048))
         harness = type("WindowHarness", (), {})()
+        harness.count_statistics_panel = Mock()  # update_image() feeds it
         harness.camera = camera
         harness.acquisition_state = AcquisitionState(None, 0.02, 2)
         harness._sensor_dimensions = camera.image_shape[::-1]
