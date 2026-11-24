@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import QMainWindow, QMessageBox, QDialog # type: ignore
 from PyQt6.QtCore import QThread, pyqtSignal # type: ignore
 
 from gui.panels.odmr_panel import ODMRPanel
+from gui.widgets import run_button
 from gui.widgets.initial_fit_parameters_dialog import (
     InitialFitParametersDialog,
     check_manual_locations_in_range,
@@ -55,6 +56,13 @@ VISA_POINT_OVERHEAD_S = 0.0102
 # Python call overhead), once per triggered frame (2 * repeats per point).
 CAMERA_PER_FRAME_OVERHEAD_S = 0.0132
 
+# 1200 x 900 fits a 1920 x 1080 screen with the taskbar visible (1032 px
+# available; 991 px with the title bar) and shows the collapsed controls
+# without scrolling. Clamped to a smaller screen; below that, and with the
+# Dense/Delays sections expanded, the controls scroll.
+_DEFAULT_WINDOW_SIZE = (1200, 900)
+_TITLE_BAR_ALLOWANCE_PX = 40
+
 
 class ODMRWindow(QMainWindow):
 
@@ -71,7 +79,12 @@ class ODMRWindow(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("ODMR Experiment")
-        self.resize(900, 600)
+        available = self.screen().availableGeometry() if self.screen() else None
+        width, height = _DEFAULT_WINDOW_SIZE
+        if available is not None:
+            width = min(width, available.width())
+            height = min(height, available.height() - _TITLE_BAR_ALLOWANCE_PX)
+        self.resize(width, height)
 
         self.hardware = hardware
         self.camera = camera
@@ -98,6 +111,16 @@ class ODMRWindow(QMainWindow):
         self.panel.plot_mode_combo.currentTextChanged.connect(self.refresh_plot)
         self.panel.fit_button.clicked.connect(self.fit_esr)
         self.panel.initial_fit_parameters_button.clicked.connect(self.supply_initial_fit_parameters)
+
+        # The run/stop button follows the real run state: run_started and
+        # run_finished, which every exit path (completion, stop, error)
+        # reaches -- not the click. Same as the Zero Field window.
+        self.run_started.connect(
+            lambda: self.panel.set_run_button_state(run_button.RUNNING)
+        )
+        self.run_finished.connect(
+            lambda: self.panel.set_run_button_state(run_button.IDLE)
+        )
 
     # =====================================================
     # RUN / STOP TOGGLE
@@ -172,7 +195,6 @@ class ODMRWindow(QMainWindow):
         )
 
         self.odmr_running = True
-        self.panel.set_running_state(True)
 
         self.panel.reset_plot()
         self.panel.fit_button.setEnabled(False)
@@ -434,8 +456,7 @@ class ODMRWindow(QMainWindow):
         self.odmr_running = False
         # First, so a failure in statistics/saving below can't leave the
         # magnet control window locked.
-        self.run_finished.emit()
-        self.panel.set_running_state(False)
+        self.run_finished.emit()  # also returns the run button to "Start"
 
         statistics_cube = getattr(self.odmr_worker, "statistics_cube", None)
         set_statistics_status = getattr(self.panel, "set_statistics_status", None)

@@ -415,11 +415,22 @@ No experiment, worker, magnet or hardware file was changed for it.
   - Every other control is below it in `control_scroll_area`, a `QScrollArea` set up exactly like the ODMR panel's: resizable, vertical scrollbar as needed, horizontal always off. Its widget is the "Zero Field Parameters" group (`controls_group`), with the groups in their original order.
   - The scroll area's minimum width is the controls' size hint plus the scrollbar, so nothing is clipped horizontally.
   - The plot, the image and the bottom "Run Queue" dock are outside it.
-- **Run/stop button.** It is one toggle driving `toggle_scan()`. Its styling is shared with the ODMR run button: `gui/widgets/run_button.py::style_run_button()`, where IDLE is green, RUNNING red and BLOCKED grey and disabled. Text and background colours are both explicit, so it reads the same in light and dark themes. The ODMR button keeps its own texts and colours.
+- **Run/stop button.** It is one toggle driving `toggle_scan()`. Its styling is shared with the ODMR run button: `gui/widgets/run_button.py::style_run_button()`, where IDLE is green, RUNNING red and BLOCKED grey and disabled. Text and background colours are both explicit, so it reads the same in light and dark themes. The ODMR button now uses the same texts and colours (see "ODMR window layout").
   - Idle: "Start", green. Running: "Stop", red. A running queue: "Queue running", grey, disabled.
   - It follows the window's `run_started`/`run_finished` signals (`_update_run_button()`), not the click, so completion, stop and error all return it to "Start".
   - `ZeroFieldWidget.set_running_state()` now only sets the status line.
 - **Default size** is 1100×960. That fits 1920×1080 with the taskbar visible (1032 px available, 991 px with the title bar), and it is clamped to a smaller screen. The window's minimum height is about 540 px, set by the plot and queue areas; below the default height the controls scroll.
+
+## ODMR window layout
+
+Same shape as the Zero Field window.
+- **Left column** (`ODMRPanel.left_panel`): the run/stop button fixed at the top, and below it `control_scroll_area` (vertical scrollbar as needed, horizontal always off) holding the "ODMR Parameters" group (`control_box`) with every other control in its original order. The plot is outside it.
+  - The scroll area's minimum width is the controls' size hint **measured with the Dense ESR Region, Dip 2 and Delays sections shown**, plus the scrollbar, so expanding them never clips horizontally.
+- **Run/stop button.** One toggle driving `ODMRWindow.toggle_odmr()`; Stop goes through the unchanged `stop_odmr()` path. Styled by `ODMRPanel.set_run_button_state()` with the shared `style_run_button()`: idle "Start" on green, running "Stop" on red (previously "Run ODMR"/"Stop ODMR").
+  - It follows the window's own `run_started`/`run_finished` signals, not the click. `run_finished` is emitted from `odmr_finished()`, which the worker's `finished_signal` reaches on completion, stop and error, so all three return it to "Start".
+  - `ODMRPanel.set_running_state()` was removed; `run_odmr()`/`odmr_finished()` no longer style the button directly.
+- **Default size** is 1200×900, clamped to the screen's available area (minus 40 px for the title bar). It fits 1920×1080 with the taskbar and shows the collapsed controls (about 734 px) without scrolling; expanded sections (about 1252 px) and smaller windows scroll.
+- Controls, defaults and `get_config()` are unchanged. **Tests:** `tests/test_odmr_window_layout.py` (real scans on sim hardware).
 
 ## Known hardware quirks (ODMR timing)
 
@@ -455,7 +466,7 @@ These are characterized properties of the current rig/sample, not code facts —
 
 ## Testing safety — read before running pytest with `--hardware`
 
-`tests/` contains 99 test files (excluding `__init__.py`/`conftest.py`). Only 42 are real, hardware-free pytest tests — see `tests/conftest.py::ALLOWED_FILES` for the current, authoritative list rather than a copy here that will drift the next time a file is added to it (as just happened for this change). **The other ~57 are ad-hoc scripts that command real lab hardware — the Andor camera, the SG386 microwave source over VISA, the Swabian pulse streamer, the Helmholtz power supplies — unconditionally at module import time, not just inside a test function.** Several have no `if __name__ == "__main__":` guard at all: importing them fires a relay, streams a pulse, or turns on a power-supply output as a side effect of Python loading the file.
+`tests/` contains 100 test files (excluding `__init__.py`/`conftest.py`). Only 43 are real, hardware-free pytest tests — see `tests/conftest.py::ALLOWED_FILES` for the current, authoritative list rather than a copy here that will drift the next time a file is added to it (as just happened for this change). **The other ~57 are ad-hoc scripts that command real lab hardware — the Andor camera, the SG386 microwave source over VISA, the Swabian pulse streamer, the Helmholtz power supplies — unconditionally at module import time, not just inside a test function.** Several have no `if __name__ == "__main__":` guard at all: importing them fires a relay, streams a pulse, or turns on a power-supply output as a side effect of Python loading the file.
 
 `pytest.ini` (`testpaths = tests`) plus `tests/conftest.py`'s `pytest_ignore_collect` hook gate this: a bare `pytest` run only collects the files named in `ALLOWED_FILES`. The gate is an allowlist, not a denylist — anything not explicitly named there is excluded from collection entirely, so it is never imported. Passing `--hardware` lifts the restriction and collects everything, including every hardware-commanding script.
 

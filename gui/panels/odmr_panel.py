@@ -99,6 +99,19 @@ class ODMRPanel(QWidget):
         main_layout = QHBoxLayout()
         self.setLayout(main_layout)
 
+        # Left column, as in the Zero Field window: the run/stop button
+        # fixed at the top, and every other control in a vertically
+        # scrolling area below it, so the button stays visible at any
+        # window height.
+        self.left_panel = QWidget()
+        left_layout = QVBoxLayout(self.left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.addWidget(self.left_panel, 1)
+
+        self.run_stop_button = QPushButton()
+        self.set_run_button_state(run_button.IDLE)
+        left_layout.addWidget(self.run_stop_button)
+
         self.control_box = QGroupBox("ODMR Parameters")
 
         odmr_layout = QVBoxLayout()
@@ -113,7 +126,7 @@ class ODMRPanel(QWidget):
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
         self.control_scroll_area.setWidget(self.control_box)
-        main_layout.addWidget(self.control_scroll_area, 1)
+        left_layout.addWidget(self.control_scroll_area, 1)
 
         self.fstart_spin = self._add_double(odmr_layout, "Start (GHz):", 0, 10, 6, 2.77)
         self.fstop_spin = self._add_double(odmr_layout, "Stop (GHz):", 0, 10, 6, 2.97)
@@ -326,10 +339,6 @@ class ODMRPanel(QWidget):
         odmr_layout.addWidget(self.analysis_button)
         self.analysis_button.clicked.connect(self.analysis_requested.emit)
 
-        self.run_stop_button = QPushButton()
-        style_run_button(self.run_stop_button, run_button.IDLE, "Run ODMR")
-        odmr_layout.addWidget(self.run_stop_button)
-
         self.sequence_button = QPushButton("Show Pulse Sequence")
         odmr_layout.addWidget(self.sequence_button)
 
@@ -347,6 +356,22 @@ class ODMRPanel(QWidget):
         odmr_layout.addWidget(self.time_label)
 
         odmr_layout.addStretch()
+
+        # Horizontal scrolling is off, so the column must be at least as
+        # wide as the controls want -- measured with the collapsible
+        # sections shown, so expanding them never clips -- plus room for
+        # the vertical scrollbar.
+        collapsible = (self.dense_group, self.dip2_group, self.delays_group)
+        for group in collapsible:
+            group.setVisible(True)
+        controls_width = self.control_box.sizeHint().width()
+        for group in collapsible:
+            group.setVisible(False)
+        self.control_scroll_area.setMinimumWidth(
+            controls_width
+            + self.control_scroll_area.verticalScrollBar().sizeHint().width()
+            + 2 * self.control_scroll_area.frameWidth()
+        )
 
         plot_box = QGroupBox("ODMR Plot")
         main_layout.addWidget(plot_box, 4)
@@ -409,11 +434,13 @@ class ODMRPanel(QWidget):
         self.statistics_dialog.raise_()
         self.statistics_dialog.activateWindow()
 
-    def set_running_state(self, running):
-        if running:
-            style_run_button(self.run_stop_button, run_button.RUNNING, "Stop ODMR")
-        else:
-            style_run_button(self.run_stop_button, run_button.IDLE, "Run ODMR")
+    # Same texts and shared styling as the Zero Field window's button.
+    RUN_BUTTON_TEXT = {run_button.IDLE: "Start", run_button.RUNNING: "Stop"}
+
+    def set_run_button_state(self, state):
+        """IDLE: "Start", green. RUNNING: "Stop", red. Driven by the
+        window's run_started/run_finished signals, not the click."""
+        style_run_button(self.run_stop_button, state, self.RUN_BUTTON_TEXT[state])
 
     def toggle_dense_section(self, checked):
         self.dense_group.setVisible(checked)
