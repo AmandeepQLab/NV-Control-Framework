@@ -532,7 +532,7 @@ class ControlPanelLayoutTests(QueueWindowTestCase):
         self.assertEqual(
             groups,
             ["Output Directory", "Magnetic Field", "Multi-Scan Averaging",
-             "Camera Acquisition"],
+             "Stability check", "Camera Acquisition"],
         )
         for control in (
             w.output_directory_edit, w.browse_output_button, w.save_data_check,

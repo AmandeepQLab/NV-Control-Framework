@@ -8,6 +8,7 @@ from PyQt6.QtCore import QThread, pyqtSignal # type: ignore
 
 from gui.panels.odmr_panel import ODMRPanel
 from gui.widgets import run_button
+from gui.stability_gate import StabilityWaitController
 from gui.widgets.initial_fit_parameters_dialog import (
     InitialFitParametersDialog,
     check_manual_locations_in_range,
@@ -75,7 +76,8 @@ class ODMRWindow(QMainWindow):
     run_started = pyqtSignal()
     run_finished = pyqtSignal()
 
-    def __init__(self, hardware, camera, acquisition_state_getter):
+    def __init__(self, hardware, camera, acquisition_state_getter,
+                 stability_monitor=None):
         super().__init__()
 
         self.setWindowTitle("ODMR Experiment")
@@ -122,6 +124,16 @@ class ODMRWindow(QMainWindow):
             lambda: self.panel.set_run_button_state(run_button.IDLE)
         )
 
+        # Optional count stability check before a run (gui/stability_gate.py).
+        # Unavailable without the main window's live view (monitor None).
+        self.stability_monitor = stability_monitor
+        self.stability = None
+        if stability_monitor is not None:
+            self.stability = StabilityWaitController(
+                stability_monitor, self.panel.stability_wait_bar, self
+            )
+        self.panel.stability_group.set_available(stability_monitor is not None)
+
     # =====================================================
     # RUN / STOP TOGGLE
     # =====================================================
@@ -130,8 +142,39 @@ class ODMRWindow(QMainWindow):
 
         if self.odmr_running:
             self.stop_odmr()
-        else:
+        elif not self.stability_waiting():
+            self.request_start()
+
+    # =====================================================
+    # STABILITY CHECK BEFORE START
+    # =====================================================
+
+    def stability_waiting(self):
+        return self.stability is not None and self.stability.active
+
+    def request_start(self):
+        """Start a run; with the stability check on, wait for stable counts
+        first. With it off this is exactly run_odmr()."""
+        settings = self.panel.stability_group.get_settings()
+        if not settings.enabled or self.stability is None:
             self.run_odmr()
+            return
+        self.panel.set_run_button_state(run_button.BLOCKED)
+        self.stability.begin(settings, self._stability_passed, self._stability_cancelled)
+
+    def _stability_passed(self, record):
+        self.panel.set_run_button_state(run_button.IDLE)
+        self.run_odmr(stability_record=record)
+
+    def _stability_cancelled(self, record):
+        self.panel.set_run_button_state(run_button.IDLE)
+        self.panel.time_label.setText(
+            f"Not started: stability check {record['stability_outcome']}"
+        )
+
+    def cancel_stability_wait(self):
+        if self.stability_waiting():
+            self.stability.cancel()
 
     # =====================================================
     # DISPLAY PULSE SEQUENCE
@@ -171,7 +214,7 @@ class ODMRWindow(QMainWindow):
     # RUN ODMR
     # =====================================================
 
-    def run_odmr(self):
+    def run_odmr(self, stability_record=None):
 
         acquisition_state = self.acquisition_state_getter()
         acquisition_roi = acquisition_state.acquisition_roi
@@ -179,6 +222,9 @@ class ODMRWindow(QMainWindow):
         config = self.panel.get_config()
         config["exposure_s"] = acquisition_state.exposure_s
         config["baseline_counts"] = acquisition_state.baseline_counts
+        # Recorded in config.json and the statistics cube's metadata. With
+        # the check off this is the only addition: stability_check_enabled.
+        config.update(stability_record or {"stability_check_enabled": False})
 
         self.current_config = config.copy()
 
@@ -251,7 +297,9 @@ class ODMRWindow(QMainWindow):
         return self.odmr_thread
 
     def request_stop(self):
-        """Ask the running scan to stop; it finishes asynchronously."""
+        """Ask the running scan to stop; it finishes asynchronously. A
+        stability wait (no scan yet) is cancelled."""
+        self.cancel_stability_wait()
         self.stop_odmr()
 
     # =====================================================
@@ -555,4 +603,8 @@ class ODMRWindow(QMainWindow):
             event.ignore()
             return
 
+        # Waiting for stable counts: nothing has started, so cancel the
+        # wait (restoring the live view) and close.
+        if getattr(self, "stability", None) is not None:
+            self.cancel_stability_wait()
         event.accept()

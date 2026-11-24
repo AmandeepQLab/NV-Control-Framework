@@ -110,7 +110,7 @@ class LayoutTests(ODMRWindowLayoutTestCase):
         widgets = [w for w in widgets if w is not None]
         self.assertEqual(widgets, [
             p.dense_check, p.dense_group, p.delays_check, p.delays_group,
-            p.save_check, p.fit_button, p.initial_fit_parameters_button,
+            p.stability_group, p.save_check, p.fit_button, p.initial_fit_parameters_button,
             p.fit_group, p.statistics_group, p.analysis_button,
             p.sequence_button, p.progress_bar, p.freq_label, p.time_label,
         ])

@@ -4,6 +4,10 @@ Assistant-facing guide to this repository. Last verified against the code: 2026-
 
 This file documents how the code actually works, not how it was originally intended to work — every claim below was checked against the current source, not carried forward from comments, commit messages, or prior documentation. If you change something this file describes, update this file in the same change.
 
+## Conventions
+
+- **Every user-facing control must have a tooltip explaining what it does, its units, and when to use it.** (Standing convention, from 2026-11-24. Controls written before then are not all compliant; new and changed controls must be. `tests/test_stability_check.py` checks it for the stability-check controls.)
+
 ## What this is
 
 NV Control Framework — Python/PyQt6 control software for nitrogen-vacancy (NV) center quantum sensing experiments in diamond. Currently drives: an SRS SG386 microwave source (VISA/TCP), a Swabian Pulse Streamer 8/2 (vendor `pulsestreamer` SDK), an Andor Neo 5.5 sCMOS camera (`andor3` SDK3 wrapper), and a Helmholtz electromagnet built from Keysight/HP E3631A/E3632A power supplies over serial (SCPI). Real ODMR and Zero Field magnetometry experiments run against this hardware today.
@@ -366,11 +370,12 @@ No experiment, worker, magnet or hardware file was changed for it.
 - "Add to queue" snapshots `ZeroFieldWidget.get_config()` (a deep copy) plus the window's `output_directory`, so later form edits never change an entry.
 - The add runs the same `_preflight_field_range()` as the Run button, with its dialog, and an unreachable entry is not added.
 - Other buttons: Remove (not the running entry), Move up/down, Duplicate, "Clear pending" (pending entries only), and "Load entry into form" (`ZeroFieldWidget.set_config()` plus the output directory).
-- Statuses: pending / running / done / stopped / failed.
+- Statuses: pending / running / done / stopped / failed / skipped (unstable). The last comes from the count stability check (see "Count stability check before experiments"); it is not a failure, so "On failure" does not apply and the queue continues.
+- Each entry also snapshots the form's stability-check settings (`QueueEntry.stability`, a `StabilitySettings`), kept apart from `config` so `config` stays exactly `get_config()`. The summary gains ", stability ≤x% ≤y%/min over w s" only when the check is on.
 - There is **no duration estimate**. The config does not determine it: exposure lives in the main window, and relay-flip count and SCPI pacing depend on the sweep path.
 
 **Queue files.**
-- "Save queue…" writes JSON: `format: "nv_control.zero_field_queue"`, `version: 1`, `pause_between_runs_s`, `on_failure`, and each entry's `config` + `output_directory`. Run status is not saved.
+- "Save queue…" writes JSON: `format: "nv_control.zero_field_queue"`, `version: 1`, `pause_between_runs_s`, `on_failure`, and each entry's `config` + `output_directory` + `stability` (the `StabilitySettings` as an object). Run status is not saved. `stability` is optional on load (validated by `StabilitySettings.from_dict()`); files written before it existed load with the check off, and the version stays 1.
 - "Load queue…" replaces the list with all-pending entries. It is refused as a whole (nothing partially loaded) if the file is invalid, if any entry is missing a `get_config()` key or has the wrong type (`CONFIG_TYPES`), or if any entry fails the field-range check.
 
 **Execution: one start path.**
@@ -400,7 +405,7 @@ No experiment, worker, magnet or hardware file was changed for it.
 
 **Queue log.**
 - File: `zero_field_queue_<timestamp>.csv`, created when the queue starts, in the first pending entry's output directory. It is UTF-8 with a BOM, so Excel shows "→".
-- Columns (`LOG_COLUMNS`): index (1-based list position when the entry started), status, start_time, end_time, duration_s, output_file, first_frame_mean_counts, summary, message.
+- Columns (`LOG_COLUMNS`): index (1-based list position when the entry started), status, start_time, end_time, duration_s, output_file, first_frame_mean_counts, summary, message, then the stability fields: stability_check_enabled, stability_outcome ("not used" when off), stability_std_percent, stability_drift_percent_per_min, stability_wait_s, and the limits (stability_window_s, stability_max_std_percent, stability_max_drift_percent_per_min, stability_timeout_s, stability_on_timeout; blank when off).
 - One row per finished entry (done/stopped/failed, including a start refused by validation), appended and flushed as it finishes, so a crash keeps completed rows.
 - `first_frame_mean_counts` is `mean_fluorescence()` of the first live-update image: scan 1, point 1, the signal frame averaged over that point's repeats.
 - If the log can't be created, the queue still runs and the error is logged.
@@ -416,6 +421,7 @@ No experiment, worker, magnet or hardware file was changed for it.
   - Every other control is below it in `control_scroll_area`, a `QScrollArea` set up exactly like the ODMR panel's: resizable, vertical scrollbar as needed, horizontal always off. Its widget is the "Zero Field Parameters" group (`controls_group`), with the groups in their original order.
   - The scroll area's minimum width is the controls' size hint plus the scrollbar, so nothing is clipped horizontally.
   - The plot, the image and the bottom "Run Queue" dock are outside it.
+  - Below the scroll area, the stability-check wait bar (hidden unless waiting; see "Count stability check before experiments").
 - **Run/stop button.** It is one toggle driving `toggle_scan()`. Its styling is shared with the ODMR run button: `gui/widgets/run_button.py::style_run_button()`, where IDLE is green, RUNNING red and BLOCKED grey and disabled. Text and background colours are both explicit, so it reads the same in light and dark themes. The ODMR button now uses the same texts and colours (see "ODMR window layout").
   - Idle: "Start", green. Running: "Stop", red. A running queue: "Queue running", grey, disabled.
   - It follows the window's `run_started`/`run_finished` signals (`_update_run_button()`), not the click, so completion, stop and error all return it to "Start".
@@ -434,12 +440,59 @@ A "Count statistics" panel under the live view, like a power meter's statistics 
 - **Settings change resets.** A change of the main window's ROI, exposure or binning (`AcquisitionState`) resets the statistics and says which, e.g. "Statistics reset: exposure 10 → 20 ms at 15:12:10". The first new frame after a change is also skipped, since `get_latest_frame()` may still hold one taken with the old settings.
 - **"Log to CSV".** While accumulating: `data/count_log_<YYYY-MM-DD_HH-MM-SS>.csv` (gitignored), columns `timestamp, mean_counts, exposure_ms, binning, roi` (`roi` "x0 y0 x1 y1" in sensor pixels or "full"), one row per accepted sample, flushed per row so a crash keeps them. Stop or unticking closes the file; the next Start opens a new one. A write error stops logging and is shown in the panel, never raised into the live view. Closed in `_shutdown_hardware()`.
 - **Cost, measured with `--sim` (2026-11-24):** `update_image()` median 0.297 ms with the panel vs 0.280 ms without (64×64 sim frames). `frame_sample()` on uint16: 2.9 ms for a full 2560×2160 Neo frame, 0.23 ms for 800×600 (an exact int64 sum; float64 was 3.7 ms). For comparison, `ImageView.setImage` + paint of a full frame took 14 ms.
+- **Signals for other consumers:** `sample_accepted(t, value)` for every accepted frame (accumulating or not; `t` on the panel's `clock`) and `samples_invalidated(reason)` on a settings change. The pre-experiment stability check uses them instead of computing its own samples.
 - **Tests:** `tests/test_count_statistics.py`, including the real `MainWindow(sim=True)` with `exclusive_camera_access()`.
+
+## Count stability check before experiments
+
+**Why.** Fluorescence wanders by ~1 % with 25–40 s oscillations when focus or air flow is unsettled, enough to spoil a long run. Optionally, a run waits until the live counts are stable, at the cost of time.
+
+**Where the code is.**
+- `framework/stability.py` (GUI-free): `StabilitySettings`, `window_statistics()`, `evaluate()`, `record()`, `status_text()`.
+- `gui/stability_gate.py`: `StabilityMonitor` (one per app), `StabilityCheck` (one per wait), `StabilityWaitController` (per window).
+- `gui/widgets/stability_check_group.py`: `StabilitySettingsGroup` ("Stability check" group) and `StabilityWaitBar`.
+
+**Samples.** The same per-frame mean counts as the count-statistics panel: `CountStatisticsPanel.sample_accepted(t, value)` fires for every accepted live frame (repeats already dropped), and `samples_invalidated` on an ROI/exposure/binning change, which restarts the check's window. Nothing here touches the camera.
+
+**Live view.** `StabilityMonitor` is built by `MainWindow` with `start_stream()`/`stop_stream()`/`timer.isActive()`. If the live view is off when a check begins, it is started; when the last check ends it is stopped again — **before** the experiment is started, which then takes the camera as usual. A running live view is left running.
+
+**Rule** (`evaluate()`), over samples with `now − window_s < t ≤ now`:
+- relative std = sample SD (ddof=1) / mean × 100 ≤ "Max std (%)";
+- |drift| = |least-squares slope| × 60 / mean × 100 ≤ "Max drift (%/min)" (limits inclusive);
+- and the window is really covered: `window_s` since the check (or last settings reset) began, ≥ 10 samples, first sample ≤ 2 s after the window start, newest ≤ 2 s old.
+- Evaluated at 4 Hz. Timeout from the check's start: "Start anyway" (default) starts, "Cancel this run" does not.
+
+**Controls** (ODMR panel after "Delays"; Zero Field after "Multi-Scan Averaging"; all with tooltips): "Check count stability before start" (default off), "Window (s)" 60, "Max std (%)" 0.30, "Max drift (%/min)" 0.50, "Timeout (s)" 600, "On timeout". The fields are enabled only with the box checked.
+- **Not part of `get_config()`**: they decide when a run starts, not how it scans. Like the windows' other settings they live in the form for the window's lifetime; nothing is written to `setupInfo.json`.
+- A window built without a monitor (tests, `hardware_manager=None` harnesses) disables the group.
+
+**While waiting** the run button is grey and disabled, "Waiting for stable counts". The wait bar below the scroll area (outside it, always visible) shows e.g. "Waiting for stable counts: std 0.62% (limit 0.30%), drift −0.80%/min (limit 0.50%/min), window 45/60 s, 45 s elapsed (timeout 600 s)", with "Start anyway" and "Cancel".
+- Zero Field also mirrors the line in its status label. The form is snapshotted at the click.
+- Zero Field checks the field range **before** waiting.
+- Closing the window, or `request_stop()`, cancels a wait. No `run_started` is emitted until the run really starts, so the magnet lock and `MainWindow`'s worker registry are unaffected.
+
+**Start paths.**
+- ODMR: `toggle_odmr()` → `request_start()` → wait → `run_odmr(stability_record=...)`.
+- Zero Field: `start_scan()` → wait → `_start_run(..., stability_record=...)`.
+- With the box off both call exactly what they called before (`run_odmr()`, `_start_run(config, output_directory)`); a queue entry without the check calls `_start_run(..., interactive=False)` with no extra argument.
+
+**Metadata.** `record()`'s keys: `stability_check_enabled`, `stability_window_s`, `stability_max_std_percent`, `stability_max_drift_percent_per_min`, `stability_timeout_s`, `stability_on_timeout`, `stability_outcome` ("passed", "timed out, started anyway", "started anyway by user"), `stability_std_percent` / `stability_drift_percent_per_min` (over the window at the moment of the decision; null if not computable), `stability_wait_s`.
+- ODMR: added to the run's config, so they are in `config.json` and the statistics cube's metadata.
+- Zero Field: top-level keys of every saved file's metadata, not inside `scan_parameters`.
+- **With the check off the only addition is `stability_check_enabled: false`** (that is how "not used" is recorded in files).
+
+**Queue.**
+- Each entry is checked with its own settings just before it starts, after the pause. The wait line goes to the queue status, the window status and the wait bar; no dialogs.
+- Timeout with "Cancel this run" → "skipped (unstable)", message "not stable within T s (std …, drift …)", and the queue continues.
+- "Cancel" or "Stop current run" during a wait → stopped ("cancelled during stability check"), and the queue continues. "Stop queue" during a wait → stopped ("queue stopped during stability check"), and the rest stay pending.
+- The finished summary adds ", N skipped (unstable)" only when N > 0.
+
+**Tests:** `tests/test_stability_check.py`. Two existing layout tests that list every control group (`test_odmr_window_layout.py`, `test_zero_field_queue.py`) now include "Stability check".
 
 ## ODMR window layout
 
 Same shape as the Zero Field window.
-- **Left column** (`ODMRPanel.left_panel`): the run/stop button fixed at the top, and below it `control_scroll_area` (vertical scrollbar as needed, horizontal always off) holding the "ODMR Parameters" group (`control_box`) with every other control in its original order. The plot is outside it.
+- **Left column** (`ODMRPanel.left_panel`): the run/stop button fixed at the top, and below it `control_scroll_area` (vertical scrollbar as needed, horizontal always off) holding the "ODMR Parameters" group (`control_box`) with every other control in its original order (plus the "Stability check" group after Delays). The plot is outside it. Below the scroll area is the stability-check wait bar, hidden unless waiting.
   - The scroll area's minimum width is the controls' size hint **measured with the Dense ESR Region, Dip 2 and Delays sections shown**, plus the scrollbar, so expanding them never clips horizontally.
 - **Run/stop button.** One toggle driving `ODMRWindow.toggle_odmr()`; Stop goes through the unchanged `stop_odmr()` path. Styled by `ODMRPanel.set_run_button_state()` with the shared `style_run_button()`: idle "Start" on green, running "Stop" on red (previously "Run ODMR"/"Stop ODMR").
   - It follows the window's own `run_started`/`run_finished` signals, not the click. `run_finished` is emitted from `odmr_finished()`, which the worker's `finished_signal` reaches on completion, stop and error, so all three return it to "Start".
@@ -481,7 +534,7 @@ These are characterized properties of the current rig/sample, not code facts —
 
 ## Testing safety — read before running pytest with `--hardware`
 
-`tests/` contains 101 test files (excluding `__init__.py`/`conftest.py`). Only 44 are real, hardware-free pytest tests — see `tests/conftest.py::ALLOWED_FILES` for the current, authoritative list rather than a copy here that will drift the next time a file is added to it (as just happened for this change). **The other ~57 are ad-hoc scripts that command real lab hardware — the Andor camera, the SG386 microwave source over VISA, the Swabian pulse streamer, the Helmholtz power supplies — unconditionally at module import time, not just inside a test function.** Several have no `if __name__ == "__main__":` guard at all: importing them fires a relay, streams a pulse, or turns on a power-supply output as a side effect of Python loading the file.
+`tests/` contains 102 test files (excluding `__init__.py`/`conftest.py`). Only 45 are real, hardware-free pytest tests — see `tests/conftest.py::ALLOWED_FILES` for the current, authoritative list rather than a copy here that will drift the next time a file is added to it (as just happened for this change). **The other ~57 are ad-hoc scripts that command real lab hardware — the Andor camera, the SG386 microwave source over VISA, the Swabian pulse streamer, the Helmholtz power supplies — unconditionally at module import time, not just inside a test function.** Several have no `if __name__ == "__main__":` guard at all: importing them fires a relay, streams a pulse, or turns on a power-supply output as a side effect of Python loading the file.
 
 `pytest.ini` (`testpaths = tests`) plus `tests/conftest.py`'s `pytest_ignore_collect` hook gate this: a bare `pytest` run only collects the files named in `ALLOWED_FILES`. The gate is an allowlist, not a denylist — anything not explicitly named there is excluded from collection entirely, so it is never imported. Passing `--hardware` lifts the restriction and collects everything, including every hardware-commanding script.
 

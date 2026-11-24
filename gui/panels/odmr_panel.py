@@ -12,6 +12,7 @@ from PyQt6.QtGui import QFontDatabase
 
 from gui.widgets import run_button
 from gui.widgets.run_button import style_run_button
+from gui.widgets.stability_check_group import StabilitySettingsGroup, StabilityWaitBar
 
 # Moved to a shared module (also used by the ODMR analysis window);
 # re-exported here so existing imports keep working.
@@ -127,6 +128,11 @@ class ODMRPanel(QWidget):
         )
         self.control_scroll_area.setWidget(self.control_box)
         left_layout.addWidget(self.control_scroll_area, 1)
+
+        # Stability-check wait line, fixed below the scroll area; shown
+        # only while waiting for stable counts.
+        self.stability_wait_bar = StabilityWaitBar()
+        left_layout.addWidget(self.stability_wait_bar)
 
         self.fstart_spin = self._add_double(odmr_layout, "Start (GHz):", 0, 10, 6, 2.77)
         self.fstop_spin = self._add_double(odmr_layout, "Stop (GHz):", 0, 10, 6, 2.97)
@@ -279,6 +285,9 @@ class ODMRPanel(QWidget):
             "hardware."
         )
         self.delays_group.setVisible(False)
+
+        self.stability_group = StabilitySettingsGroup()
+        odmr_layout.addWidget(self.stability_group)
 
         self.save_check = QCheckBox("Save data")
         self.save_check.setChecked(False)
@@ -435,12 +444,21 @@ class ODMRPanel(QWidget):
         self.statistics_dialog.activateWindow()
 
     # Same texts and shared styling as the Zero Field window's button.
-    RUN_BUTTON_TEXT = {run_button.IDLE: "Start", run_button.RUNNING: "Stop"}
+    RUN_BUTTON_TEXT = {
+        run_button.IDLE: "Start",
+        run_button.RUNNING: "Stop",
+        run_button.BLOCKED: "Waiting for stable counts",
+    }
+    WAITING_TOOLTIP = "Use \"Start anyway\" or \"Cancel\" below the controls."
 
     def set_run_button_state(self, state):
         """IDLE: "Start", green. RUNNING: "Stop", red. Driven by the
-        window's run_started/run_finished signals, not the click."""
-        style_run_button(self.run_stop_button, state, self.RUN_BUTTON_TEXT[state])
+        window's run_started/run_finished signals, not the click. BLOCKED:
+        grey and disabled while the stability check waits."""
+        style_run_button(
+            self.run_stop_button, state, self.RUN_BUTTON_TEXT[state],
+            self.WAITING_TOOLTIP if state == run_button.BLOCKED else "",
+        )
 
     def toggle_dense_section(self, checked):
         self.dense_group.setVisible(checked)

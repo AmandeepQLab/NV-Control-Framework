@@ -24,6 +24,7 @@ from experiments.zero_field_experiment import VECTOR_AXIS, unit_direction
 from gui.image_inspection import line_profile, pixel_value
 from gui.widgets import run_button
 from gui.widgets.run_button import style_run_button
+from gui.widgets.stability_check_group import StabilitySettingsGroup, StabilityWaitBar
 
 
 class ZeroFieldWidget(QWidget):
@@ -62,6 +63,11 @@ class ZeroFieldWidget(QWidget):
         )
         self.control_scroll_area.setWidget(controls)
         left_layout.addWidget(self.control_scroll_area, 1)
+
+        # Stability-check wait line, fixed below the scroll area; shown
+        # only while waiting for stable counts.
+        self.stability_wait_bar = StabilityWaitBar()
+        left_layout.addWidget(self.stability_wait_bar)
 
         output_group = QGroupBox("Output Directory")
         output_group_layout = QVBoxLayout(output_group)
@@ -250,6 +256,12 @@ class ZeroFieldWidget(QWidget):
         self.save_data_check.toggled.connect(self._update_save_raw_scans_enabled)
         self._set_averaging_controls_enabled(False)
         self._update_save_raw_scans_enabled()
+
+        # Optional count stability check before a run (gui/stability_gate.py).
+        # Its settings are not part of get_config(): they decide when a run
+        # starts, not how it scans, and a queue entry snapshots them apart.
+        self.stability_group = StabilitySettingsGroup()
+        control_layout.addWidget(self.stability_group)
 
         camera_group = QGroupBox("Camera Acquisition")
         camera_layout = QVBoxLayout(camera_group)
@@ -611,4 +623,14 @@ class ZeroFieldWidget(QWidget):
         style_run_button(
             self.run_stop_button, state, self.RUN_BUTTON_TEXT[state],
             self.QUEUE_RUNNING_TOOLTIP if state == run_button.BLOCKED else "",
+        )
+
+    WAITING_TEXT = "Waiting for stable counts"
+    WAITING_TOOLTIP = "Use \"Start anyway\" or \"Cancel\" below the controls."
+
+    def set_run_button_waiting(self):
+        """Grey and disabled while a single run's stability check waits."""
+        style_run_button(
+            self.run_stop_button, run_button.BLOCKED, self.WAITING_TEXT,
+            self.WAITING_TOOLTIP,
         )

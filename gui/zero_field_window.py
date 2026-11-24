@@ -22,6 +22,9 @@ from gui.widgets.zero_field_queue_widget import ZeroFieldQueueWidget
 from gui.widgets.zero_field_widget import ZeroFieldWidget
 from gui.zero_field_queue import QueueEntry, QueueLog
 from gui.zero_field_worker import ZeroFieldWorker, ratio_curve
+from gui.stability_gate import StabilityWaitController
+from framework import stability as stability_model
+from framework.stability import StabilitySettings
 from experiments.zero_field_experiment import (
     VECTOR_AXIS,
     ZeroFieldExperiment,
@@ -124,6 +127,7 @@ class ZeroFieldWindow(QMainWindow):
         hardware,
         camera,
         acquisition_state_getter,
+        stability_monitor=None,
     ):
         super().__init__()
         self.setWindowTitle("Zero-Field Imaging")
@@ -206,6 +210,17 @@ class ZeroFieldWindow(QMainWindow):
         self.run_started.connect(self._on_run_started_for_button)
         self.run_finished.connect(self._on_run_finished_for_button)
 
+        # Optional count stability check before a run (gui/stability_gate.py).
+        # Unavailable without the main window's live view (monitor None).
+        self.stability_monitor = stability_monitor
+        self.stability = None
+        if stability_monitor is not None:
+            self.stability = StabilityWaitController(
+                stability_monitor, self.widget.stability_wait_bar, self
+            )
+        self.widget.stability_group.set_available(stability_monitor is not None)
+        self._single_stability_wait = False  # a Run-button wait (not a queue's)
+
         self._init_queue()
 
     def _resolve_default_output_directory(self):
@@ -231,13 +246,52 @@ class ZeroFieldWindow(QMainWindow):
     def toggle_scan(self):
         if self.zero_field_running:
             self.stop_scan()
-        else:
+        elif not self.stability_waiting():
             self.start_scan()
 
     def start_scan(self):
-        self._start_run(self.widget.get_config(), self.output_directory)
+        """Run button. With the stability check on, the form is snapshotted
+        now, the field range is checked, and the run starts once the counts
+        are stable (or per "On timeout"). With it off: exactly _start_run()."""
+        config = self.widget.get_config()
+        output_directory = self.output_directory
+        settings = self.widget.stability_group.get_settings()
+        if not settings.enabled or self.stability is None:
+            self._start_run(config, output_directory)
+            return
+        # Refuse an unreachable sweep before waiting, not after.
+        if not self._preflight_field_range(config):
+            return
+        self._single_stability_wait = True
+        self._update_run_button()
+        self.widget.status_label.setText("Status: Waiting for stable counts")
+        self.stability.begin(
+            settings,
+            on_start=lambda record: self._single_stability_done(
+                config, output_directory, record),
+            on_cancel=self._single_stability_cancelled,
+        )
 
-    def _start_run(self, config, output_directory, interactive=True):
+    # ---- stability check -------------------------------------------------
+
+    def stability_waiting(self):
+        """True while a stability check (single run or queue entry) waits."""
+        return self.stability is not None and self.stability.active
+
+    def _single_stability_done(self, config, output_directory, record):
+        self._single_stability_wait = False
+        self._update_run_button()
+        self._start_run(config, output_directory, stability_record=record)
+
+    def _single_stability_cancelled(self, record):
+        self._single_stability_wait = False
+        self._update_run_button()
+        self.widget.status_label.setText(
+            f"Status: Not started — stability check {record['stability_outcome']}"
+        )
+
+    def _start_run(self, config, output_directory, interactive=True,
+                   stability_record=None):
         """Validate *config* and start its worker; the one start path for
         both the Run button and the run queue.
 
@@ -322,6 +376,9 @@ class ZeroFieldWindow(QMainWindow):
                 "acquisition_roi": acquisition_roi,
             },
         }
+        # Top-level keys of every saved file's metadata. With the check off
+        # the only addition is stability_check_enabled = false.
+        metadata.update(stability_record or {"stability_check_enabled": False})
 
         self.thread = QThread(self)
         self.worker = ZeroFieldWorker(
@@ -428,6 +485,8 @@ class ZeroFieldWindow(QMainWindow):
         Close" needs."""
         if self._queue_active:
             self.stop_queue()
+        elif self.stability_waiting():
+            self.stability.cancel()  # nothing started yet
         else:
             self.stop_scan()
 
@@ -798,7 +857,9 @@ class ZeroFieldWindow(QMainWindow):
         config = self.widget.get_config()
         if not self._preflight_field_range(config):
             return False
-        self.queue_entries.append(QueueEntry.snapshot(config, self.output_directory))
+        self.queue_entries.append(QueueEntry.snapshot(
+            config, self.output_directory, self.widget.stability_group.get_settings()
+        ))
         self._refresh_queue(select=len(self.queue_entries) - 1)
         return True
 
@@ -847,6 +908,7 @@ class ZeroFieldWindow(QMainWindow):
         if entry is None:
             return
         self.widget.set_config(entry.config)
+        self.widget.stability_group.set_settings(entry.stability)
         self.output_directory = Path(entry.output_directory)
         self.widget.set_output_directory(self.output_directory)
 
@@ -966,14 +1028,70 @@ class ZeroFieldWindow(QMainWindow):
         entry.first_frame_mean = None
         entry.start_time = now
         entry.end_time = None
+        entry.stability_result = None
         entry.log_index = self.queue_entries.index(entry) + 1
         self._queue_started.append(entry)
         self._queue_current = entry
         self._refresh_queue()
 
+        if entry.stability.enabled and self.stability is not None:
+            # The entry's own settings, checked now: after the pause between
+            # runs, just before it starts. No dialogs; the wait line goes to
+            # the window's status, the queue status and the wait bar.
+            entry.message = "waiting for stable counts"
+            self._refresh_queue()
+            self.stability.begin(
+                entry.stability,
+                on_start=lambda record: self._launch_queue_entry(entry, record),
+                on_cancel=lambda record: self._queue_stability_cancelled(entry, record),
+                on_status=self._queue_stability_status,
+            )
+            return
+        self._launch_queue_entry(entry, None)
+
+    def _queue_stability_status(self, text):
+        self.queue_widget.queue_status_label.setText(f"Queue: {text}")
+        self.widget.status_label.setText(f"Status: {text}")
+
+    def _queue_stability_cancelled(self, entry, record):
+        """The entry's stability wait ended without starting it."""
+        entry.stability_result = record
+        self._queue_current = None
+        outcome = record["stability_outcome"]
+        if self._queue_stop_requested:
+            status, message = queue_model.STOPPED, "queue stopped during stability check"
+        elif outcome == stability_model.OUTCOME_TIMEOUT_CANCELLED:
+            std, drift = record["stability_std_percent"], record["stability_drift_percent_per_min"]
+            status = queue_model.SKIPPED_UNSTABLE
+            message = (
+                f"not stable within {record['stability_timeout_s']:g} s "
+                f"(std {'--' if std is None else f'{std:.2f}'}%, "
+                f"drift {'--' if drift is None else f'{drift:+.2f}'}%/min)"
+            )
+        else:
+            status, message = queue_model.STOPPED, "cancelled during stability check"
+        self.widget.status_label.setText(f"Status: Not started — {status}")
+        self._finish_queue_entry(entry, status, message)
+        if self._queue_should_continue(entry):
+            self._queue_timer.start(0)
+        else:
+            self._end_queue()
+
+    def _launch_queue_entry(self, entry, stability_record):
+        entry.message = ""
+        entry.stability_result = stability_record
+        if self._queue_stop_requested:
+            # Stopped while the check was finishing; never start.
+            self._queue_current = None
+            self._finish_queue_entry(entry, queue_model.STOPPED, "queue stopped")
+            self._end_queue()
+            return
         # Field range re-checked here, immediately before the start, as
         # well as when the entry was added.
-        problem = self._start_run(entry.config, entry.output_directory, interactive=False)
+        # With the check off this is the same call as before it existed.
+        extra = {} if stability_record is None else {"stability_record": stability_record}
+        problem = self._start_run(entry.config, entry.output_directory,
+                                  interactive=False, **extra)
         if problem is not None:
             # Refused before any worker existed: nothing to wait for.
             self._queue_current = None
@@ -1050,6 +1168,8 @@ class ZeroFieldWindow(QMainWindow):
         """Stop the running entry; the queue continues with the next one."""
         if self._queue_active and self.zero_field_running:
             self.stop_scan()
+        elif self._queue_active and self.stability_waiting():
+            self.stability.cancel()  # entry marked stopped; queue continues
 
     def stop_queue(self):
         """Stop the running entry and start no more."""
@@ -1059,6 +1179,8 @@ class ZeroFieldWindow(QMainWindow):
         self._queue_timer.stop()
         if self.zero_field_running:
             self.stop_scan()  # scan_finished() then ends the queue
+        elif self.stability_waiting():
+            self.stability.cancel()  # its callback ends the queue
         else:
             self._end_queue()
 
@@ -1074,6 +1196,9 @@ class ZeroFieldWindow(QMainWindow):
             f"Queue: finished — {counts[queue_model.DONE]} done, "
             f"{counts[queue_model.STOPPED]} stopped, {counts[queue_model.FAILED]} failed"
         )
+        skipped = sum(e.status == queue_model.SKIPPED_UNSTABLE for e in self._queue_started)
+        if skipped:
+            text += f", {skipped} skipped (unstable)"
         if self._queue_stop_requested:
             text += " (queue stopped)"
         self.queue_widget.queue_status_label.setText(text)
@@ -1107,7 +1232,9 @@ class ZeroFieldWindow(QMainWindow):
         has_pending = any(e.status == queue_model.PENDING for e in self.queue_entries)
         self._update_run_button()
         q.run_queue_button.setEnabled(not active and not self.zero_field_running and has_pending)
-        q.stop_current_button.setEnabled(active and self.zero_field_running)
+        q.stop_current_button.setEnabled(
+            active and (self.zero_field_running or self.stability_waiting())
+        )
         q.stop_queue_button.setEnabled(active)
         q.remove_button.setEnabled(entry is not None and entry.status != queue_model.RUNNING)
         q.move_up_button.setEnabled(row is not None and row > 0)
@@ -1133,6 +1260,9 @@ class ZeroFieldWindow(QMainWindow):
         while it runs, so the button is then disabled ("Queue running")."""
         if self._queue_active:
             state = run_button.BLOCKED
+        elif getattr(self, "_single_stability_wait", False):
+            self.widget.set_run_button_waiting()
+            return
         elif self._run_in_progress:
             state = run_button.RUNNING
         else:
@@ -1152,4 +1282,8 @@ class ZeroFieldWindow(QMainWindow):
             # Between queued runs: nothing is commanding hardware, so end
             # the queue (releasing the magnet lock) and close.
             self.stop_queue()
+        elif getattr(self, "stability", None) is not None and self.stability_waiting():
+            # Waiting for stable counts: nothing started; cancel the wait
+            # (restoring the live view) and close.
+            self.stability.cancel()
         event.accept()

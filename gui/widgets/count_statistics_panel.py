@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
     QGridLayout,
@@ -74,7 +74,16 @@ class CountStatisticsPanel(QGroupBox):
     of its ROI, exposure or binning resets the statistics. camera_owned()
     is True while an experiment holds the camera; accumulation pauses then
     and resumes with the live view.
+
+    Every accepted sample is also emitted as sample_accepted(t, value), t
+    on this panel's clock, whether or not statistics are accumulating; the
+    pre-experiment stability check (gui/stability_gate.py) listens to it.
+    samples_invalidated(reason) fires when a settings change makes earlier
+    samples incomparable.
     """
+
+    sample_accepted = pyqtSignal(float, float)
+    samples_invalidated = pyqtSignal(str)
 
     def __init__(self, settings_getter, camera_owned, log_directory=None,
                  clock=time.monotonic, now=datetime.now, parent=None):
@@ -196,6 +205,7 @@ class CountStatisticsPanel(QGroupBox):
             return
         self.latest_sample = value
         self._last_frame_time = self._clock()
+        self.sample_accepted.emit(self._last_frame_time, value)
         if not self.accumulating:
             return
         self.statistics.add(value)
@@ -226,6 +236,12 @@ class CountStatisticsPanel(QGroupBox):
         self._skip_next_frame = True
         self.latest_sample = None
         self.reset(f"Statistics reset: {change}")
+        self.samples_invalidated.emit(change)
+
+    @property
+    def clock(self):
+        """The clock sample_accepted times are on."""
+        return self._clock
 
     # ---- accumulation ---------------------------------------------------
 

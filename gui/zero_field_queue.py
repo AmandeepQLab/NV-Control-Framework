@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from experiments.zero_field_experiment import VECTOR_AXIS, unit_direction
+from framework import stability as stability_model
+from framework.stability import StabilitySettings
 
 
 PENDING = "pending"
@@ -20,6 +22,9 @@ RUNNING = "running"
 DONE = "done"
 STOPPED = "stopped"
 FAILED = "failed"
+# The stability check timed out with "Cancel this run": not started, and
+# not a failure -- the queue continues.
+SKIPPED_UNSTABLE = "skipped (unstable)"
 
 ON_FAILURE_STOP = "Stop queue"
 ON_FAILURE_SKIP = "Skip to next"
@@ -60,17 +65,34 @@ LOG_COLUMNS = (
     "first_frame_mean_counts",
     "summary",
     "message",
+    # Stability check (framework/stability.py record() keys).
+    "stability_check_enabled",
+    "stability_outcome",
+    "stability_std_percent",
+    "stability_drift_percent_per_min",
+    "stability_wait_s",
+    "stability_window_s",
+    "stability_max_std_percent",
+    "stability_max_drift_percent_per_min",
+    "stability_timeout_s",
+    "stability_on_timeout",
 )
 
 
 @dataclass
 class QueueEntry:
-    """One queued run. ``config`` and ``output_directory`` are the saved
-    settings; the remaining fields describe this session's execution only
-    and are not written to queue files."""
+    """One queued run. ``config``, ``output_directory`` and ``stability``
+    are the saved settings; the remaining fields describe this session's
+    execution only and are not written to queue files.
+
+    ``stability`` is the entry's own StabilitySettings (checked just before
+    the entry starts); it is kept apart from ``config`` so that config stays
+    exactly ZeroFieldWidget.get_config().
+    """
 
     config: dict
     output_directory: str
+    stability: StabilitySettings = None
     status: str = PENDING
     message: str = ""
     output_path: str = ""
@@ -78,21 +100,34 @@ class QueueEntry:
     end_time: object = None
     first_frame_mean: object = None
     log_index: int = 0
+    stability_result: dict = None    # framework.stability.record() of this run
+
+    def __post_init__(self):
+        if self.stability is None:
+            self.stability = StabilitySettings()
 
     @classmethod
-    def snapshot(cls, config, output_directory):
-        """A new pending entry holding an independent copy of *config*."""
+    def snapshot(cls, config, output_directory, stability=None):
+        """A new pending entry holding independent copies of the settings."""
         return cls(
             config=copy.deepcopy(dict(config)),
             output_directory=str(output_directory),
+            stability=copy.deepcopy(stability) if stability is not None else None,
         )
 
     def duplicate(self):
         """A new pending entry with the same settings."""
-        return QueueEntry.snapshot(self.config, self.output_directory)
+        return QueueEntry.snapshot(self.config, self.output_directory, self.stability)
 
     def summary(self):
-        return summarize(self.config)
+        text = summarize(self.config)
+        s = self.stability
+        if s.enabled:
+            text += (
+                f", stability ≤{s.max_std_percent:g}% ≤{s.max_drift_percent_per_min:g}%/min"
+                f" over {s.window_s:g} s"
+            )
+        return text
 
 
 def _signed(value):
@@ -179,7 +214,11 @@ def save_queue_file(path, entries, pause_s, on_failure):
         "pause_between_runs_s": float(pause_s),
         "on_failure": on_failure,
         "entries": [
-            {"config": entry.config, "output_directory": entry.output_directory}
+            {
+                "config": entry.config,
+                "output_directory": entry.output_directory,
+                "stability": entry.stability.to_dict(),
+            }
             for entry in entries
         ],
     }
@@ -209,9 +248,15 @@ def load_queue_file(path):
             raise ValueError(f"entry {number}: missing output_directory")
         try:
             config = validate_config(raw.get("config"))
+            # Optional: queue files written before the stability check
+            # existed have none, which means "off".
+            stability = (
+                StabilitySettings.from_dict(raw["stability"])
+                if "stability" in raw else StabilitySettings()
+            )
         except ValueError as error:
             raise ValueError(f"entry {number}: {error}") from error
-        entries.append(QueueEntry.snapshot(config, raw["output_directory"]))
+        entries.append(QueueEntry.snapshot(config, raw["output_directory"], stability))
     pause = document.get("pause_between_runs_s", 0.0)
     if not isinstance(pause, (int, float)) or isinstance(pause, bool) or pause < 0:
         raise ValueError("pause_between_runs_s must be a number >= 0")
@@ -251,6 +296,13 @@ class QueueLog:
             "summary": entry.summary(),
             "message": entry.message,
         }
+        result = entry.stability_result or stability_model.record(entry.stability)
+        for key in LOG_COLUMNS:
+            if key.startswith("stability_"):
+                value = result.get(key)
+                row[key] = "" if value is None else value
+        if not result["stability_check_enabled"]:
+            row["stability_outcome"] = stability_model.OUTCOME_NOT_USED
         with open(self.path, "a", newline="", encoding="utf-8") as handle:
             csv.DictWriter(handle, fieldnames=LOG_COLUMNS).writerow(row)
             handle.flush()

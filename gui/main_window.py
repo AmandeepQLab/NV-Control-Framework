@@ -35,6 +35,7 @@ from framework.acquisition_state import (
 from framework.roi import validate_roi
 from gui.live_view_controller import LiveViewTimerController
 from gui.widgets.count_statistics_panel import CountStatisticsPanel
+from gui.stability_gate import StabilityMonitor
 from gui.display_settings import (
     COLORMAP_NAMES,
     LIVE_VIEW_COLORMAP_KEY,
@@ -444,6 +445,17 @@ class MainWindow(QMainWindow):
             camera_owned=lambda: experiment_owns_camera(self.camera),
         )
         right_panel.addWidget(self.count_statistics_panel, 1)
+
+        # Shared pre-experiment count stability check (gui/stability_gate.py):
+        # it uses the panel's samples, and starts/stops the live view only
+        # through start_stream()/stop_stream() below. Handed to every
+        # experiment window.
+        self.stability_monitor = StabilityMonitor(
+            self.count_statistics_panel,
+            live_view_running=lambda: self.timer.isActive(),
+            start_live_view=self.start_stream,
+            stop_live_view=self.stop_stream,
+        )
 
         # ROI overlay
         self.roi = pg.RectROI(
@@ -1046,6 +1058,7 @@ class MainWindow(QMainWindow):
             hardware=self.hardware,
             camera=self.camera,
             acquisition_state_getter=self.get_acquisition_state,
+            stability_monitor=getattr(self, "stability_monitor", None),
         )
         self.odmr_window.analysis_requested.connect(
             self.open_odmr_analysis_window
@@ -1100,6 +1113,8 @@ class MainWindow(QMainWindow):
             camera=self.camera,
 
             acquisition_state_getter=self.get_acquisition_state,
+
+            stability_monitor=getattr(self, "stability_monitor", None),
 
         )
         window = self.zero_field_window
