@@ -22,7 +22,11 @@ from gui.widgets.zero_field_queue_widget import ZeroFieldQueueWidget
 from gui.widgets.zero_field_widget import ZeroFieldWidget
 from gui.zero_field_queue import QueueEntry, QueueLog
 from gui.zero_field_worker import ZeroFieldWorker, ratio_curve
-from experiments.zero_field_experiment import ZeroFieldExperiment
+from experiments.zero_field_experiment import (
+    VECTOR_AXIS,
+    ZeroFieldExperiment,
+    unit_direction,
+)
 from framework.analysis.zero_field import mean_fluorescence_vs_field
 from framework.fluorescence import mean_fluorescence
 from framework.paths import ensure_writable_directory
@@ -54,25 +58,43 @@ def field_range_problem(magnet, config, axis_limit_note):
 
     See ZeroFieldWindow._preflight_field_range() for what is checked and
     why only ValueError counts. Pure calculation: no I/O, no dialog.
+
+    A vector sweep (field_axis "vector") commands s * n_hat on every axis.
+    Each axis's target is linear in s, so the endpoints still cover every
+    point; all three axes are checked at each endpoint (and the reference).
     """
     swept = config["field_axis"].lower()
+    if swept == VECTOR_AXIS:
+        try:
+            direction = unit_direction(config.get("field_direction"))
+        except ValueError as error:
+            return (
+                "Invalid field direction",
+                f"{error}\n\nRequested direction: {config.get('field_direction')}.",
+            )
+        components = dict(zip(("x", "y", "z"), direction))
+        where = "along n = (" + ", ".join(f"{n:.3g}" for n in direction) + ")"
+    else:
+        components = {name: 1.0 if name == swept else 0.0 for name in ("x", "y", "z")}
+        where = f"on {swept.upper()}"
     targets = [(config["field_start"], False), (config["field_stop"], False)]
     # With reference normalization on, the reference vector (the swept
-    # axis at reference_field_gauss, the others zeroed as for the sweep)
-    # is commanded at every point and is checked the same way.
+    # axis at reference_field_gauss, the others zeroed as for the sweep;
+    # for a vector sweep, reference_field_gauss * n_hat) is commanded at
+    # every point and is checked the same way.
     if config.get("reference_enabled", False):
         targets.append((config["reference_field_gauss"], True))
     for target_gauss, is_reference in targets:
         for name in ("x", "y", "z"):
-            target_mT = target_gauss * 0.1 if name == swept else 0.0
+            target_mT = target_gauss * 0.1 * components[name] + 0.0  # no -0.0
             try:
                 getattr(magnet, name).plan_field(target_mT)
             except ValueError as error:
                 requested = (
-                    f"Reference field: {target_gauss:g} G on {swept.upper()}."
+                    f"Reference field: {target_gauss:g} G {where}."
                     if is_reference else
                     f"Requested sweep: {config['field_start']:g} G to "
-                    f"{config['field_stop']:g} G on {swept.upper()}."
+                    f"{config['field_stop']:g} G {where}."
                 )
                 return (
                     "Field range out of bounds",
@@ -346,7 +368,8 @@ class ZeroFieldWindow(QMainWindow):
         the same check Magnet.set_vector() makes per point mid-scan. Required
         current on a branch is |target - intercept| / ratio, so over a linear
         sweep its maximum is at an endpoint; checking both endpoints covers
-        every point in between.
+        every point in between. A vector sweep commands s * n_hat, so every
+        axis is linear in s and is checked at both endpoints the same way.
 
         Only ValueError blocks the scan: that is what plan_field() raises for
         an out-of-range or non-finite target. Its RuntimeErrors concern relay

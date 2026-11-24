@@ -17,9 +17,46 @@ from framework.roi import validate_roi
 
 LOGGER = logging.getLogger(__name__)
 
+# field_axis value for a sweep along an arbitrary direction (see
+# ZeroFieldExperiment): every axis is commanded at once, B = s * n_hat.
+VECTOR_AXIS = "vector"
+
+
+def unit_direction(direction):
+    """Normalise a 3-component direction to a unit vector (list of floats).
+
+    Raises ValueError for anything that is not three finite numbers, and
+    for a zero vector, which has no direction.
+    """
+    if direction is None or isinstance(direction, (str, bytes)):
+        raise ValueError("field_direction must be three numbers [nx, ny, nz].")
+    values = list(direction)
+    if len(values) != 3 or any(
+        isinstance(v, bool) or not isinstance(v, (int, float, np.integer, np.floating))
+        for v in values
+    ):
+        raise ValueError("field_direction must be three numbers [nx, ny, nz].")
+    vector = np.asarray(values, dtype=np.float64)
+    if not np.all(np.isfinite(vector)):
+        raise ValueError("field_direction must be finite.")
+    norm = float(np.linalg.norm(vector))
+    if norm < 1e-12:
+        raise ValueError("field_direction is a zero vector; it has no direction.")
+    if abs(norm - 1.0) < 1e-12:
+        # Already a unit vector: returned unchanged, so normalising twice
+        # (widget, queue file, experiment) never alters the last digit.
+        return [float(v) for v in vector]
+    return [float(v) / norm for v in vector]
+
 
 class ZeroFieldExperiment(ScanExperiment):
-    """Acquire fluorescence images while sweeping one magnetic-field axis.
+    """Acquire fluorescence images while sweeping the magnetic field.
+
+    The sweep runs along one coil axis (field_axis "X"/"Y"/"Z"), or with
+    field_axis "vector" along the unit vector n_hat of field_direction:
+    each point then commands B = s * n_hat on all three axes at once, where
+    s is the point's value of the start/stop linspace (the signed magnitude
+    along n_hat).
 
     Field inputs and the ImageCube scan axis are expressed in gauss.  The
     existing :class:`Magnet` API uses millitesla internally, so values are
@@ -63,6 +100,7 @@ class ZeroFieldExperiment(ScanExperiment):
         alternate_direction=False,
         reference_enabled=False,
         reference_field_gauss=-8.0,
+        field_direction=None,
     ):
         config = {
             "settling_time_ms": settling_time_ms,
@@ -74,9 +112,18 @@ class ZeroFieldExperiment(ScanExperiment):
         }
         super().__init__(hardware, config)
 
-        axis = field_axis.upper()
-        if axis not in ("X", "Y", "Z"):
-            raise ValueError("field_axis must be 'X', 'Y', or 'Z'.")
+        if str(field_axis).lower() == VECTOR_AXIS:
+            axis = VECTOR_AXIS
+            # Normalised here, so every command and the metadata use n_hat.
+            field_direction = unit_direction(field_direction)
+        else:
+            axis = field_axis.upper()
+            if axis not in ("X", "Y", "Z"):
+                raise ValueError("field_axis must be 'X', 'Y', 'Z', or 'vector'.")
+            if field_direction is not None:
+                raise ValueError(
+                    "field_direction applies only to field_axis 'vector'."
+                )
         if field_points < 1:
             raise ValueError("field_points must be at least 1.")
         if averages < 1:
@@ -107,6 +154,9 @@ class ZeroFieldExperiment(ScanExperiment):
         self.field_stop = field_stop
         self.field_points = field_points
         self.field_axis = axis
+        # Unit vector [nx, ny, nz] for a vector sweep; None for one axis.
+        self.field_direction = field_direction
+        self.vector_mode = axis == VECTOR_AXIS
         self.averages = averages
         # Acquisition ROI is expressed in full-sensor coordinates and frozen
         # at construction so a GUI change cannot affect a running scan.
@@ -359,8 +409,11 @@ class ZeroFieldExperiment(ScanExperiment):
         if self._initial_magnet_vector_mT is None:
             self._initial_magnet_vector_mT = dict(entry_vector_mT)
 
+        # A vector sweep commands every axis at every point: none is
+        # non-swept, and the resolved vector below is only the setup state.
         non_swept_axes = [
-            axis for axis in ("x", "y", "z") if axis != self.field_axis.lower()
+            axis for axis in ("x", "y", "z")
+            if not self.vector_mode and axis != self.field_axis.lower()
         ]
 
         if self.zero_other_axes:
@@ -435,16 +488,11 @@ class ZeroFieldExperiment(ScanExperiment):
 
     def set_scan_point(self, value):
         """Apply the field for this point; return the axes whose relay flipped."""
-        fields_mT = dict(self._configured_field_mT)
-        fields_mT[self.field_axis.lower()] = value * 0.1
+        bx, by, bz = self._point_vector_mT(value)
 
         timing = self._timing
         t0 = time.perf_counter() if timing else None
-        flipped = self.magnet.set_vector(
-            bx=fields_mT["x"],
-            by=fields_mT["y"],
-            bz=fields_mT["z"],
-        )
+        flipped = self.magnet.set_vector(bx=bx, by=by, bz=bz)
         if timing:
             self._merge_magnet_log(t0 - self._timing_epoch)
         return self._as_flip_set(flipped)
@@ -456,7 +504,13 @@ class ZeroFieldExperiment(ScanExperiment):
         return frozenset(flipped) if isinstance(flipped, (set, frozenset)) else frozenset()
 
     def _point_vector_mT(self, value):
-        """The (x, y, z) mT vector set_scan_point(value) commands."""
+        """The (x, y, z) mT vector set_scan_point(value) commands.
+
+        One axis: that axis at *value* G, the others as resolved by
+        setup_scan(). Vector sweep: value * n_hat on all three axes."""
+        if self.vector_mode:
+            # "+ 0.0" turns -0.0 (negative s on a zero component) into 0.0.
+            return tuple(value * 0.1 * n + 0.0 for n in self.field_direction)
         fields_mT = dict(self._configured_field_mT)
         fields_mT[self.field_axis.lower()] = value * 0.1
         return (fields_mT["x"], fields_mT["y"], fields_mT["z"])
@@ -664,7 +718,16 @@ class ZeroFieldExperiment(ScanExperiment):
         Model values, not measurements (see MagnetAxis.get_field())."""
         vector = self.magnet.get_vector()
         vector_mT = [vector.get(axis) for axis in ("x", "y", "z")]
-        swept_mT = vector.get(self.field_axis.lower())
+        if self.vector_mode:
+            # The model vector's component along n_hat: the counterpart of
+            # the requested signed magnitude s. The full vector is kept in
+            # model_field_vector_mT (it can leave the line in a branch gap).
+            swept_mT = (
+                None if any(v is None for v in vector_mT)
+                else sum(v * n for v, n in zip(vector_mT, self.field_direction))
+            )
+        else:
+            swept_mT = vector.get(self.field_axis.lower())
         swept_gauss = None if swept_mT is None else swept_mT * 10.0
         get_polarities = getattr(self.magnet, "get_polarities", None)
         polarities = get_polarities() if callable(get_polarities) else {}
@@ -1400,6 +1463,31 @@ class ZeroFieldExperiment(ScanExperiment):
         ),
     }
 
+    # field_value_definitions entries replaced or added for a vector sweep.
+    _VECTOR_DEFINITIONS = {
+        "field_direction": (
+            "Unit vector [nx, ny, nz] of the sweep direction (field_axis "
+            "'vector'), normalised from the requested direction. Each point "
+            "commands B = s * field_direction on all three axes."
+        ),
+        "field_values_gauss": (
+            "Requested signed magnitude s along field_direction per point (the "
+            "linspace), in G; same as scan_axis_values. The commanded vector "
+            "is s * field_direction."
+        ),
+        "model_field_values_gauss": (
+            "Component of the modelled field vector along field_direction, in "
+            "G, read right after each point's set_vector(). Differs from the "
+            "request where an axis is in a branch gap. Not a measurement; "
+            "model_field_vector_mT has the full vector."
+        ),
+    }
+    _VECTOR_REFERENCE_DEFINITION = (
+        "Dataset: per-point fluorescence image at the reference field "
+        "(reference_field_gauss * field_direction), same plane order and "
+        "averaging as data."
+    )
+
     def _set_static_metadata(self):
         """Record the known conditions that define this field sweep."""
         metadata = dict(self.metadata)
@@ -1411,6 +1499,10 @@ class ZeroFieldExperiment(ScanExperiment):
                 "camera_exposure_s": self._camera_setting("exposure_time"),
                 "camera_binning": self._camera_setting("binning"),
                 "field_axis": self.field_axis,
+                # Unit vector [nx, ny, nz] of a vector sweep; None otherwise.
+                "field_direction": (
+                    None if self.field_direction is None else list(self.field_direction)
+                ),
                 "field_values_gauss": self.scan_vector.tolist(),
                 "field_value_definitions": {
                     "field_values_gauss": (
@@ -1476,6 +1568,13 @@ class ZeroFieldExperiment(ScanExperiment):
             metadata["reference_field_gauss"] = self.reference_field_gauss
             definitions = dict(metadata["field_value_definitions"])
             definitions.update(self._REFERENCE_DEFINITIONS)
+            metadata["field_value_definitions"] = definitions
+        if self.vector_mode:
+            # Only for a vector sweep, so single-axis metadata is unchanged.
+            definitions = dict(metadata["field_value_definitions"])
+            definitions.update(self._VECTOR_DEFINITIONS)
+            if self.reference_enabled:
+                definitions["reference"] = self._VECTOR_REFERENCE_DEFINITION
             metadata["field_value_definitions"] = definitions
         power_supply_models = self._power_supply_models()
         if power_supply_models:

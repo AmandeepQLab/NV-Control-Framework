@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt
 
+from experiments.zero_field_experiment import VECTOR_AXIS, unit_direction
 from gui.image_inspection import line_profile, pixel_value
 from gui.widgets import run_button
 from gui.widgets.run_button import style_run_button
@@ -92,16 +93,63 @@ class ZeroFieldWidget(QWidget):
         axis_row = QHBoxLayout()
         axis_row.addWidget(QLabel("Sweep Axis:"))
         self.field_axis_combo = QComboBox()
-        self.field_axis_combo.addItems(["X", "Y", "Z"])
+        self.field_axis_combo.addItems(["X", "Y", "Z", self.VECTOR_TEXT])
         self.field_axis_combo.setToolTip(
             "Axis to sweep; the other two axes are zeroed for the duration "
             "of the scan (not preserved). The entry vector -- what the "
             "magnet actually held before the scan touched it -- is "
             "recorded in the saved metadata, so the zeroing is verifiable "
-            "after the fact."
+            "after the fact.\n\n"
+            "Vector: sweep along the direction (nx, ny, nz) on all three "
+            "axes at once. Start/Stop Field are then the signed magnitude "
+            "along the normalised direction."
         )
         axis_row.addWidget(self.field_axis_combo)
         field_layout.addLayout(axis_row)
+
+        # Direction of a vector sweep; shown only while "Vector" is selected.
+        self.field_direction_box = QWidget()
+        direction_layout = QVBoxLayout(self.field_direction_box)
+        direction_layout.setContentsMargins(0, 0, 0, 0)
+        direction_row = QHBoxLayout()
+        direction_row.addWidget(QLabel("Direction:"))
+        self.field_direction_spins = []
+        for name in ("nx", "ny", "nz"):
+            direction_row.addWidget(QLabel(f"{name}"))
+            spin = QDoubleSpinBox()
+            spin.setRange(-1000.0, 1000.0)
+            spin.setDecimals(4)
+            spin.setSingleStep(0.1)
+            spin.setValue(1.0)
+            spin.valueChanged.connect(self._update_field_direction_label)
+            direction_row.addWidget(spin)
+            self.field_direction_spins.append(spin)
+        direction_layout.addLayout(direction_row)
+        preset_row = QHBoxLayout()
+        self.direction_110_button = QPushButton("<110>")
+        self.direction_110_button.setToolTip("Direction (1, 1, 0): X = Y")
+        self.direction_110_button.clicked.connect(
+            lambda: self.set_field_direction((1.0, 1.0, 0.0))
+        )
+        self.direction_111_button = QPushButton("<111>")
+        self.direction_111_button.setToolTip("Direction (1, 1, 1): X = Y = Z")
+        self.direction_111_button.clicked.connect(
+            lambda: self.set_field_direction((1.0, 1.0, 1.0))
+        )
+        preset_row.addWidget(self.direction_110_button)
+        preset_row.addWidget(self.direction_111_button)
+        preset_row.addStretch()
+        direction_layout.addLayout(preset_row)
+        self.field_direction_label = QLabel()
+        self.field_direction_label.setWordWrap(True)
+        direction_layout.addWidget(self.field_direction_label)
+        field_layout.addWidget(self.field_direction_box)
+        self.field_axis_combo.currentTextChanged.connect(
+            self._update_field_direction_visible
+        )
+        self._update_field_direction_label()
+        # Visibility is applied after the column width is computed below, so
+        # the width also fits the direction row.
 
         self.settling_time_spin = self._add_int(
             field_layout, "Settling Time (ms):", 0, 600000, 100
@@ -271,6 +319,7 @@ class ZeroFieldWidget(QWidget):
             + self.control_scroll_area.verticalScrollBar().sizeHint().width()
             + 2 * self.control_scroll_area.frameWidth()
         )
+        self._update_field_direction_visible()
 
         self._signal_label = self._COUNTS_LABEL
         plot_group = QGroupBox("Zero Field Mean Fluorescence (counts/pixel)")
@@ -331,7 +380,53 @@ class ZeroFieldWidget(QWidget):
     def set_output_directory(self, path):
         self.output_directory_edit.setText(str(path))
 
+    # ---- vector sweep direction ----------------------------------------
+
+    VECTOR_TEXT = "Vector"
+
+    def is_vector_sweep(self):
+        return self.field_axis_combo.currentText() == self.VECTOR_TEXT
+
+    def raw_field_direction(self):
+        """(nx, ny, nz) as entered, not normalised."""
+        return [spin.value() for spin in self.field_direction_spins]
+
+    def set_field_direction(self, direction):
+        for spin, value in zip(self.field_direction_spins, direction):
+            spin.setValue(float(value))
+
+    def _update_field_direction_visible(self, _text=None):
+        self.field_direction_box.setVisible(self.is_vector_sweep())
+
+    def _update_field_direction_label(self, _value=None):
+        try:
+            unit = unit_direction(self.raw_field_direction())
+        except ValueError:
+            self.field_direction_label.setText(
+                "⚠ Zero vector: choose a direction. A scan will be refused."
+            )
+            self.field_direction_label.setStyleSheet("color: #c06000;")
+            return
+        self.field_direction_label.setStyleSheet("")
+        self.field_direction_label.setText(
+            "n̂ = (" + ", ".join(f"{n:.3f}" for n in unit) + "). "
+            "Start/Stop Field (and the reference field) are the signed "
+            "magnitude along n̂."
+        )
+
     def get_config(self):
+        config = self._single_axis_config()
+        if self.is_vector_sweep():
+            config["field_axis"] = VECTOR_AXIS
+            # Normalised; a zero vector is reported as entered, and refused
+            # by the window's pre-scan check (field_range_problem()).
+            try:
+                config["field_direction"] = unit_direction(self.raw_field_direction())
+            except ValueError:
+                config["field_direction"] = self.raw_field_direction()
+        return config
+
+    def _single_axis_config(self):
         return {
             "field_start": self.field_start_spin.value(),
             "field_stop": self.field_stop_spin.value(),
@@ -367,7 +462,11 @@ class ZeroFieldWidget(QWidget):
         self.field_start_spin.setValue(config["field_start"])
         self.field_stop_spin.setValue(config["field_stop"])
         self.field_points_spin.setValue(config["field_points"])
-        self.field_axis_combo.setCurrentText(config["field_axis"])
+        if config["field_axis"] == VECTOR_AXIS:
+            self.field_axis_combo.setCurrentText(self.VECTOR_TEXT)
+            self.set_field_direction(config["field_direction"])
+        else:
+            self.field_axis_combo.setCurrentText(config["field_axis"])
         self.settling_time_spin.setValue(config["settling_time_ms"])
         self.post_flip_settling_spin.setValue(config["post_flip_settling_ms"])
         self.averages_spin.setValue(config["averages"])

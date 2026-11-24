@@ -12,6 +12,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from experiments.zero_field_experiment import VECTOR_AXIS, unit_direction
+
 
 PENDING = "pending"
 RUNNING = "running"
@@ -29,6 +31,8 @@ QUEUE_FILE_VERSION = 1
 # Every key ZeroFieldWidget.get_config() returns, with the type a loaded
 # value must have. A queue file missing any of them is refused rather than
 # filled with defaults, so a loaded entry always runs exactly as saved.
+# A vector sweep (field_axis "vector") also requires field_direction, a list
+# of three numbers; see validate_config().
 CONFIG_TYPES = {
     "field_start": float,
     "field_stop": float,
@@ -95,6 +99,16 @@ def _signed(value):
     return f"{value:+g}" if value else "0"
 
 
+def _axis_text(config):
+    """"X"/"Y"/"Z", or "vec(0.58,0.58,0.58)" for a vector sweep."""
+    if config["field_axis"] != VECTOR_AXIS:
+        return config["field_axis"]
+    # "+ 0.0" avoids printing -0.
+    return "vec(" + ",".join(
+        f"{n + 0.0:.2g}" for n in config["field_direction"]
+    ) + ")"
+
+
 def summarize(config):
     """One-line description of a run's settings for the queue list and log."""
     scans = config["num_scans"] if config["averaging_enabled"] else 1
@@ -104,7 +118,7 @@ def summarize(config):
     )
     alternate = "alt on" if config["alternate_direction"] else "alt off"
     return (
-        f"{config['field_axis']} {config['field_start']:g}→{config['field_stop']:g} G, "
+        f"{_axis_text(config)} {config['field_start']:g}→{config['field_stop']:g} G, "
         f"{config['field_points']} pts, {config['averages']} rep, "
         f"{scans} scan{'s' if scans != 1 else ''}, "
         f"settle {config['settling_time_ms']} ms, {reference}, {alternate}"
@@ -138,8 +152,19 @@ def validate_config(config):
         if not ok:
             raise ValueError(f"setting '{key}' has the wrong type ({value!r})")
         clean[key] = value
-    if clean["field_axis"] not in ("X", "Y", "Z"):
-        raise ValueError(f"field_axis must be X, Y or Z, not {clean['field_axis']!r}")
+    if clean["field_axis"] not in ("X", "Y", "Z", VECTOR_AXIS):
+        raise ValueError(
+            f"field_axis must be X, Y, Z or {VECTOR_AXIS}, not {clean['field_axis']!r}"
+        )
+    if clean["field_axis"] == VECTOR_AXIS:
+        # Required for a vector sweep, stored normalised; a zero vector is
+        # refused. For X/Y/Z it is an unknown key and dropped.
+        if "field_direction" not in config:
+            raise ValueError("missing setting 'field_direction'")
+        try:
+            clean["field_direction"] = unit_direction(config["field_direction"])
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"setting 'field_direction': {error}") from error
     for key in ("field_points", "averages", "num_scans"):
         if clean[key] < 1:
             raise ValueError(f"setting '{key}' must be at least 1")

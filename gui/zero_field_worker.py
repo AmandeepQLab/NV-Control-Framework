@@ -115,6 +115,8 @@ class ZeroFieldWorker(QObject):
                 field_stop=self.config["field_stop"],
                 field_points=self.config["field_points"],
                 field_axis=self.config["field_axis"],
+                # Present only for a vector sweep (field_axis "vector").
+                field_direction=self.config.get("field_direction"),
                 settling_time_ms=self.config["settling_time_ms"],
                 post_flip_settling_ms=self.config.get("post_flip_settling_ms", 0.0),
                 averages=self.config["averages"],
@@ -235,6 +237,11 @@ class ZeroFieldWorker(QObject):
                 f"# camera_binning={binning} (actual camera read-back)",
                 f"# measured_run_total_s={run_total_s}",
             ]
+            if self.config.get("field_direction") is not None:
+                # Vector sweeps only, so single-axis headers are unchanged.
+                header_lines.insert(
+                    6, f"# field_direction={self.config.get('field_direction')}"
+                )
 
             fieldnames = [
                 "scan_index", "point_index", "field_gauss", "avg_index",
@@ -282,9 +289,17 @@ class ZeroFieldWorker(QObject):
 
         configured_mT = getattr(self.experiment, "_configured_field_mT", None)
         if configured_mT is not None:
-            vector_mT = dict(configured_mT)
-            # Same G -> mT conversion as ZeroFieldExperiment.set_scan_point().
-            vector_mT[self.experiment.field_axis.lower()] = float(field) * 0.1
+            # The vector set_scan_point() commanded for this point, with the
+            # same G -> mT conversion: s * n_hat on every axis for a vector
+            # sweep, else the swept axis plus the resolved others.
+            if getattr(self.experiment, "vector_mode", False):
+                vector_mT = dict(zip(
+                    ("x", "y", "z"),
+                    (float(field) * 0.1 * n + 0.0 for n in self.experiment.field_direction),
+                ))
+            else:
+                vector_mT = dict(configured_mT)
+                vector_mT[self.experiment.field_axis.lower()] = float(field) * 0.1
             if all(vector_mT[axis] is not None for axis in ("x", "y", "z")):
                 self.field_updated.emit(
                     float(vector_mT["x"]), float(vector_mT["y"]), float(vector_mT["z"])
