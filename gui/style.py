@@ -36,6 +36,10 @@ RUN_BLOCKED_BACKGROUND = "#707070"
 RUN_TEXT = "white"
 RUN_BLOCKED_TEXT = "#f0f0f0"
 
+# Magnet window power button: on / off (unchanged named colours).
+MAGNET_ON_BACKGROUND = "lightgreen"
+MAGNET_OFF_BACKGROUND = "lightgray"
+
 CARD_PROPERTY = "card"
 
 # The card title is bold through the card's own font; "> QWidget" resets the

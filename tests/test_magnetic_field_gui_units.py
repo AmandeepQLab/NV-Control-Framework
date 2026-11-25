@@ -80,7 +80,28 @@ class MagnetGuiUnitsTests(unittest.TestCase):
         self.assertEqual(spin.suffix(), " G")
         self.assertEqual((spin.minimum(), spin.maximum()), (-1000.0, 1000.0))
         self.assertEqual(spin.singleStep(), 1.0)
-        self.assertEqual(spin.decimals(), 3)
+        # GUI redesign: gauss inputs have 4 decimals everywhere (was 3; no
+        # precision lost).
+        self.assertEqual(spin.decimals(), 4)
+
+    def test_redesigned_layout_keeps_every_readout_and_has_tooltips(self):
+        from PyQt6.QtWidgets import QAbstractButton, QAbstractSpinBox, QComboBox
+        w = self.window
+        # The polarity labels now sit in the vector card, the status line in
+        # the status bar; their texts are unchanged.
+        for name in ("x", "y", "z"):
+            self.assertTrue(w.vector_box.isAncestorOf(w.polarity_labels[name]))
+            self.assertIn(f"{name.upper()} coil polarity:",
+                          w.polarity_labels[name].text())
+        self.assertIs(w.status_label.parentWidget(), w.statusBar())
+        self.assertEqual(w.vector_box.title(), MagnetControlWindow._VECTOR_BOX_TITLE)
+        controls = [c for kind in (QAbstractButton, QAbstractSpinBox, QComboBox)
+                    for c in w.centralWidget().findChildren(kind)
+                    if c.parentWidget() is not None
+                    and type(c.parentWidget()).__name__ != "QTabBar"]
+        missing = [getattr(c, "text", lambda: type(c).__name__)()
+                   for c in controls if not c.toolTip().strip()]
+        self.assertEqual(missing, [])
 
     def test_apply_gauss_preserves_backend_current_calculation_for_each_axis(self):
         for name in ("X", "Y", "Z"):

@@ -12,6 +12,7 @@ Author:
 =====================================================
 """
 from hardware.magnet.magnet import POSITIVE, NEGATIVE
+from gui import style
 try:
     from PyQt6.QtWidgets import (  # type: ignore[import]
         QMainWindow,
@@ -83,6 +84,13 @@ _SWEPT_OVERRIDE_WARNING = (
 _STATIC_OVERRIDE_WARNING = "Changing the field will affect your measurement."
 
 
+def _tipped(text, field):
+    """A form label carrying its field's tooltip."""
+    label = QLabel(text)
+    label.setToolTip(field.toolTip())
+    return label
+
+
 class MagnetControlWindow(QMainWindow):
 
     _VECTOR_BOX_TITLE = "Commanded / Model Magnet Vector"
@@ -126,43 +134,50 @@ class MagnetControlWindow(QMainWindow):
         self.setCentralWidget(central)
 
         main_layout = QVBoxLayout(central)
+        main_layout.setSpacing(style.COLUMN_SPACING)
 
         # =================================================
         # MAGNET POWER
         # =================================================
 
-        power_layout = QHBoxLayout()
-
         self.power_button = QPushButton()
-
         self.power_button.setMinimumHeight(42)
-
-        power_layout.addWidget(self.power_button)
-
-        main_layout.addLayout(power_layout)
+        self.power_button.setToolTip(
+            "Switch the coil supplies on or off. Off de-energizes every axis "
+            "(0 A, outputs off). On is needed before any field command. "
+            "Locked while an experiment runs."
+        )
+        main_layout.addWidget(self.power_button)
 
         # =================================================
         # EXPERIMENT LOCK
         # =================================================
         # Outside the tabs so the lock state is visible from either tab.
 
-        lock_box = QGroupBox("Experiment Lock")
-
-        lock_layout = QVBoxLayout(lock_box)
+        lock_box, lock_layout = style.card("Experiment lock", form=False)
+        self.lock_box = lock_box
 
         self.lock_label = QLabel("")
         self.lock_label.setWordWrap(True)
         self.lock_label.setVisible(False)
+        self.lock_label.setToolTip(
+            "Shown while an experiment runs: magnet commands from this window "
+            "are locked so they can't interleave with the experiment's own."
+        )
         lock_layout.addWidget(self.lock_label)
 
         self.override_check = QCheckBox("Allow manual control during experiment")
         self.override_check.setChecked(False)
+        self.override_check.setToolTip(
+            "Unlock this window's commands while an experiment runs (after a "
+            "warning). Manual changes then affect the measurement. Cleared "
+            "when the next experiment starts."
+        )
         # Only meaningful while an experiment is running.
         self.override_check.setVisible(False)
         lock_layout.addWidget(self.override_check)
 
         post_layout = QHBoxLayout()
-        post_layout.addWidget(QLabel("After experiment:"))
         self.post_experiment_combo = QComboBox()
         self.post_experiment_combo.addItems(
             [POST_EXPERIMENT_FIELD_ZERO, POST_EXPERIMENT_ELECTRICAL_OFF]
@@ -172,19 +187,12 @@ class MagnetControlWindow(QMainWindow):
             "Applies to static-field experiments (e.g. ODMR). After a Zero Field "
             "scan the magnet is always turned off by the experiment itself."
         )
+        post_layout.addWidget(_tipped("After experiment:", self.post_experiment_combo))
         post_layout.addWidget(self.post_experiment_combo)
         post_layout.addStretch()
         lock_layout.addLayout(post_layout)
 
         main_layout.addWidget(lock_box)
-
-        polarity_layout = QHBoxLayout()
-        self.polarity_labels = {}
-        for name in ("X", "Y", "Z"):
-            label = QLabel(f"{name} coil polarity: Unknown")
-            self.polarity_labels[name.lower()] = label
-            polarity_layout.addWidget(label)
-        main_layout.addLayout(polarity_layout)
 
         self.tabs = QTabWidget()
         main_layout.addWidget(self.tabs)
@@ -201,161 +209,104 @@ class MagnetControlWindow(QMainWindow):
         )
 
         layout = QVBoxLayout(manual_tab)
+        layout.setSpacing(style.COLUMN_SPACING)
 
-        # =================================================
-        # AXIS
-        # =================================================
+        # ---- One command: axis, field, Apply/Refresh/Zero -----------------
 
-        axis_box = QGroupBox("Axis")
-
-        layout.addWidget(axis_box)
-
-        axis_layout = QHBoxLayout(axis_box)
+        command_box, command_form = style.card("Manual command")
+        layout.addWidget(command_box)
 
         self.axis_combo = QComboBox()
-
-        self.axis_combo.addItems(
-
-            [
-
-                "X",
-
-                "Y",
-
-                "Z",
-
-            ]
-
-        )
-
+        self.axis_combo.addItems(["X", "Y", "Z"])
         self.axis_combo.setCurrentText("Z")
-
-        axis_layout.addWidget(self.axis_combo)
-
-        # =================================================
-        # MAGNETIC FIELD
-        # =================================================
-
-        field_box = QGroupBox("Target Magnetic Field")
-
-        layout.addWidget(field_box)
-
-        field_layout = QFormLayout(field_box)
+        self.axis_combo.setToolTip(
+            "Coil axis that Apply commands and that the readout below "
+            "describes."
+        )
+        command_form.addRow(_tipped("Axis:", self.axis_combo), self.axis_combo)
 
         self.field_spin = QDoubleSpinBox()
-
         self.field_spin.setRange(-1000.0, 1000.0)
-        self.field_spin.setDecimals(3)
+        self.field_spin.setDecimals(4)
         self.field_spin.setSingleStep(1.0)
         self.field_spin.setSuffix(" G")
-
-        field_layout.addRow(
-            "Field (G)",
-            self.field_spin
+        self.field_spin.setToolTip(
+            "Total field to command on the selected axis, in gauss (G). "
+            "Calibrated: 0 G cancels the lab background on this axis. "
+            "Positive and negative values select the relay branch "
+            "automatically. Sent when you press Apply."
         )
-        # =================================================
-        # BUTTONS
-        # =================================================
-
-        button_layout = QHBoxLayout()
+        command_form.addRow(_tipped("Field:", self.field_spin), self.field_spin)
 
         self.apply_button = QPushButton("Apply")
+        self.apply_button.setToolTip(
+            "Command the field above on the selected axis. Needs the magnet "
+            "on; locked while an experiment runs."
+        )
         self.read_button = QPushButton("Refresh")
+        self.read_button.setToolTip(
+            "Re-read the commanded/model state shown below. No hardware "
+            "command is sent."
+        )
         self.zero_button = QPushButton("Magnetic Zero (all axes)")
         self.zero_button.setToolTip(
             "Command calibrated 0 G on every axis. Compensation currents may be nonzero."
         )
+        command_form.addRow(style.button_row(
+            self.apply_button, self.read_button, self.zero_button))
 
+        # ---- Selected axis: commanded/model state -------------------------
 
-        button_layout.addWidget(self.apply_button)
-        button_layout.addWidget(self.read_button)
-        button_layout.addWidget(self.zero_button)
-        layout.addLayout(button_layout)
-
-        # =================================================
-        # CURRENT STATUS
-        # =================================================
-
-        current_box = QGroupBox("Commanded / Model Status")
-
+        current_box, current_layout = style.card("Commanded / Model Status")
         layout.addWidget(current_box)
 
-        current_layout = QFormLayout(current_box)
-
         self.current_field_label = QLabel("0.000 G")
-
         self.current_current_label = QLabel("0.0000 A")
-
         self.direction_label = QLabel("Positive")
-
         self.connection_label = QLabel("Connected")
-
-        current_layout.addRow(
-            "Model Field (G)",
-            self.current_field_label
+        current_layout.addRow("Model field:", self.current_field_label)
+        current_layout.addRow("Commanded current:", self.current_current_label)
+        current_layout.addRow("Coil polarity:", self.direction_label)
+        current_layout.addRow("Status:", self.connection_label)
+        current_box.setToolTip(
+            "The selected axis as last commanded, and its calibration-model "
+            "field. Not a measurement: there is no field readback."
         )
 
-        current_layout.addRow(
-            "Commanded Current",
-            self.current_current_label
+        # ---- All axes: model vector and relay polarity --------------------
+
+        self.vector_box, vector_layout = style.card(self._VECTOR_BOX_TITLE)
+        self.vector_box.setToolTip(
+            "Model field on every axis (calibration values, not measured) "
+            "and each coil's relay polarity. During a Zero Field scan: the "
+            "scan's commanded vector, live."
         )
-
-        current_layout.addRow(
-            "Coil Polarity",
-            self.direction_label
-        )
-
-        current_layout.addRow(
-            "Status",
-            self.connection_label
-        )
-
-        # =====================================================
-        # CURRENT MAGNET VECTOR
-        # =====================================================
-
-        self.vector_box = QGroupBox(self._VECTOR_BOX_TITLE)
-
         layout.addWidget(self.vector_box)
-
-        vector_layout = QFormLayout(self.vector_box)
 
         self.bx_label = QLabel("0.000 G")
         self.by_label = QLabel("0.000 G")
         self.bz_label = QLabel("0.000 G")
+        self.polarity_labels = {}
+        for name, value_label in (("X", self.bx_label), ("Y", self.by_label),
+                                  ("Z", self.bz_label)):
+            polarity = QLabel(f"{name} coil polarity: Unknown")
+            style.muted(polarity)
+            self.polarity_labels[name.lower()] = polarity
+            row = QHBoxLayout()
+            row.addWidget(value_label, 1)
+            row.addWidget(polarity)
+            vector_layout.addRow(f"B{name.lower()}:", row)
 
-        vector_layout.addRow(
-            "Bx (G)",
-            self.bx_label
-        )
+        layout.addStretch()
 
-        vector_layout.addRow(
-            "By (G)",
-            self.by_label
-        )
-
-        vector_layout.addRow(
-            "Bz (G)",
-            self.bz_label
-        )
-
-        
         # =================================================
-        # STATUS
+        # STATUS (in the window's status bar)
         # =================================================
-
-        status_box = QGroupBox("Status")
-
-        layout.addWidget(status_box)
-
-        status_layout = QVBoxLayout(status_box)
 
         self.status_label = QLabel("Ready")
         self.status_label.setWordWrap(True)
-
-        status_layout.addWidget(self.status_label)
-
-        layout.addStretch()
+        self.status_label.setToolTip("Result of the last command or action.")
+        self.statusBar().addWidget(self.status_label, 1)
 
         # =====================================================
         # CONFIGURATION TAB
@@ -374,11 +325,10 @@ class MagnetControlWindow(QMainWindow):
         # Configuration Information
         # -----------------------------------------------------
 
-        info_box = QGroupBox("Configuration Information")
+        info_box, info_layout = style.card("Configuration Information")
 
         cfg_layout.addWidget(info_box)
 
-        info_layout = QFormLayout(info_box)
 
         self.cfg_axis_label = QLabel("Z")
 
@@ -412,9 +362,7 @@ class MagnetControlWindow(QMainWindow):
         # Buttons
         # -----------------------------------------------------
 
-        config_box = QGroupBox("Configuration")
-
-        config_layout = QFormLayout(config_box)
+        config_box, config_layout = style.card("Configuration")
 
         cfg_layout.addWidget(config_box)
 
@@ -516,7 +464,7 @@ class MagnetControlWindow(QMainWindow):
             self.power_button.setText("Magnet ON: Turn OFF (de-energize)")
 
             self.power_button.setStyleSheet(
-                "background-color: lightgreen;"
+                f"background-color: {style.MAGNET_ON_BACKGROUND};"
             )
 
         else:
@@ -524,7 +472,7 @@ class MagnetControlWindow(QMainWindow):
             self.power_button.setText("Magnet OFF: Turn ON")
 
             self.power_button.setStyleSheet(
-                "background-color: lightgray;"
+                f"background-color: {style.MAGNET_OFF_BACKGROUND};"
             )
 
         self._apply_command_lock()
