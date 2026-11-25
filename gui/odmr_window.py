@@ -170,6 +170,9 @@ class ODMRWindow(QMainWindow):
 
         self.latest_x = None
         self.latest_y = None
+        # What the plot shows (displayed_data()): set after each completed
+        # sweep; never a sweep in progress.
+        self.display = None
         self.current_config = None
         self.scan_start_time = None
 
@@ -353,6 +356,8 @@ class ODMRWindow(QMainWindow):
 
         self.latest_x = None
         self.latest_y = None
+        self.display = None
+        self.panel.set_plot_title("")
         self.panel.set_statistics_status("Statistics: No completed acquisition")
 
         self.scan_start_time = time.time()
@@ -395,6 +400,7 @@ class ODMRWindow(QMainWindow):
         self.odmr_thread.started.connect(self.odmr_worker.start)
 
         self.odmr_worker.point_signal.connect(self.store_latest_data)
+        self.odmr_worker.sweep_completed_signal.connect(self.show_completed_sweeps)
         self.odmr_worker.finished_signal.connect(self.odmr_finished)
         self.odmr_worker.finished_signal.connect(self.odmr_thread.quit)
 
@@ -431,9 +437,22 @@ class ODMRWindow(QMainWindow):
     # =====================================================
 
     def store_latest_data(self, x, y):
+        """Every point: kept for saving at the end, never drawn (a sweep in
+        progress is not mixed into the displayed mean)."""
 
         self.latest_x = x
         self.latest_y = y
+
+    def show_completed_sweeps(self, completed, total, x, y, i_on, i_off):
+        """After each completed sweep: draw the mean of the sweeps completed
+        so far (sweep 1, then mean of 1-2, ...). No automatic fit; "Fit"
+        fits what is shown. Display only -- saving uses latest_x/latest_y."""
+        self.display = {
+            "x": x, "y": y, "i_on": i_on, "i_off": i_off,
+            "label": f"Average {completed} / {total}" if total > 1 else "",
+        }
+        self.refresh_plot()
+        self.panel.fit_button.setEnabled(True)
 
     # =====================================================
     # ESTIMATE ODMR TIME
@@ -528,33 +547,54 @@ class ODMRWindow(QMainWindow):
     # REFRESH PLOT
     # =====================================================
 
+    def displayed_data(self):
+        """What the plot shows: the mean of the completed sweeps (set per
+        completed sweep). Before any sweep completes nothing is shown while
+        the scan runs; after it ends, the last acquired data (the run was
+        stopped during its first sweep)."""
+        display = getattr(self, "display", None)
+        if display is not None:
+            return display
+        if getattr(self, "odmr_running", False):
+            return None
+        if self.latest_x is None or self.latest_y is None:
+            return None
+        worker = getattr(self, "odmr_worker", None)
+        total = getattr(worker, "n_avg", 1)
+        return {
+            "x": self.latest_x, "y": self.latest_y,
+            "i_on": getattr(worker, "i_on_data", None),
+            "i_off": getattr(worker, "i_off_data", None),
+            "label": (f"Incomplete sweep 1 / {total} (stopped)"
+                      if isinstance(total, int) and total > 1 else ""),
+        }
+
     def refresh_plot(self):
 
-        if self.latest_x is None or self.latest_y is None:
+        data = self.displayed_data()
+        if data is None:
             return
 
         mode = self.panel.get_plot_mode()
 
         if mode == "Mean I_on / I_off":
 
-            if self.odmr_worker is None:
+            if data["i_on"] is None or data["i_off"] is None:
                 return
 
-            i_off = self.odmr_worker.i_off_data
-            i_on = self.odmr_worker.i_on_data
-
             self.panel.update_plot_raw(
-                self.latest_x,
-                i_on,
-                i_off
+                data["x"],
+                data["i_on"],
+                data["i_off"]
             )
 
         else:
 
             self.panel.update_plot_normalized(
-                self.latest_x,
-                self.latest_y
+                data["x"],
+                data["y"]
             )
+        self.panel.set_plot_title(data["label"])
 
     # =====================================================
     # FIT ESR
@@ -562,7 +602,14 @@ class ODMRWindow(QMainWindow):
 
     def fit_esr(self):
 
-        if self.latest_x is None or self.latest_y is None:
+        # Fits what the plot shows: the mean of the completed sweeps.
+        display = getattr(self, "display", None)
+        if display is not None:
+            x, y = display["x"], display["y"]
+        else:
+            x, y = self.latest_x, self.latest_y
+
+        if x is None or y is None:
             QMessageBox.warning(
                 self,
                 "Fit Error",
@@ -575,20 +622,20 @@ class ODMRWindow(QMainWindow):
             fit_type = self.panel.get_fit_type()
             manual = self.initial_fit_guesses[fit_type]
             if manual is not None:
-                low, high = float(np.min(self.latest_x)), float(np.max(self.latest_x))
+                low, high = float(np.min(x)), float(np.max(x))
                 check_manual_locations_in_range(fit_type, manual, low, high)
 
             initial_guess = manual_initial_guess(fit_type, manual)
             if fit_type == "Single Lorentzian":
                 fit = fit_single_lorentzian(
-                    self.latest_x,
-                    self.latest_y,
+                    x,
+                    y,
                     **({} if initial_guess is None else {"initial_guess": initial_guess})
                 )
             else:
                 fit = fit_double_lorentzian(
-                    self.latest_x,
-                    self.latest_y,
+                    x,
+                    y,
                     **({} if initial_guess is None else {"initial_guess": initial_guess})
                 )
 
@@ -597,7 +644,7 @@ class ODMRWindow(QMainWindow):
             self.refresh_plot()
 
             self.panel.plot.plot(
-                self.latest_x,
+                x,
                 fit["fit_y"],
                 pen="c",
                 width=3
@@ -648,6 +695,15 @@ class ODMRWindow(QMainWindow):
                         f"Statistics: Processing failed ({detail or type(error).__name__})"
                     )
 
+        # Stopped (or failed) before the last sweep: keep showing the mean of
+        # the completed sweeps, and say so.
+        display = getattr(self, "display", None)
+        worker = getattr(self, "odmr_worker", None)
+        total = getattr(worker, "n_avg", None)
+        completed = getattr(worker, "completed_averages", None)
+        if display is not None and total is not None and completed is not None \
+                and completed < total and display["label"]:
+            display["label"] += " (stopped)"
         self.refresh_plot()
         self.panel.fit_button.setEnabled(True)
 

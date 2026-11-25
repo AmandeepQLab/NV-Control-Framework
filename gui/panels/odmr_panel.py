@@ -425,6 +425,7 @@ class ODMRPanel(QWidget):
         plot_layout.addWidget(self.plot)
 
         self.curve = self.plot.plot([], [], pen="y", symbol="o", symbolSize=6)
+        self.plot_title = ""
 
     # ---- section summaries ---------------------------------------------------
 
@@ -662,6 +663,11 @@ class ODMRPanel(QWidget):
 
     def update_plot(self, x, y):
         self.update_plot_normalized(x, y)
+
+    def set_plot_title(self, text):
+        """Which average the plot shows, e.g. "Average 3 / 5" (empty: none)."""
+        self.plot.setTitle(text or None)
+        self.plot_title = text or ""
 
     def reset_plot(self):
         self.plot.clear()

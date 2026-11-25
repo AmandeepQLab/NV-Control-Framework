@@ -104,8 +104,12 @@ Both selectors offer the same list: `gui/display_settings.py::COLORMAP_NAMES` (G
 - **The scalar contrast for the live plot keeps the old convention:** the mean of per-repeat ROI-mean ratios (see "per-repeat-ratio averaging" below). `process_frame()`/`acquire_configured_point()` remain for other callers.
 
 **`averages` now means independent full sweeps, not repeats of one point.** Before, `ODMRWorker` looped `averages` times inside each frequency point. Now it walks the whole frequency list once per average.
-- The live curve is the running mean over sweeps acquired so far.
-- **The ODMR plot is deliberately not live-plotted per point; do not change that.** A half-finished sweep must never be mixed into the displayed running mean. As the code stands, `ODMRWindow` only stores each `point_signal` (whose per-point mean already includes the in-progress sweep) and redraws when the scan finishes (`odmr_finished()`), on Fit, or on a plot-mode change — there is no redraw after each completed sweep, and a plot-mode change mid-scan does draw the partial sweep.
+- **The ODMR plot shows the running mean of the completed sweeps, redrawn after each sweep; it is deliberately not live-plotted per point; do not change that.** A half-finished sweep must never be mixed into the displayed mean.
+  - `ODMRWorker.sweep_completed_signal(completed, total, x, y, i_on, i_off)` fires when a sweep completes. At that moment every point has been measured once per completed sweep, so the worker's running means are exactly the mean of sweeps 1…k. `ODMRWindow.show_completed_sweeps()` stores it as `display` and redraws; the plot title says "Average k / N" (no title with Averages = 1).
+  - `point_signal` still only updates `latest_x`/`latest_y` (its per-point mean includes the in-progress sweep). Those are what is **saved**, unchanged; the display never feeds the saved data.
+  - The plot, a plot-mode change and Fit all use `displayed_data()`: the completed-sweeps mean, or nothing while the first sweep runs. No automatic fit; Fit is enabled after the first completed sweep and fits what is shown.
+  - Finished normally: the final plot is the mean of all sweeps, identical to `latest_*`, as before. Stopped or failed after k ≥ 1 sweeps: the k-sweep mean stays shown, titled "Average k / N (stopped)" (the saved spectrum still includes the partial sweep, as before). Stopped during the first sweep: the partial data is shown, titled "Incomplete sweep 1 / N (stopped)" (no title with Averages = 1), as before.
+  - Tests: `tests/test_odmr_running_average.py`.
 - `n_points * averages` acquisitions, so `estimate_odmr_time()` is unchanged in form.
 - Every average must have the same repeat count, or the worker raises.
 

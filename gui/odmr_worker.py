@@ -17,6 +17,10 @@ LOGGER = logging.getLogger(__name__)
 class ODMRWorker(QObject):
 
     point_signal = pyqtSignal(object, object)
+    # After each completed sweep: (completed sweeps, total averages, x GHz,
+    # y, i_on, i_off) -- the running mean of the completed sweeps only (each
+    # point has then been measured once per completed sweep). Display only.
+    sweep_completed_signal = pyqtSignal(int, int, object, object, object, object)
     finished_signal = pyqtSignal()
     error_signal = pyqtSignal(str)
     progress_signal = pyqtSignal(int, int)
@@ -315,6 +319,7 @@ class ODMRWorker(QObject):
         self.i_on_data = self.i_on_results[valid].tolist()
 
         self.freq_index += 1
+        sweep_completed = False
         if self.freq_index >= len(self.freqs):
             if len(set(self._repeat_counts_for_average)) != 1:
                 raise RuntimeError(
@@ -326,7 +331,14 @@ class ODMRWorker(QObject):
             self._repeat_counts_for_average = []
             self.average_index += 1
             self.freq_index = 0
+            sweep_completed = True
         self.point_signal.emit(self.xdata.copy(), self.ydata.copy())
+        if sweep_completed:
+            self.sweep_completed_signal.emit(
+                self.completed_averages, self.n_avg,
+                self.xdata.copy(), self.ydata.copy(),
+                list(self.i_on_data), list(self.i_off_data),
+            )
         if self.average_index >= self.n_avg:
             self._finish()
 
