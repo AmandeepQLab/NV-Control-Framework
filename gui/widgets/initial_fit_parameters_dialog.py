@@ -25,6 +25,13 @@ FIT_TYPES = (SINGLE_LORENTZIAN, DOUBLE_LORENTZIAN)
 CLEAR_BUTTON_TEXT = "Clear / use automatic guesses"
 
 
+_FIELD_TOOLTIPS = {
+    "f0": ("Approximate dip centre in GHz, inside the measured frequency "
+           "range. Required: it is where the fit starts."),
+    "contrast": "Approximate dip depth in % of the baseline. Blank: automatic.",
+    "fwhm": "Approximate full width at half maximum, in MHz. Blank: automatic.",
+}
+
 class InitialFitParametersDialog(QDialog):
     """Collect optional manual initial values for an ODMR Lorentzian fit.
 
@@ -57,6 +64,7 @@ class InitialFitParametersDialog(QDialog):
         for key, label, required in specs:
             field = QLineEdit(self)
             field.setPlaceholderText("Required" if required else "Automatic if blank")
+            field.setToolTip(_FIELD_TOOLTIPS[key.rstrip("12")])
             if initial_values.get(key) is not None:
                 field.setText(str(initial_values[key]))
             self.fields[key] = field
@@ -70,6 +78,9 @@ class InitialFitParametersDialog(QDialog):
             self.clear_button = buttons.addButton(
                 CLEAR_BUTTON_TEXT, QDialogButtonBox.ButtonRole.ResetRole
             )
+            self.clear_button.setToolTip(
+                "Forget the values for this fit type and use the automatic "
+                "guess again.")
             self.clear_button.clicked.connect(self.clear_and_accept)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)

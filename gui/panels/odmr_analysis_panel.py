@@ -15,7 +15,14 @@ from PyQt6.QtWidgets import (
 )
 
 from gui.widgets.initial_fit_parameters_dialog import DOUBLE_LORENTZIAN, FIT_TYPES
+from gui import style
 
+
+def _tipped(text, field):
+    """A label carrying its field's tooltip."""
+    label = QLabel(text)
+    label.setToolTip(field.toolTip())
+    return label
 
 class ODMRAnalysisPanel(QWidget):
     """Controls and displays for global and pixel-wise ODMR analysis."""
@@ -36,7 +43,7 @@ class ODMRAnalysisPanel(QWidget):
         control_layout = QVBoxLayout()
         main_layout.addLayout(control_layout, 1)
 
-        controls = QGroupBox("Analysis")
+        controls = style.mark_card(QGroupBox("Analysis"))
         controls_layout = QVBoxLayout(controls)
         self.open_button = QPushButton("Open ODMR HDF5")
         self.fit_button = QPushButton("Fit Global Spectrum")
@@ -46,12 +53,33 @@ class ODMRAnalysisPanel(QWidget):
         self.fit_button.setEnabled(False)
         self.fit_pixels_button.setEnabled(False)
         self.reconstruct_bz_button.setEnabled(False)
+        self.open_button.setToolTip(
+            "Open a saved odmr_statistics.h5 (from an ODMR scan with \"Save "
+            "data\" on) and compute its statistics. Touches no hardware.")
+        self.fit_button.setToolTip(
+            "Fit the spatial-mean spectrum with the selected fit type. A "
+            "successful Double fit seeds the per-pixel fits.")
+        self.initial_fit_parameters_button.setToolTip(
+            "Give starting values for the global fit (dip locations in GHz; "
+            "optionally contrast and FWHM). Use it when the automatic guess "
+            "puts both dips on the same line.")
+        self.fit_pixels_button.setToolTip(
+            "Fit every pixel's spectrum with a double Lorentzian seeded by the "
+            "global Double fit. Runs in the background; one pixel's failure "
+            "never stops the rest.")
+        self.reconstruct_bz_button.setToolTip(
+            "Compute the field magnitude |Bz| per pixel from the dip splitting "
+            "(f+ - f-)/(2 gamma) / cos(54.74 deg), in G, with uncertainty. No "
+            "sign and no background subtraction.")
 
         # Same labels and order as the ODMR window's selector. Double is
         # preselected because it was this window's only fit before.
         fit_type_row = QHBoxLayout()
-        fit_type_row.addWidget(QLabel("Fit type:"))
         self.fit_type_combo = QComboBox()
+        self.fit_type_combo.setToolTip(
+            "Model for the global fit: Single or Double Lorentzian. Only a "
+            "Double fit enables Fit Pixels and Reconstruct Bz.")
+        fit_type_row.addWidget(_tipped("Fit type:", self.fit_type_combo))
         self.fit_type_combo.addItems(list(FIT_TYPES))
         self.fit_type_combo.setCurrentText(DOUBLE_LORENTZIAN)
         fit_type_row.addWidget(self.fit_type_combo, 1)
@@ -73,7 +101,7 @@ class ODMRAnalysisPanel(QWidget):
         controls_layout.addWidget(self.status_label)
         control_layout.addWidget(controls)
 
-        metadata_box = QGroupBox("Acquisition Metadata")
+        metadata_box = style.mark_card(QGroupBox("Acquisition Metadata"))
         metadata_layout = QVBoxLayout(metadata_box)
         self.metadata_label = QLabel("No dataset loaded.")
         self.metadata_label.setWordWrap(True)
@@ -83,14 +111,14 @@ class ODMRAnalysisPanel(QWidget):
         metadata_layout.addWidget(self.metadata_label)
         control_layout.addWidget(metadata_box)
 
-        fit_box = QGroupBox("Global Fit")
+        fit_box = style.mark_card(QGroupBox("Global Fit"))
         fit_layout = QVBoxLayout(fit_box)
         self.fit_info_label = QLabel("No global fit available.")
         self.fit_info_label.setWordWrap(True)
         fit_layout.addWidget(self.fit_info_label)
         control_layout.addWidget(fit_box)
 
-        pixel_box = QGroupBox("Pixel Fit")
+        pixel_box = style.mark_card(QGroupBox("Pixel Fit"))
         pixel_layout = QVBoxLayout(pixel_box)
         self.pixel_fit_summary_label = QLabel("No pixel fit available.")
         self.pixel_fit_summary_label.setWordWrap(True)
@@ -104,7 +132,7 @@ class ODMRAnalysisPanel(QWidget):
         result_layout = QVBoxLayout()
         main_layout.addLayout(result_layout, 4)
 
-        plot_box = QGroupBox("Global ODMR Spectrum")
+        plot_box = style.mark_card(QGroupBox("Global ODMR Spectrum"))
         plot_layout = QVBoxLayout(plot_box)
         self.plot = pg.PlotWidget()
         self.plot.getViewBox().unregister()
@@ -123,11 +151,14 @@ class ODMRAnalysisPanel(QWidget):
         spatial_layout = QHBoxLayout()
         result_layout.addLayout(spatial_layout, 2)
 
-        map_box = QGroupBox("Pixel Result Map")
+        map_box = style.mark_card(QGroupBox("Pixel Result Map"))
         map_layout = QVBoxLayout(map_box)
         map_controls = QHBoxLayout()
-        map_controls.addWidget(QLabel("Map:"))
         self.map_combo = QComboBox()
+        self.map_combo.setToolTip(
+            "Which per-pixel result the map shows. Click a pixel to see its "
+            "spectrum and fit.")
+        map_controls.addWidget(_tipped("Map:", self.map_combo))
         self.map_combo.addItems(
             ["f_minus", "f_plus", "splitting", "RMSE", "fit_status", "Bz magnitude"]
         )
@@ -136,17 +167,24 @@ class ODMRAnalysisPanel(QWidget):
         map_layout.addLayout(map_controls)
 
         color_controls = QHBoxLayout()
-        color_controls.addWidget(QLabel("Colormap:"))
         self.colormap_combo = QComboBox()
+        self.colormap_combo.setToolTip("Colour map of the result map (display only).")
+        color_controls.addWidget(_tipped("Colormap:", self.colormap_combo))
         self.colormap_combo.addItems(
             ["Viridis", "Plasma", "Inferno", "Magma", "Cividis"]
         )
         color_controls.addWidget(self.colormap_combo)
-        color_controls.addWidget(QLabel("Min:"))
         self.scale_min_spin = self._make_scale_spinbox()
+        self.scale_min_spin.setToolTip(
+            "Lowest value of the colour scale, in the map's own unit. Display "
+            "only; Auto restores automatic limits.")
+        color_controls.addWidget(_tipped("Min:", self.scale_min_spin))
         color_controls.addWidget(self.scale_min_spin)
-        color_controls.addWidget(QLabel("Max:"))
         self.scale_max_spin = self._make_scale_spinbox()
+        self.scale_max_spin.setToolTip(
+            "Highest value of the colour scale, in the map's own unit. Display "
+            "only; Auto restores automatic limits.")
+        color_controls.addWidget(_tipped("Max:", self.scale_max_spin))
         color_controls.addWidget(self.scale_max_spin)
         self.auto_scale_button = QPushButton("Auto")
         self.auto_scale_button.setToolTip("Restore automatic color-scale limits")
@@ -179,7 +217,7 @@ class ODMRAnalysisPanel(QWidget):
         map_layout.addWidget(self.status_legend_label)
         spatial_layout.addWidget(map_box, 3)
 
-        pixel_plot_box = QGroupBox("Selected Pixel Spectrum")
+        pixel_plot_box = style.mark_card(QGroupBox("Selected Pixel Spectrum"))
         pixel_plot_layout = QVBoxLayout(pixel_plot_box)
         self.pixel_plot = pg.PlotWidget()
         self.pixel_plot.getViewBox().unregister()

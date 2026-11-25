@@ -20,15 +20,16 @@ from PyQt6.QtCore import QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
     QGridLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
     QVBoxLayout,
+    QWidget,
 )
 
 from framework.count_statistics import CountLog, RunningStatistics, frame_sample
 from gui.widgets import run_button
+from gui.widgets.collapsible_section import CollapsibleSection
 from gui.widgets.run_button import style_run_button
 
 LOGGER = logging.getLogger(__name__)
@@ -58,6 +59,18 @@ def _describe_change(old, new):
     return ", ".join(changes)
 
 
+_VALUE_TOOLTIPS = {
+    "actual": "Mean counts of the latest accepted live frame (whole ROI).",
+    "mean": "Mean of the accumulated samples (counts).",
+    "minimum": "Smallest accumulated sample (counts).",
+    "maximum": "Largest accumulated sample (counts).",
+    "std": "Sample standard deviation (ddof=1), in counts and % of the mean.",
+    "ratio": "Largest / smallest accumulated sample.",
+    "count": "Number of accepted samples (repeated frames are dropped).",
+    "elapsed": "Time spent accumulating (Stop pauses it).",
+}
+
+
 def _fmt(value, spec):
     return "--" if value is None or not math.isfinite(value) else format(value, spec)
 
@@ -67,8 +80,11 @@ def _fmt_elapsed(seconds):
     return f"{seconds // 3600}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
 
 
-class CountStatisticsPanel(QGroupBox):
+class CountStatisticsPanel(CollapsibleSection):
     """Statistics of the live-view mean counts: values, trend and CSV log.
+
+    A collapsible section, open by default; folded, its summary line keeps
+    showing the status and the mean/std (refreshed with the labels, 4 Hz).
 
     settings_getter() returns the main window's AcquisitionState; a change
     of its ROI, exposure or binning resets the statistics. camera_owned()
@@ -87,7 +103,13 @@ class CountStatisticsPanel(QGroupBox):
 
     def __init__(self, settings_getter, camera_owned, log_directory=None,
                  clock=time.monotonic, now=datetime.now, parent=None):
-        super().__init__("Count statistics", parent)
+        super().__init__(
+            "Count statistics", expanded=True,
+            settings_key="main/count_statistics", parent=parent,
+            tooltip=("Show or hide the count statistics. Folded, they keep "
+                     "running; the line below the title shows the status "
+                     "and mean."),
+        )
         self._settings_getter = settings_getter
         self._camera_owned = camera_owned
         self._log_directory = Path(log_directory or _DEFAULT_LOG_DIRECTORY)
@@ -118,7 +140,10 @@ class CountStatisticsPanel(QGroupBox):
     # ---- layout ---------------------------------------------------------
 
     def _build_ui(self):
-        layout = QHBoxLayout(self)
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.body_layout().addRow(container)
 
         left = QVBoxLayout()
         layout.addLayout(left, 0)
@@ -134,8 +159,11 @@ class CountStatisticsPanel(QGroupBox):
         # Two columns of four, so the panel stays short under the image.
         for index, (key, title) in enumerate(rows):
             row, column = index % 4, 2 * (index // 4)
-            grid.addWidget(QLabel(f"{title}:"), row, column)
+            name = QLabel(f"{title}:")
+            name.setToolTip(_VALUE_TOOLTIPS[key])
+            grid.addWidget(name, row, column)
             label = QLabel("--")
+            label.setToolTip(_VALUE_TOOLTIPS[key])
             label.setMinimumWidth(150)
             grid.addWidget(label, row, column + 1)
             self.value_labels[key] = label
@@ -146,6 +174,9 @@ class CountStatisticsPanel(QGroupBox):
         self.start_stop_button.clicked.connect(self.toggle_accumulation)
         buttons.addWidget(self.start_stop_button)
         self.reset_button = QPushButton("Reset")
+        self.reset_button.setToolTip(
+            "Clear the statistics, trend and elapsed time; accumulation keeps "
+            "running if it was.")
         self.reset_button.clicked.connect(lambda: self.reset("Statistics reset"))
         buttons.addWidget(self.reset_button)
         left.addLayout(buttons)
@@ -160,6 +191,9 @@ class CountStatisticsPanel(QGroupBox):
         left.addWidget(self.log_check)
 
         self.status_label = QLabel()
+        self.status_label.setToolTip(
+            "Accumulating, stopped, or paused while an experiment owns the "
+            "camera.")
         self.note_label = QLabel("")
         self.note_label.setWordWrap(True)
         self.log_label = QLabel("")
@@ -173,6 +207,8 @@ class CountStatisticsPanel(QGroupBox):
         self.trend_plot.setLabel("bottom", "Time (s)")
         self.trend_plot.showGrid(x=True, y=True)
         self.trend_curve = self.trend_plot.plot([], [], pen="y")
+        self.trend_plot.setToolTip(
+            "Accepted samples of the last 5 minutes; a pause breaks the line.")
         layout.addWidget(self.trend_plot, 1)
 
         # Keep the live image the main thing in the column above it.
@@ -182,9 +218,13 @@ class CountStatisticsPanel(QGroupBox):
 
     def _update_button(self):
         if self.accumulating:
-            style_run_button(self.start_stop_button, run_button.RUNNING, "Stop")
+            style_run_button(self.start_stop_button, run_button.RUNNING, "Stop",
+                             "Stop accumulating (pauses the elapsed time).")
         else:
-            style_run_button(self.start_stop_button, run_button.IDLE, "Start")
+            style_run_button(
+                self.start_stop_button, run_button.IDLE, "Start",
+                "Start accumulating statistics of the live-view mean counts "
+                "(the live view must be running).")
 
     # ---- frames ---------------------------------------------------------
 
@@ -360,6 +400,11 @@ class CountStatisticsPanel(QGroupBox):
         v["count"].setText(str(s.count))
         v["elapsed"].setText(_fmt_elapsed(self.elapsed_s()))
         self.status_label.setText(f"Status: {self.status_text()}")
+        s_mean = _fmt(s.mean, ".7g")
+        self.set_summary(
+            f"{self.status_text()}; mean {s_mean}"
+            + ("" if not math.isfinite(s.std) else f", std {s.std_percent:.3f} %")
+            + f", {s.count} samples")
 
         if self._trend:
             t, y = (np.array(c, dtype=float) for c in zip(*self._trend))

@@ -89,5 +89,52 @@ class MainWindowLayoutTests(unittest.TestCase):
         self.assertEqual(missing, [])
 
 
+    def test_count_statistics_is_an_open_section_with_a_summary(self):
+        panel = self.main.count_statistics_panel
+        self.assertEqual(panel.title(), "Count statistics")
+        self.assertTrue(panel.is_expanded())
+        panel.refresh()
+        self.assertIn("samples", panel.summary())
+        panel.set_expanded(False)
+        try:
+            self.assertFalse(panel.summary_label.isHidden())
+        finally:
+            panel.set_expanded(True)
+        controls = [c for kind in (QAbstractButton,) for c in panel.body.findChildren(kind)]
+        self.assertEqual([c.text() for c in controls if not c.toolTip().strip()], [])
+
+    def test_live_view_in_a_card(self):
+        main = self.main
+        self.assertEqual(main.live_view_group.title(), "Live view")
+        self.assertTrue(main.live_view_group.isAncestorOf(main.image_view))
+        self.assertTrue(main.live_view_group.isAncestorOf(main.colormap_combo))
+
+
+class OtherWindowsTooltipTests(unittest.TestCase):
+    def test_odmr_analysis_window_controls_have_tooltips(self):
+        from gui.odmr_analysis_window import ODMRAnalysisWindow
+        window = ODMRAnalysisWindow()
+        self.addCleanup(window.deleteLater)
+        controls = [c for kind in (QAbstractButton, QAbstractSpinBox, QComboBox)
+                    for c in window.panel.findChildren(kind)
+                    if not isinstance(c.parentWidget(), (QAbstractSpinBox, QComboBox))]
+        self.assertGreaterEqual(len(controls), 11)
+        missing = [getattr(c, "text", lambda: type(c).__name__)()
+                   for c in controls if not c.toolTip().strip()]
+        self.assertEqual(missing, [])
+        # Precision kept (the map limits had 9 decimals).
+        self.assertEqual(window.panel.scale_min_spin.decimals(), 9)
+
+    def test_initial_fit_dialog_fields_have_tooltips(self):
+        from gui.widgets.initial_fit_parameters_dialog import (
+            DOUBLE_LORENTZIAN, InitialFitParametersDialog, SINGLE_LORENTZIAN)
+        for fit_type in (SINGLE_LORENTZIAN, DOUBLE_LORENTZIAN):
+            dialog = InitialFitParametersDialog(fit_type, allow_clear=True)
+            self.addCleanup(dialog.deleteLater)
+            for key, field in dialog.fields.items():
+                self.assertTrue(field.toolTip().strip(), key)
+            self.assertTrue(dialog.clear_button.toolTip().strip())
+
+
 if __name__ == "__main__":
     unittest.main()

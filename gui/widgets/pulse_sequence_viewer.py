@@ -105,6 +105,9 @@ class PulseSequenceViewer(QWidget):
         self.reset_button = QPushButton(
             "Reset Zoom"
         )
+        self.reset_button.setToolTip(
+            "Show the whole pulse sequence again after zooming or panning."
+        )
 
         toolbar.addWidget(
             self.reset_button

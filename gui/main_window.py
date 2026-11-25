@@ -339,7 +339,12 @@ class MainWindow(QMainWindow):
         # =====================================================
 
         right_panel = QVBoxLayout()
+        right_panel.setSpacing(style.COLUMN_SPACING)
         main_layout.addLayout(right_panel, 4)
+
+        # The live image and its colormap in one card.
+        self.live_view_group, live_view_layout = style.card("Live view", form=False)
+        right_panel.addWidget(self.live_view_group, 3)
 
         # Same selector as the Zero Field window's (gui/display_settings.py).
         colormap_row = QHBoxLayout()
@@ -351,7 +356,7 @@ class MainWindow(QMainWindow):
         colormap_row.addWidget(_tipped("Colormap:", self.colormap_combo))
         colormap_row.addWidget(self.colormap_combo)
         colormap_row.addStretch()
-        right_panel.addLayout(colormap_row)
+        live_view_layout.addLayout(colormap_row)
 
         self.image_plot = pg.PlotItem()
         self.image_plot.showAxis("bottom", True)
@@ -360,7 +365,7 @@ class MainWindow(QMainWindow):
         # Own name, not pyqtgraph's shared default "ImageView" (see
         # gui/pyqtgraph_teardown.py).
         self.image_view = pg.ImageView(view=self.image_plot, name="LiveView")
-        right_panel.addWidget(self.image_view, 3)
+        live_view_layout.addWidget(self.image_view, 1)
         self._init_live_view_colormap()
 
         # Statistics of the live-view mean counts. It only consumes frames
