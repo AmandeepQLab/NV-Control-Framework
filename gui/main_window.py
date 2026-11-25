@@ -20,6 +20,8 @@ from gui.odmr_window import ODMRWindow
 from gui.odmr_analysis_window import ODMRAnalysisWindow
 from gui.zero_field_window import ZeroFieldWindow
 from gui.pyqtgraph_teardown import clear_view_registry
+from gui import style
+from gui.widgets.collapsible_section import enable_state_persistence
 from framework.camera_ownership import (
     apply_live_acquisition_state,
     experiment_owns_camera,
@@ -1268,6 +1270,11 @@ def main():
     args, _ = parser.parse_known_args()
 
     app = QApplication(sys.argv)
+    # Normal launch only: the shared look, and remembered open/closed
+    # sections (tests and scripts that build windows directly get neither,
+    # so they always see the documented defaults).
+    style.apply_app_style(app)
+    enable_state_persistence()
 
     win = MainWindow(sim=args.sim)
     win.show()

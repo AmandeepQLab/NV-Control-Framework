@@ -10,10 +10,16 @@ IDLE = "idle"
 RUNNING = "running"
 BLOCKED = "blocked"
 
-# Same named colours the ODMR button has always used; grey with a light
-# text for the disabled ("blocked") state.
-_BACKGROUND = {IDLE: "green", RUNNING: "red", BLOCKED: "#707070"}
-_TEXT = {IDLE: "white", RUNNING: "white", BLOCKED: "#f0f0f0"}
+from gui import style
+
+# Same named colours the ODMR button has always used (defined in gui/style.py);
+# grey with a light text for the disabled ("blocked") state.
+_BACKGROUND = {
+    IDLE: style.RUN_IDLE_BACKGROUND,
+    RUNNING: style.RUN_RUNNING_BACKGROUND,
+    BLOCKED: style.RUN_BLOCKED_BACKGROUND,
+}
+_TEXT = {IDLE: style.RUN_TEXT, RUNNING: style.RUN_TEXT, BLOCKED: style.RUN_BLOCKED_TEXT}
 
 
 def run_button_stylesheet(state):

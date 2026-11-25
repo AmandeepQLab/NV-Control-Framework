@@ -14,6 +14,7 @@ has run. Only a separate process can show that the process quits.
 import os
 import subprocess
 import sys
+import tempfile
 import textwrap
 import unittest
 from pathlib import Path
@@ -96,13 +97,17 @@ _DRIVER = textwrap.dedent(
 
 
 def _run_app_and_exit(mode):
-    env = dict(os.environ, EXIT_TEST_MODE=mode, QT_QPA_PLATFORM="offscreen",
-               PYTHONIOENCODING="utf-8")
-    return subprocess.run(
-        [sys.executable, "-c", _DRIVER], cwd=REPO, env=env,
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-        timeout=90,
-    )
+    # main() remembers open/closed sections; keep that out of the user's
+    # registry by pointing it at a throwaway INI file.
+    with tempfile.TemporaryDirectory() as tmp:
+        env = dict(os.environ, EXIT_TEST_MODE=mode, QT_QPA_PLATFORM="offscreen",
+                   PYTHONIOENCODING="utf-8",
+                   NV_CONTROL_UI_STATE_FILE=os.path.join(tmp, "ui_state.ini"))
+        return subprocess.run(
+            [sys.executable, "-c", _DRIVER], cwd=REPO, env=env,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=90,
+        )
 
 
 class ProcessExitTests(unittest.TestCase):
