@@ -3,8 +3,13 @@ from experiments.odmr_experiment import (
     FIELD_MODE_CUSTOM,
     FIELD_MODE_LEAVE,
     FIELD_MODE_ZERO,
+    VECTOR_ENTRY_DIRECTION,
     ODMRExperiment,
+    commanded_vector_gauss,
+    direction_entry,
+    format_direction,
     magnet_field_problem,
+    vector_entry,
 )
 import numpy as np # type: ignore
 import time
@@ -76,13 +81,15 @@ def _format_vector(values):
 
 
 def target_field_gauss(config):
-    """(x, y, z) G a scan with *config* commands, or None (leave as is)."""
-    mode = config.get("magnet_field_mode", FIELD_MODE_LEAVE)
-    if mode == FIELD_MODE_ZERO:
-        return (0.0, 0.0, 0.0)
-    if mode == FIELD_MODE_CUSTOM:
-        return tuple(float(v) for v in config["magnet_custom_vector_gauss"])
-    return None
+    """(x, y, z) G a scan with *config* commands, or None (leave as is).
+
+    The experiment's own computation, so the window checks and shows
+    exactly what the scan will command. ValueError for an invalid
+    direction entry (zero direction, non-finite magnitude).
+    """
+    return commanded_vector_gauss(
+        config, config.get("magnet_field_mode", FIELD_MODE_LEAVE)
+    )
 
 
 def field_status_text(config, magnet):
@@ -94,6 +101,12 @@ def field_status_text(config, magnet):
     if mode == FIELD_MODE_ZERO:
         return f"Field: calibrated zero {_format_vector(target)} G"
     if mode == FIELD_MODE_CUSTOM:
+        if vector_entry(config) == VECTOR_ENTRY_DIRECTION:
+            direction, magnitude = direction_entry(config)
+            return (
+                f"Field: custom {magnitude:g} G along {format_direction(direction)}"
+                f" = {_format_vector(round(v, 4) + 0.0 for v in target)} G"
+            )
         return f"Field: custom {_format_vector(target)} G"
     if not magnet.is_enabled():
         return "Field: coils off (background)"
@@ -210,9 +223,20 @@ class ODMRWindow(QMainWindow):
         axis, pure calculation; only an out-of-range/non-finite target
         refuses. Runs before any state change, thread or stability wait.
         """
-        target = target_field_gauss(config)
         magnet = self._magnet()
-        if target is None or magnet is None:
+        if magnet is None:
+            return True
+        try:
+            target = target_field_gauss(config)
+        except ValueError as error:
+            QMessageBox.critical(
+                self,
+                "Invalid field direction",
+                f"{error}\n\nChoose a nonzero direction (nx, ny, nz) under "
+                "\"Magnetic field during scan\".",
+            )
+            return False
+        if target is None:
             return True
         problem = magnet_field_problem(magnet, target)
         if problem is None:

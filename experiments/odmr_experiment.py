@@ -8,6 +8,7 @@ from framework.scan_experiment import ScanExperiment
 from framework.camera_ownership import exclusive_camera_access
 from framework.fluorescence import mean_fluorescence
 from framework.roi import validate_roi
+from framework.field_direction import unit_direction, vector_along
 from sequencing.pulse_sequence import PulseSequence
 
 
@@ -27,6 +28,16 @@ FIELD_MODE_CUSTOM = "custom_vector"
 FIELD_MODE_LEAVE = "leave_as_is"
 FIELD_MODES = (FIELD_MODE_ZERO, FIELD_MODE_CUSTOM, FIELD_MODE_LEAVE)
 
+# config["magnet_vector_entry"]: how a FIELD_MODE_CUSTOM vector is given.
+# Components: magnet_custom_vector_gauss [x, y, z]. Direction: the signed
+# magnet_field_magnitude_gauss along magnet_field_direction (normalised),
+# turned into [x, y, z] once by framework.field_direction.vector_along() and
+# then commanded exactly like components. A config without the key means
+# components, as before this setting existed.
+VECTOR_ENTRY_COMPONENTS = "components"
+VECTOR_ENTRY_DIRECTION = "direction"
+VECTOR_ENTRIES = (VECTOR_ENTRY_COMPONENTS, VECTOR_ENTRY_DIRECTION)
+
 COILS_OFF_NOTE = "coils off: diamond sees the lab background field"
 NO_MAGNET_NOTE = "no magnet available: field neither controlled nor recorded"
 
@@ -38,6 +49,24 @@ MAGNET_FIELD_DEFINITIONS = {
         "for the whole scan; custom_vector: magnet enabled and "
         "magnet_commanded_vector_gauss commanded for the whole scan; "
         "leave_as_is: ODMR sent no magnet command."
+    ),
+    "magnet_vector_entry": (
+        "custom_vector only: 'components' (X, Y, Z entered) or 'direction' "
+        "(a magnitude along a direction entered); null in other modes. Either "
+        "way magnet_commanded_vector_gauss is what was commanded."
+    ),
+    "magnet_field_direction": (
+        "direction entry only: unit vector [nx, ny, nz] the field points "
+        "along (coil X, Y, Z axes); null otherwise."
+    ),
+    "magnet_field_magnitude_gauss": (
+        "direction entry only: signed field magnitude along "
+        "magnet_field_direction, in G (negative = opposite direction); "
+        "null otherwise. magnet_commanded_vector_gauss = magnitude * direction."
+    ),
+    "magnet_field_description": (
+        "direction entry only (key absent otherwise): the same in words, "
+        "e.g. '4 G along [0.707, 0.707, 0]'."
     ),
     "magnet_enabled": "Whether the coil supplies were enabled during the scan.",
     "magnet_commanded_vector_gauss": (
@@ -78,6 +107,50 @@ def magnet_field_problem(magnet, vector_gauss):
         except RuntimeError:
             continue
     return None
+
+
+def vector_entry(config):
+    """The custom-vector entry from *config* (components when absent)."""
+    entry = config.get("magnet_vector_entry", VECTOR_ENTRY_COMPONENTS)
+    if entry not in VECTOR_ENTRIES:
+        raise ValueError(f"Unknown magnet_vector_entry {entry!r}")
+    return entry
+
+
+def direction_entry(config):
+    """(unit direction, magnitude G) of a direction entry.
+
+    Raises ValueError for a zero/invalid direction or a non-finite
+    magnitude; nothing is commanded in that case.
+    """
+    direction = unit_direction(config.get("magnet_field_direction"))
+    magnitude = config.get("magnet_field_magnitude_gauss")
+    vector_along(magnitude, direction)  # validates the magnitude
+    return direction, float(magnitude)
+
+
+def commanded_vector_gauss(config, mode):
+    """(x, y, z) G a scan in *mode* commands with *config*; None for leave.
+
+    Both custom-vector entries end here as three components, so a direction
+    entry is commanded exactly like the same X, Y, Z typed in directly.
+    """
+    if mode == FIELD_MODE_ZERO:
+        return (0.0, 0.0, 0.0)
+    if mode == FIELD_MODE_CUSTOM:
+        if vector_entry(config) == VECTOR_ENTRY_DIRECTION:
+            direction, magnitude = direction_entry(config)
+            return tuple(vector_along(magnitude, direction))
+        vector = config.get("magnet_custom_vector_gauss", (0.0, 0.0, 0.0))
+        if len(vector) != 3:
+            raise ValueError("magnet_custom_vector_gauss needs three values")
+        return tuple(float(v) for v in vector)
+    return None
+
+
+def format_direction(direction):
+    """'[0.707, 0.707, 0]' for a unit direction."""
+    return "[" + ", ".join(f"{round(n, 3) + 0.0:g}" for n in direction) + "]"
 
 
 def _polarity_symbol(polarity):
@@ -228,15 +301,27 @@ class ODMRExperiment(ScanExperiment):
 
     def target_field_gauss(self):
         """(x, y, z) G this scan commands, or None in FIELD_MODE_LEAVE."""
-        mode = self.magnet_field_mode()
-        if mode == FIELD_MODE_ZERO:
-            return (0.0, 0.0, 0.0)
-        if mode == FIELD_MODE_CUSTOM:
-            vector = self.config.get("magnet_custom_vector_gauss", (0.0, 0.0, 0.0))
-            if len(vector) != 3:
-                raise ValueError("magnet_custom_vector_gauss needs three values")
-            return tuple(float(v) for v in vector)
-        return None
+        return commanded_vector_gauss(self.config, self.magnet_field_mode())
+
+    def _vector_entry_record(self, mode):
+        """How a custom vector was entered; all null outside custom_vector."""
+        record = {
+            "magnet_vector_entry": None,
+            "magnet_field_direction": None,
+            "magnet_field_magnitude_gauss": None,
+        }
+        if mode != FIELD_MODE_CUSTOM:
+            return record
+        entry = vector_entry(self.config)
+        record["magnet_vector_entry"] = entry
+        if entry == VECTOR_ENTRY_DIRECTION:
+            direction, magnitude = direction_entry(self.config)
+            record["magnet_field_direction"] = direction
+            record["magnet_field_magnitude_gauss"] = magnitude
+            record["magnet_field_description"] = (
+                f"{magnitude:g} G along {format_direction(direction)}"
+            )
+        return record
 
     def setup_magnet_field(self):
         """Set the scan's field (if the mode asks for one) and record it.
@@ -257,6 +342,7 @@ class ODMRExperiment(ScanExperiment):
             "magnet_enabled_by_scan": False,
             "magnet_commanded_vector_gauss": None if target is None else list(target),
             "magnet_relay_flip_axes": None,
+            **self._vector_entry_record(mode),
             "magnet_field_definitions": dict(MAGNET_FIELD_DEFINITIONS),
         }
         if target is not None:

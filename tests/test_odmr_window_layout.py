@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import QApplication, QMessageBox
 _APP = QApplication.instance() or QApplication(sys.argv[:1])
 
 from experiments.odmr_experiment import ODMRExperiment  # noqa: E402
+from framework.field_direction import unit_direction  # noqa: E402
 from gui.odmr_window import ODMRWindow  # noqa: E402
 from hardware.camera.sim_camera import SimCamera  # noqa: E402
 from tests.test_odmr_external_acquisition import _make_sim_hardware  # noqa: E402
@@ -141,6 +142,10 @@ class LayoutTests(ODMRWindowLayoutTestCase):
             # magnet, so the group is disabled and reports leave-as-is.
             "magnet_field_mode": "leave_as_is",
             "magnet_custom_vector_gauss": [0.0, 0.0, 0.0],
+            # Added with the direction + magnitude entry.
+            "magnet_vector_entry": "components",
+            "magnet_field_direction": unit_direction([1.0, 1.0, 1.0]),
+            "magnet_field_magnitude_gauss": 0.0,
         })
 
     def test_default_size_fits_1920x1080_with_taskbar(self):

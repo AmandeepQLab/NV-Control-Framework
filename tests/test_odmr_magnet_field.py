@@ -13,6 +13,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import numpy as np
 from PyQt6.QtCore import QCoreApplication, QEvent
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
@@ -23,9 +24,14 @@ from experiments.odmr_experiment import (  # noqa: E402
     FIELD_MODE_CUSTOM,
     FIELD_MODE_LEAVE,
     FIELD_MODE_ZERO,
+    VECTOR_ENTRY_COMPONENTS,
+    VECTOR_ENTRY_DIRECTION,
     MagnetFieldRangeError,
     ODMRExperiment,
+    commanded_vector_gauss,
+    format_direction,
 )
+from framework.field_direction import unit_direction, vector_along  # noqa: E402
 from framework.image_cube import ImageCube  # noqa: E402
 from gui.magnet_window import (  # noqa: E402
     POST_EXPERIMENT_ELECTRICAL_OFF,
@@ -399,6 +405,240 @@ class MagnetLockAndPostActionTests(ODMRMagnetFieldTestCase):
         self._run_scan()
         self.assertEqual(self._calls(*_MAGNET_COMMANDS), [])
         self.assertTrue(self.magnet_window.apply_button.isEnabled())
+
+
+class DirectionComputationTests(unittest.TestCase):
+    """framework.field_direction and the experiment's config -> X, Y, Z."""
+
+    def test_vector_along_normalises(self):
+        x, y, z = vector_along(4.0, [1.0, 1.0, 0.0])
+        self.assertAlmostEqual(x, 4.0 / 2 ** 0.5)
+        self.assertAlmostEqual(y, 4.0 / 2 ** 0.5)
+        self.assertEqual(z, 0.0)
+        # Scale of the direction doesn't matter.
+        np.testing.assert_allclose(vector_along(4.0, [1.0, 1.0, 0.0]),
+                                   vector_along(4.0, [7.0, 7.0, 0.0]), rtol=1e-15)
+        self.assertEqual(vector_along(5.0, [0.0, 3.0, 4.0]), [0.0, 3.0, 4.0])
+
+    def test_negative_magnitude_points_the_opposite_way(self):
+        self.assertEqual(vector_along(-5.0, [3.0, 0.0, 4.0]), [-3.0, 0.0, -4.0])
+        for value in vector_along(-2.0, [0.0, 1.0, 0.0]):
+            self.assertNotEqual(str(value), "-0.0")
+
+    def test_invalid_direction_or_magnitude_rejected(self):
+        for direction in ([0.0, 0.0, 0.0], [1.0, float("nan"), 0.0], [1.0, 2.0], None):
+            with self.subTest(direction=direction), self.assertRaises(ValueError):
+                vector_along(1.0, direction)
+        for magnitude in (float("inf"), float("nan"), None, True):
+            with self.subTest(magnitude=magnitude), self.assertRaises(ValueError):
+                vector_along(magnitude, [1.0, 0.0, 0.0])
+
+    def test_zero_field_experiment_uses_the_same_function(self):
+        import experiments.zero_field_experiment as zfe
+        self.assertIs(zfe.unit_direction, unit_direction)
+
+    def test_commanded_vector_from_config(self):
+        direction = {"magnet_vector_entry": VECTOR_ENTRY_DIRECTION,
+                     "magnet_field_direction": [1.0, 1.0, 0.0],
+                     "magnet_field_magnitude_gauss": -4.0,
+                     # Ignored with a direction entry.
+                     "magnet_custom_vector_gauss": [9.0, 9.0, 9.0]}
+        self.assertEqual(commanded_vector_gauss(direction, FIELD_MODE_CUSTOM),
+                         tuple(vector_along(-4.0, [1.0, 1.0, 0.0])))
+        self.assertEqual(commanded_vector_gauss(direction, FIELD_MODE_ZERO),
+                         (0.0, 0.0, 0.0))
+        self.assertIsNone(commanded_vector_gauss(direction, FIELD_MODE_LEAVE))
+        # No entry key: components, as before the setting existed.
+        self.assertEqual(commanded_vector_gauss(
+            {"magnet_custom_vector_gauss": [1, 2, 3]}, FIELD_MODE_CUSTOM),
+            (1.0, 2.0, 3.0))
+        with self.assertRaises(ValueError):
+            commanded_vector_gauss(dict(direction, magnet_field_direction=[0, 0, 0]),
+                                   FIELD_MODE_CUSTOM)
+        with self.assertRaises(ValueError):
+            commanded_vector_gauss({"magnet_vector_entry": "polar"}, FIELD_MODE_CUSTOM)
+
+    def test_format_direction(self):
+        self.assertEqual(format_direction(unit_direction([1, 1, 0])), "[0.707, 0.707, 0]")
+        self.assertEqual(format_direction([0.0, -0.0, -1.0]), "[0, 0, -1]")
+
+
+class DirectionEntryTests(ODMRMagnetFieldTestCase):
+    def setUp(self):
+        super().setUp()
+        self.group.set_mode(FIELD_MODE_CUSTOM)
+        self.group.set_vector_entry(VECTOR_ENTRY_DIRECTION)
+
+    def _use_direction(self, direction, magnitude):
+        self.group.set_field_direction(direction)
+        self.group.set_field_magnitude(magnitude)
+
+    def test_entry_selector_enabled_only_for_custom_and_switches_page(self):
+        for mode, enabled in ((FIELD_MODE_CUSTOM, True), (FIELD_MODE_ZERO, False),
+                              (FIELD_MODE_LEAVE, False)):
+            self.group.set_mode(mode)
+            self.assertEqual(self.group.entry_combo.isEnabled(), enabled, mode)
+            self.assertEqual(self.group.magnitude_spin.isEnabled(), enabled, mode)
+        self.assertEqual(self.group.entry_stack.currentIndex(), 1)
+        self.group.set_vector_entry(VECTOR_ENTRY_COMPONENTS)
+        self.assertEqual(self.group.entry_stack.currentIndex(), 0)
+
+    def test_presets_and_applied_components_display(self):
+        presets = self.group.direction_preset_buttons
+        self.assertEqual(list(presets), ["X", "Y", "Z", "<110>", "<1-10>", "<111>"])
+        self.group.set_field_magnitude(4.0)
+        presets["<1-10>"].click()
+        self.assertEqual(self.group.raw_field_direction(), [1.0, -1.0, 0.0])
+        self.assertEqual(self.group.normalised_label.text(), "n̂ = (0.707, -0.707, 0.000)")
+        self.assertEqual(self.group.applied_label.text(),
+                         "Applied: X 2.8284, Y -2.8284, Z 0.0000 G")
+        presets["Z"].click()
+        self.group.set_field_magnitude(-3.0)
+        self.assertEqual(self.group.applied_label.text(),
+                         "Applied: X 0.0000, Y 0.0000, Z -3.0000 G")
+        config = self.panel.get_config()
+        self.assertEqual(config["magnet_vector_entry"], VECTOR_ENTRY_DIRECTION)
+        self.assertEqual(config["magnet_custom_vector_gauss"], [0.0, 0.0, -3.0])
+        self.assertEqual(config["magnet_field_direction"], [0.0, 0.0, 1.0])
+        self.assertEqual(config["magnet_field_magnitude_gauss"], -3.0)
+
+    def test_direction_is_normalised_in_config(self):
+        self._use_direction((2.0, 2.0, 0.0), 1.0)
+        np.testing.assert_allclose(self.panel.get_config()["magnet_field_direction"],
+                                   [2 ** -0.5, 2 ** -0.5, 0.0])
+
+    def test_zero_direction_refused_before_anything_is_commanded(self):
+        self._use_direction((0.0, 0.0, 0.0), 4.0)
+        self.assertIn("Zero vector", self.group.normalised_label.text())
+        self.assertIsNone(self.panel.get_config()["magnet_custom_vector_gauss"])
+        self.window.toggle_odmr()
+        self.critical.assert_called_once()
+        self.assertEqual(self.critical.call_args.args[1], "Invalid field direction")
+        self.assertFalse(self.window.odmr_running)
+        self.assertEqual(self.started, [])
+        self.assertEqual(self.log, [], "nothing may be commanded")
+
+    def test_experiment_refuses_zero_direction_before_any_magnet_command(self):
+        config = _make_fast_config(
+            magnet_field_mode=FIELD_MODE_CUSTOM,
+            magnet_vector_entry=VECTOR_ENTRY_DIRECTION,
+            magnet_field_direction=[0.0, 0.0, 0.0],
+            magnet_field_magnitude_gauss=4.0,
+        )
+        with self.assertRaises(ValueError):
+            ODMRExperiment(self.hardware, config).setup_magnet_field()
+        self.assertEqual(self.log, [])
+
+    def test_out_of_range_magnitude_refused(self):
+        self._use_direction((0.0, 0.0, 1.0), -_OUT_OF_RANGE_G)
+        self.window.toggle_odmr()
+        self.critical.assert_called_once()
+        self.assertEqual(self.critical.call_args.args[1], "Magnetic field out of range")
+        self.assertIn("Z-axis reachable range", self.critical.call_args.args[2])
+        self.assertEqual(self.log, [])
+
+    def test_scan_commands_once_and_records_direction_metadata(self):
+        self._use_direction((1.0, 1.0, 0.0), 4.0)
+        expected = vector_along(4.0, [1.0, 1.0, 0.0])
+        with tempfile.TemporaryDirectory() as tmp:
+            config, metadata = self._run_scan(save_dir=tmp)
+        set_vector = self._calls("set_vector")
+        self.assertEqual(len(set_vector), 1, "field must not change during the scan")
+        self.assertEqual(set_vector[0][2], {"bx": expected[0] * 0.1 + 0.0,
+                                            "by": expected[1] * 0.1 + 0.0,
+                                            "bz": 0.0})
+        self._assert_magnet_command_before_acquisition()
+        self.assertEqual(self.panel.field_label.text(),
+                         "Field: custom 4 G along [0.707, 0.707, 0] = "
+                         "(2.8284, 2.8284, 0) G")
+        for record in (config, metadata):
+            self.assertEqual(record["magnet_field_mode"], FIELD_MODE_CUSTOM)
+            self.assertEqual(record["magnet_vector_entry"], VECTOR_ENTRY_DIRECTION)
+            self.assertEqual(record["magnet_field_direction"],
+                             unit_direction([1.0, 1.0, 0.0]))
+            self.assertEqual(record["magnet_field_magnitude_gauss"], 4.0)
+            self.assertEqual(record["magnet_field_description"],
+                             "4 G along [0.707, 0.707, 0]")
+            self.assertEqual(record["magnet_commanded_vector_gauss"], expected)
+            for value, want in zip(record["magnet_model_vector_gauss"], expected):
+                self.assertAlmostEqual(value, want)
+            self.assertIn("magnitude * direction",
+                          record["magnet_field_definitions"]
+                          ["magnet_field_magnitude_gauss"])
+
+    def test_components_and_other_modes_record_null_direction(self):
+        self.group.set_vector_entry(VECTOR_ENTRY_COMPONENTS)
+        self.group.set_custom_vector(1.0, 0.0, 0.0)
+        for mode, entry in ((FIELD_MODE_CUSTOM, VECTOR_ENTRY_COMPONENTS),
+                            (FIELD_MODE_ZERO, None), (FIELD_MODE_LEAVE, None)):
+            self.group.set_mode(mode)
+            experiment = ODMRExperiment(self.hardware,
+                                        _make_fast_config(**self.panel.get_config()))
+            record = experiment.setup_magnet_field()
+            self.assertEqual(record["magnet_vector_entry"], entry, mode)
+            self.assertIsNone(record["magnet_field_direction"], mode)
+            self.assertIsNone(record["magnet_field_magnitude_gauss"], mode)
+            self.assertNotIn("magnet_field_description", record)
+
+    def test_tooltips_on_new_controls(self):
+        g = self.group
+        widgets = [g.entry_combo, g.magnitude_spin, g.normalised_label,
+                   g.applied_label, *g.direction_spins,
+                   *g.direction_preset_buttons.values()]
+        for widget in widgets:
+            self.assertTrue(widget.toolTip().strip(), widget)
+        self.assertIn("gauss", g.magnitude_spin.toolTip())
+        self.assertIn("Negative", g.magnitude_spin.toolTip())
+        self.assertIn("normalised", g.direction_spins[0].toolTip())
+
+
+class DirectionMatchesComponentsTests(ODMRMagnetFieldTestCase):
+    """Both entries command the identical field through the same path."""
+
+    def _set_vector_args(self, **entry):
+        magnet = _make_magnet()
+        log = []
+        _record_calls(self, magnet, "set_vector", log)
+        _record_calls(self, magnet, "enable", log)
+        hardware = dict(self.hardware, magnet=magnet)
+        config = _make_fast_config(magnet_field_mode=FIELD_MODE_CUSTOM, **entry)
+        record = ODMRExperiment(hardware, config).setup_magnet_field()
+        model = magnet.get_vector()
+        return log, record, model, magnet.get_polarities()
+
+    def test_experiment_level_identical_for_unrounded_components(self):
+        for direction, magnitude in (([1.0, 1.0, 0.0], 4.0), ([1.0, 1.0, 1.0], -3.0),
+                                     ([1.0, -1.0, 0.0], 2.5), ([0.0, 0.0, 1.0], -1.0)):
+            with self.subTest(direction=direction, magnitude=magnitude):
+                by_direction = self._set_vector_args(
+                    magnet_vector_entry=VECTOR_ENTRY_DIRECTION,
+                    magnet_field_direction=direction,
+                    magnet_field_magnitude_gauss=magnitude)
+                by_components = self._set_vector_args(
+                    magnet_custom_vector_gauss=vector_along(magnitude, direction))
+                self.assertEqual(by_direction[0], by_components[0])
+                self.assertEqual(by_direction[1]["magnet_commanded_vector_gauss"],
+                                 by_components[1]["magnet_commanded_vector_gauss"])
+                self.assertEqual(by_direction[1]["magnet_relay_flip_axes"],
+                                 by_components[1]["magnet_relay_flip_axes"])
+                self.assertEqual(by_direction[2], by_components[2])
+                self.assertEqual(by_direction[3], by_components[3])
+
+    def test_gui_scans_identical(self):
+        """The same window, same X, Y, Z, entered both ways."""
+        self.group.set_mode(FIELD_MODE_CUSTOM)
+        self.group.set_vector_entry(VECTOR_ENTRY_COMPONENTS)
+        self.group.set_custom_vector(-3.0, -4.0, 0.0)
+        self._run_scan()
+        self.group.set_vector_entry(VECTOR_ENTRY_DIRECTION)
+        self.group.set_field_direction((3.0, 4.0, 0.0))
+        self.group.set_field_magnitude(-5.0)
+        self.magnet.disable()  # start from the same state: off
+        self._run_scan()
+        set_vector = self._calls("set_vector")
+        self.assertEqual(len(set_vector), 2)
+        self.assertEqual(set_vector[0][1:], set_vector[1][1:])
+        self.assertEqual(len(self._calls("enable")), 2)
 
 
 if __name__ == "__main__":

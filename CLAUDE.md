@@ -130,8 +130,13 @@ Both selectors offer the same list: `gui/display_settings.py::COLORMAP_NAMES` (G
 **Rule: zero-field ESR is taken at calibrated zero, not with coils off.** With the coils off, the lab background (~1.2 G, mostly Z) splits each strain line into sub-components and inflates the apparent splitting. Measured at the rig: 2E = 6.87 MHz and FWHM 5.3 MHz with the coils off, against 2E = 5.52 MHz and FWHM 3.6 MHz at calibrated zero. ODMR files saved before this setting existed don't record the field, so their ESRs can't be interpreted reliably.
 
 **GUI:** the "Magnetic field during scan" group in the ODMR panel (`gui/widgets/odmr_magnet_field_group.py::MagnetFieldGroup`).
-- Mode: "Field zero at diamond" (default) / "Custom vector" / "Leave magnet as is". X, Y, Z spinboxes in G (default 0, ±10000), enabled only for "Custom vector". Every control has a tooltip.
-- `get_config()` adds `magnet_field_mode` (`"field_zero"`, `"custom_vector"`, `"leave_as_is"`) and `magnet_custom_vector_gauss` `[x, y, z]`. Like the other ODMR settings they live in the form for the window's lifetime; nothing goes to `setupInfo.json`.
+- Mode: "Field zero at diamond" (default) / "Custom vector" / "Leave magnet as is". Every control has a tooltip.
+- "Enter as:" (enabled only for "Custom vector") picks how the custom vector is given, on a `QStackedWidget` page each:
+  - "Components (X, Y, Z)" (default): X, Y, Z spinboxes in G (default 0, ±10000).
+  - "Direction + magnitude": nx/ny/nz (default 1, 1, 1 as in Zero Field; ±1000, normalised automatically), presets X, Y, Z, <110>, <1-10>, <111>, the normalised n̂, one signed "Magnitude" in G (negative = opposite direction), and a read-only "Applied: X …, Y …, Z … G" line. A zero direction is flagged there and refused by the window ("Invalid field direction") before anything starts.
+  - The stack's width covers both pages, so the panel column did not widen (303 px, as before); inactive pages have a vertical `Ignored` size policy, so the height follows the shown page.
+- `get_config()` adds `magnet_field_mode` (`"field_zero"`, `"custom_vector"`, `"leave_as_is"`), `magnet_vector_entry` (`"components"`/`"direction"`), `magnet_custom_vector_gauss` `[x, y, z]` (with a direction entry: the computed components, or None for a zero direction), `magnet_field_direction` (normalised) and `magnet_field_magnitude_gauss`. Like the other ODMR settings they live in the form for the window's lifetime (the ODMR window has no saved settings); nothing goes to `setupInfo.json`.
+- **Both entries command the same way.** `commanded_vector_gauss()` in `experiments/odmr_experiment.py` turns a direction entry into `[x, y, z]` once, with `framework/field_direction.py::vector_along()` (magnitude × `unit_direction()`), ignoring `magnet_custom_vector_gauss`. From there it is the components path: same range check, `enable()`, one `set_vector()`. The window's preflight and status line use the same function. A config without `magnet_vector_entry` means components.
 - No `hardware["magnet"]`: the group is disabled with a tooltip saying why, `get_config()` reports `"leave_as_is"`, and the scan sends no magnet command.
 
 **Experiment** (`ODMRExperiment.setup_magnet_field()`, called first in `ODMRWorker.start()`, before the camera lease and any MW/camera action; also from `setup_scan()`):
@@ -140,11 +145,12 @@ Both selectors offer the same list: `gui/display_settings.py::COLORMAP_NAMES` (G
 - **A config without `magnet_field_mode` means "leave_as_is"**, so direct callers, scripts and older tests behave exactly as before. Only the GUI defaults to field zero.
 - Only the injected magnet object is used (`is_enabled`, `enable`, `set_vector`, `get_vector`, `get_polarities`, per-axis `plan_field`/`current_to_field`); no concrete class import.
 
-**Window:** `ODMRWindow._preflight_magnet_field()` runs the same check before a run starts, and before a stability wait. On failure it shows "Magnetic field out of range" with the axis's approximate reachable range. Nothing starts and `run_started` is not emitted. The "Field:" status line shows e.g. "Field: calibrated zero (0, 0, 0) G", "Field: custom (2, -1, 3) G", "Field: left as is, coils on, model (…) G", "Field: coils off (background)" or "Field: no magnet available (not controlled)".
+**Window:** `ODMRWindow._preflight_magnet_field()` runs the same check before a run starts, and before a stability wait. On failure it shows "Magnetic field out of range" with the axis's approximate reachable range. Nothing starts and `run_started` is not emitted. The "Field:" status line shows e.g. "Field: calibrated zero (0, 0, 0) G", "Field: custom (2, -1, 3) G", "Field: custom 4 G along [0.707, 0.707, 0] = (2.8284, 2.8284, 0) G", "Field: left as is, coils on, model (…) G", "Field: coils off (background)" or "Field: no magnet available (not controlled)".
 
 **Metadata** (`magnet_field_record`, in `config.json` and the statistics cube, in every mode):
 - `magnet_field_mode` (effective), `magnet_available`, `magnet_enabled`, `magnet_enabled_by_scan`.
 - `magnet_commanded_vector_gauss` (null for leave as is) and `magnet_relay_flip_axes` (`"X,Z"`, `""`; null for leave as is).
+- `magnet_vector_entry` (custom vector only, else null), `magnet_field_direction` (unit vector) and `magnet_field_magnitude_gauss` (direction entry only, else null), and with a direction entry `magnet_field_description`, e.g. "4 G along [0.707, 0.707, 0]" (key absent otherwise).
 - `magnet_model_vector_gauss` and `magnet_model_polarity` (`"+"`/`"-"`/`"?"`), read right after setup. These are calibration-model values, not measurements.
 - Coils off only: `magnet_calibration_background_gauss`, the zero-current intercept of each axis's retained branch (positive before the relays are synchronized), labelled a calibration estimate, not a measurement. Also `magnet_field_note`: "coils off: diamond sees the lab background field".
 - `magnet_field_definitions` spells all of these out.
@@ -363,7 +369,7 @@ All three are calibration-model values, **not measurements** (there is no field 
   - `get_config()` adds `field_axis: "vector"` and `field_direction` (normalised). With X/Y/Z it is exactly as before, with no `field_direction` key. `set_config()` accepts both.
   - The direction box's column width is computed before it is hidden, so showing it never clips the column.
 - Experiment: `ZeroFieldExperiment(field_axis="vector", field_direction=[nx, ny, nz])`, passed through by `ZeroFieldWorker`.
-  - `field_direction` is normalised once by `unit_direction()` (`experiments/zero_field_experiment.py`). It is required for "vector" and refused for X/Y/Z.
+  - `field_direction` is normalised once by `unit_direction()` (`framework/field_direction.py`, shared with ODMR's direction entry; still importable from `experiments/zero_field_experiment.py`). It is required for "vector" and refused for X/Y/Z.
   - `unit_direction()` rejects a zero, non-finite or non-3-number direction, and returns an already-unit vector unchanged, so normalising again (queue file, experiment) never changes the last digit.
 
 **What a point commands.** `_point_vector_mT(s)` = s × 0.1 × n̂ on all three axes, through the same `set_scan_point()` → `Magnet.set_vector()` path (`+ 0.0` keeps a zero component from becoming −0.0).
@@ -526,7 +532,7 @@ Same shape as the Zero Field window.
 - **Run/stop button.** One toggle driving `ODMRWindow.toggle_odmr()`; Stop goes through the unchanged `stop_odmr()` path. Styled by `ODMRPanel.set_run_button_state()` with the shared `style_run_button()`: idle "Start" on green, running "Stop" on red (previously "Run ODMR"/"Stop ODMR").
   - It follows the window's own `run_started`/`run_finished` signals, not the click. `run_finished` is emitted from `odmr_finished()`, which the worker's `finished_signal` reaches on completion, stop and error, so all three return it to "Start".
   - `ODMRPanel.set_running_state()` was removed; `run_odmr()`/`odmr_finished()` no longer style the button directly.
-- **Default size** is 1200×900, clamped to the screen's available area (minus 40 px for the title bar). It fits 1920×1080 with the taskbar and shows the collapsed controls (about 734 px) without scrolling; expanded sections (about 1252 px) and smaller windows scroll.
+- **Default size** is 1200×900, clamped to the screen's available area (minus 40 px for the title bar). It fits 1920×1080 with the taskbar. The controls now scroll even when collapsed: the control box's size hint is about 1148 px collapsed and 1716 px with Dense, Dip 2 and Delays expanded (measured 2026-11-25; it was about 734 px before the "Magnetic field during scan" and "Stability check" groups were added).
 - The layout change left controls, defaults and `get_config()` unchanged; the later "Magnetic field during scan" group added two `get_config()` keys (see "ODMR magnetic field during scan"). **Tests:** `tests/test_odmr_window_layout.py` (real scans on sim hardware).
 
 ## Known hardware quirks (ODMR timing)

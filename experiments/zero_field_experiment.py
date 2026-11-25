@@ -13,6 +13,8 @@ from framework.scan_experiment import ScanExperiment
 from framework.camera_ownership import exclusive_camera_access
 from framework.image_cube import ImageCube
 from framework.roi import validate_roi
+# Shared with ODMR; still importable from this module.
+from framework.field_direction import unit_direction  # noqa: F401
 
 
 LOGGER = logging.getLogger(__name__)
@@ -20,33 +22,6 @@ LOGGER = logging.getLogger(__name__)
 # field_axis value for a sweep along an arbitrary direction (see
 # ZeroFieldExperiment): every axis is commanded at once, B = s * n_hat.
 VECTOR_AXIS = "vector"
-
-
-def unit_direction(direction):
-    """Normalise a 3-component direction to a unit vector (list of floats).
-
-    Raises ValueError for anything that is not three finite numbers, and
-    for a zero vector, which has no direction.
-    """
-    if direction is None or isinstance(direction, (str, bytes)):
-        raise ValueError("field_direction must be three numbers [nx, ny, nz].")
-    values = list(direction)
-    if len(values) != 3 or any(
-        isinstance(v, bool) or not isinstance(v, (int, float, np.integer, np.floating))
-        for v in values
-    ):
-        raise ValueError("field_direction must be three numbers [nx, ny, nz].")
-    vector = np.asarray(values, dtype=np.float64)
-    if not np.all(np.isfinite(vector)):
-        raise ValueError("field_direction must be finite.")
-    norm = float(np.linalg.norm(vector))
-    if norm < 1e-12:
-        raise ValueError("field_direction is a zero vector; it has no direction.")
-    if abs(norm - 1.0) < 1e-12:
-        # Already a unit vector: returned unchanged, so normalising twice
-        # (widget, queue file, experiment) never alters the last digit.
-        return [float(v) for v in vector]
-    return [float(v) / norm for v in vector]
 
 
 class ZeroFieldExperiment(ScanExperiment):
