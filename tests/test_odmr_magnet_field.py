@@ -592,6 +592,50 @@ class DirectionEntryTests(ODMRMagnetFieldTestCase):
         self.assertIn("normalised", g.direction_spins[0].toolTip())
 
 
+class FoldedSummaryTests(ODMRMagnetFieldTestCase):
+    """The section is folded by default; its summary states the field."""
+
+    def test_folded_by_default_with_explicit_field(self):
+        self.assertFalse(self.group.is_expanded())
+        self.assertFalse(self.group.summary_label.isHidden())
+        self.assertEqual(self.group.summary(), "Field: calibrated zero (0, 0, 0) G")
+
+    def test_summary_follows_every_mode(self):
+        g = self.group
+        g.set_mode(FIELD_MODE_CUSTOM)
+        g.set_vector_entry(VECTOR_ENTRY_DIRECTION)
+        g.direction_preset_buttons["<110>"].click()
+        g.set_field_magnitude(4.0)
+        self.assertEqual(
+            g.summary(),
+            "Field: 4 G along [0.707, 0.707, 0] = (2.8284, 2.8284, 0) G")
+        g.set_field_direction((0.0, 0.0, 0.0))
+        self.assertIn("invalid direction", g.summary())
+        g.set_vector_entry(VECTOR_ENTRY_COMPONENTS)
+        g.set_custom_vector(2.0, -1.0, 3.0)
+        self.assertEqual(g.summary(), "Field: custom (2, -1, 3) G")
+        g.set_mode(FIELD_MODE_LEAVE)
+        self.assertEqual(g.summary(), "Field: magnet off (lab background)")
+
+    def test_leave_as_is_summary_tracks_the_magnet(self):
+        self.group.set_mode(FIELD_MODE_LEAVE)
+        self.magnet.enable()
+        self.magnet.set_vector(bx=0.2, by=0.0, bz=-0.1)
+        self.group.refresh_summary()  # the 1 s timer does this in the app
+        self.assertEqual(self.group.summary(),
+                         "Field: left as is, magnet on, model (2, 0, -1) G")
+        self.assertTrue(self.group._summary_timer.isActive())
+
+    def test_folding_keeps_the_field_settings(self):
+        g = self.group
+        g.set_mode(FIELD_MODE_CUSTOM)
+        g.set_custom_vector(1.5, 0.0, -2.0)
+        before = self.panel.get_config()
+        g.set_expanded(True)
+        g.set_expanded(False)
+        self.assertEqual(self.panel.get_config(), before)
+
+
 class DirectionMatchesComponentsTests(ODMRMagnetFieldTestCase):
     """Both entries command the identical field through the same path."""
 

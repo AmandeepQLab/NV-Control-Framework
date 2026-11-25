@@ -210,7 +210,7 @@ class ODMRWindow(QMainWindow):
 
         # Without a magnet the field group is disabled and scans leave the
         # field untouched (as "Leave magnet as is").
-        self.panel.magnet_field_group.set_available(self._magnet() is not None)
+        self.panel.magnet_field_group.set_magnet(self._magnet())
 
     def _magnet(self):
         get = getattr(self.hardware, "get", None)

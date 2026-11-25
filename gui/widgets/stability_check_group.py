@@ -9,8 +9,6 @@ See gui/stability_gate.py and framework/stability.py.
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
-    QDoubleSpinBox,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -19,6 +17,8 @@ from PyQt6.QtWidgets import (
 )
 
 from framework.stability import ON_TIMEOUT_CHOICES, StabilitySettings
+from gui import style
+from gui.widgets.collapsible_section import CollapsibleSection
 
 UNAVAILABLE_TOOLTIP = (
     "Not available: this window was opened without the main window's live "
@@ -26,52 +26,54 @@ UNAVAILABLE_TOOLTIP = (
 )
 
 
-class StabilitySettingsGroup(QGroupBox):
-    """Checkbox plus window/limits/timeout; fields enabled only when on."""
+class StabilitySettingsGroup(CollapsibleSection):
+    """Collapsible "Stability check": the on/off checkbox sits in the header,
+    window/limits/timeout in the body (enabled only when on). Folded, the
+    summary line says whether the check is on and with which limits."""
 
-    def __init__(self, parent=None):
-        super().__init__("Stability check", parent)
-        layout = QVBoxLayout(self)
+    def __init__(self, parent=None, settings_key=None):
+        self.enabled_check = QCheckBox("On")
+        self.enabled_check.setToolTip(
+            "Check count stability before start: wait until the live counts "
+            "are stable. Costs time; useful when focus or air flow drifts. "
+            "The counts are the main window's live-view mean over the "
+            "acquisition ROI; the live view is started for the check if it "
+            "is off."
+        )
+        super().__init__(
+            "Stability check", expanded=False, checkbox=self.enabled_check,
+            settings_key=settings_key, parent=parent,
+        )
+        layout = self.body_layout()
         defaults = StabilitySettings()
 
-        self.enabled_check = QCheckBox("Check count stability before start")
-        self.enabled_check.setToolTip(
-            "Before starting, wait until the live counts are stable. Costs "
-            "time; useful when focus or air flow drifts. The counts are the "
-            "main window's live-view mean over the acquisition ROI; the live "
-            "view is started for the check if it is off."
-        )
-        layout.addWidget(self.enabled_check)
-
         self.window_spin = self._add_spin(
-            layout, "Window (s):", 5.0, 3600.0, 0, defaults.window_s,
+            layout, "Window:", 5.0, 3600.0, 0, defaults.window_s, "s",
             "How long the counts must stay within the limits before the run "
             "starts (seconds). Longer windows catch slow oscillations "
             "(25–40 s at the rig) but take longer to pass.",
         )
         self.max_std_spin = self._add_spin(
-            layout, "Max std (%):", 0.01, 100.0, 2, defaults.max_std_percent,
+            layout, "Max std:", 0.01, 100.0, 2, defaults.max_std_percent, "%",
             "Largest allowed standard deviation of the counts over the "
             "window, as % of the mean. Lower is stricter; it must sit above "
             "the counts' own shot noise or the check never passes.",
         )
         self.max_drift_spin = self._add_spin(
-            layout, "Max drift (%/min):", 0.01, 100.0, 2,
-            defaults.max_drift_percent_per_min,
+            layout, "Max drift:", 0.01, 100.0, 2,
+            defaults.max_drift_percent_per_min, "%/min",
             "Largest allowed steady rise or fall of the counts, in % of the "
             "mean per minute (straight-line fit over the window). Lower is "
             "stricter.",
         )
         self.timeout_spin = self._add_spin(
-            layout, "Timeout (s):", 1.0, 86400.0, 0, defaults.timeout_s,
+            layout, "Timeout:", 1.0, 86400.0, 0, defaults.timeout_s, "s",
             "Longest time to wait for stable counts (seconds). After it, "
             "\"On timeout\" decides whether the run starts anyway or is "
             "cancelled. Should be longer than the window.",
         )
 
-        row = QHBoxLayout()
         on_timeout_label = QLabel("On timeout:")
-        row.addWidget(on_timeout_label)
         self.on_timeout_combo = QComboBox()
         self.on_timeout_combo.addItems(ON_TIMEOUT_CHOICES)
         self.on_timeout_combo.setToolTip(
@@ -81,8 +83,7 @@ class StabilitySettingsGroup(QGroupBox):
             "entry is marked \"skipped (unstable)\" and the queue continues)."
         )
         on_timeout_label.setToolTip(self.on_timeout_combo.toolTip())
-        row.addWidget(self.on_timeout_combo)
-        layout.addLayout(row)
+        layout.addRow(on_timeout_label, self.on_timeout_combo)
 
         self.fields = (
             self.window_spin, self.max_std_spin, self.max_drift_spin,
@@ -91,21 +92,25 @@ class StabilitySettingsGroup(QGroupBox):
         self.enabled_check.toggled.connect(self._update_enabled)
         self._available = True
         self._update_enabled()
+        self.set_summary_provider(self.summary_text)
 
     @staticmethod
-    def _add_spin(layout, label, minimum, maximum, decimals, default, tooltip):
-        row = QHBoxLayout()
+    def _add_spin(layout, label, minimum, maximum, decimals, default, unit, tooltip):
         text = QLabel(label)
         text.setToolTip(tooltip)
-        row.addWidget(text)
-        spin = QDoubleSpinBox()
-        spin.setRange(minimum, maximum)
-        spin.setDecimals(decimals)
-        spin.setValue(default)
-        spin.setToolTip(tooltip)
-        row.addWidget(spin)
-        layout.addLayout(row)
+        spin = style.double_spin(minimum, maximum, decimals, default, unit, tooltip)
+        layout.addRow(text, spin)
         return spin
+
+    def summary_text(self):
+        if not self._available:
+            return "Not available (no live view)"
+        if not self.enabled_check.isChecked():
+            return "Off"
+        s = self.get_settings()
+        return (f"On: std ≤ {s.max_std_percent:g} %, drift ≤ "
+                f"{s.max_drift_percent_per_min:g} %/min over {s.window_s:g} s; "
+                f"timeout {s.timeout_s:g} s ({s.on_timeout.lower()})")
 
     def controls(self):
         """Every user-facing control in the group (for tooltip checks)."""
@@ -124,6 +129,7 @@ class StabilitySettingsGroup(QGroupBox):
             self.enabled_check.setChecked(False)
             self.setToolTip(UNAVAILABLE_TOOLTIP)
         self._update_enabled()
+        self.refresh_summary()
 
     def get_settings(self):
         return StabilitySettings(

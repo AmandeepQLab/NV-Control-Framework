@@ -14,6 +14,8 @@ from gui.widgets import run_button
 from gui.widgets.run_button import style_run_button
 from gui.widgets.stability_check_group import StabilitySettingsGroup, StabilityWaitBar
 from gui.widgets.odmr_magnet_field_group import MagnetFieldGroup
+from gui.widgets.collapsible_section import CollapsibleSection
+from gui import style
 
 # Moved to a shared module (also used by the ODMR analysis window);
 # re-exported here so existing imports keep working.
@@ -122,12 +124,18 @@ class ODMRPanel(QWidget):
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("Progress: 0 / 0")
         self.progress_bar.setTextVisible(True)
+        self.progress_bar.setToolTip(
+            "Acquired points out of the scan's total (frequencies x averages).")
         left_layout.addWidget(self.progress_bar)
 
         self.freq_label = QLabel("Current frequency: -- GHz")
+        self.freq_label.setToolTip("Microwave frequency being measured now, in GHz.")
         left_layout.addWidget(self.freq_label)
 
         self.time_label = QLabel("Time: estimated -- | actual --")
+        self.time_label.setToolTip(
+            "Estimated scan duration from the settings, and the time actually "
+            "taken (shown when the scan ends).")
         left_layout.addWidget(self.time_label)
 
         # The field held during the current/last scan (set at run start).
@@ -140,10 +148,13 @@ class ODMRPanel(QWidget):
         )
         left_layout.addWidget(self.field_label)
 
-        self.control_box = QGroupBox("ODMR Parameters")
-
-        odmr_layout = QVBoxLayout()
-        self.control_box.setLayout(odmr_layout)
+        # Scroll content: cards and collapsible sections (gui/style.py,
+        # gui/widgets/collapsible_section.py). Folding a section only hides
+        # its controls; get_config() reads them as before.
+        self.control_box = QWidget()
+        odmr_layout = QVBoxLayout(self.control_box)
+        odmr_layout.setContentsMargins(0, 0, 4, 0)
+        odmr_layout.setSpacing(style.COLUMN_SPACING)
 
         self.control_scroll_area = QScrollArea()
         self.control_scroll_area.setWidgetResizable(True)
@@ -153,6 +164,7 @@ class ODMRPanel(QWidget):
         self.control_scroll_area.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
+        self.control_scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
         self.control_scroll_area.setWidget(self.control_box)
         left_layout.addWidget(self.control_scroll_area, 1)
 
@@ -161,112 +173,120 @@ class ODMRPanel(QWidget):
         self.stability_wait_bar = StabilityWaitBar()
         left_layout.addWidget(self.stability_wait_bar)
 
-        self.fstart_spin = self._add_double(odmr_layout, "Start (GHz):", 0, 10, 6, 2.77)
-        self.fstop_spin = self._add_double(odmr_layout, "Stop (GHz):", 0, 10, 6, 2.97)
-        self.steps_spin = self._add_int(odmr_layout, "Steps:", 2, 100000, 20)
+        # ---- Scan (always open) -------------------------------------------
+        self.scan_group, scan_form = style.card("Scan")
+        odmr_layout.addWidget(self.scan_group)
+        self.fstart_spin = self._add_double(
+            scan_form, "Start:", 0, 10, 6, 2.77, "GHz",
+            "First microwave frequency of the sweep, in GHz.")
+        self.fstop_spin = self._add_double(
+            scan_form, "Stop:", 0, 10, 6, 2.97, "GHz",
+            "Last microwave frequency of the sweep, in GHz.")
+        self.steps_spin = self._add_int(
+            scan_form, "Steps:", 2, 100000, 20,
+            "Number of evenly spaced frequencies from Start to Stop. Dense "
+            "points (if on) are added to these.")
+        self.avg_spin = self._add_int(
+            scan_form, "Averages:", 1, 100000, 1,
+            "Number of independent full sweeps over every frequency. The "
+            "result is their equal-weight mean; with 2 or more, the slow "
+            "(sweep-to-sweep) noise can be estimated, and the plot shows the "
+            "running mean after each completed sweep. Outer loop -- see "
+            "Repeats for the averaging inside each point.")
+        self.repeat_spin = self._add_int(
+            scan_form, "Repeats:", 1, 100000, 1,
+            "Number of OFF/ON frame pairs acquired and averaged at each "
+            "frequency within one sweep (inner loop). More repeats lower the "
+            "fast noise of each point.")
+        self.mw_power_spin = self._add_double(
+            scan_form, "MW power:", -100, 20, 1, -10, "dBm",
+            "SG386 output power for the whole scan, in dBm. MW on/off is "
+            "gated by the fast switch, not by this power.")
+        self.save_check = QCheckBox("Save data")
+        self.save_check.setChecked(False)
+        self.save_check.setToolTip(
+            "Save the scan (config.json, the spectrum and odmr_statistics.h5) "
+            "in a new data/odmr_<date>_<time> folder when it finishes.")
+        scan_form.addRow(self.save_check)
 
-        self.dense_check = QCheckBox("Add dense points near ESR dip(s)")
+        # ---- Dense points near ESR dips (on/off in the header) -----------
+        self.dense_check = QCheckBox("On")
         self.dense_check.setChecked(False)
-        self.dense_check.toggled.connect(self.toggle_dense_section)
-        odmr_layout.addWidget(self.dense_check)
-
-        self.dense_group = QGroupBox("Dense ESR Region")
-        dense_layout = QVBoxLayout()
-        self.dense_group.setLayout(dense_layout)
-        odmr_layout.addWidget(self.dense_group)
-
-        dip_layout = QHBoxLayout()
-        dip_layout.addWidget(QLabel("Number of dips:"))
-
+        self.dense_check.setToolTip(
+            "Add dense points near ESR dip(s): extra frequencies concentrated "
+            "around one or two dips, merged with the evenly spaced ones. "
+            "Use it to resolve narrow lines without a long scan.")
+        self.dense_section = CollapsibleSection(
+            "Dense points near ESR dips", checkbox=self.dense_check,
+            settings_key="odmr/dense")
+        odmr_layout.addWidget(self.dense_section)
+        dense_form = self.dense_section.body_layout()
         self.num_dips_combo = QComboBox()
         self.num_dips_combo.addItems(["1", "2"])
+        self.num_dips_combo.setToolTip("Number of dips to add dense points around.")
+        dense_form.addRow(self._tipped("Number of dips:", self.num_dips_combo),
+                          self.num_dips_combo)
+        self.dense1_center_spin = self._add_double(
+            dense_form, "Dip 1 centre:", 0, 10, 6, 2.87, "GHz",
+            "Centre frequency of the first dense region, in GHz.")
+        self.dense1_width_spin = self._add_double(
+            dense_form, "Dip 1 width:", 0.1, 500, 2, 20, "MHz",
+            "Full width of the first dense region around its centre, in MHz.")
+        self.dense1_steps_spin = self._add_int(
+            dense_form, "Dip 1 steps:", 2, 100000, 30,
+            "Number of dense frequencies across the first region.")
+        self.dense2_center_spin = self._add_double(
+            dense_form, "Dip 2 centre:", 0, 10, 6, 2.90, "GHz",
+            "Centre frequency of the second dense region, in GHz. Used only "
+            "with 2 dips.")
+        self.dense2_width_spin = self._add_double(
+            dense_form, "Dip 2 width:", 0.1, 500, 2, 20, "MHz",
+            "Full width of the second dense region, in MHz. Used only with "
+            "2 dips.")
+        self.dense2_steps_spin = self._add_int(
+            dense_form, "Dip 2 steps:", 2, 100000, 30,
+            "Number of dense frequencies across the second region. Used only "
+            "with 2 dips.")
+        self._dense_fields = (
+            self.num_dips_combo, self.dense1_center_spin, self.dense1_width_spin,
+            self.dense1_steps_spin, self.dense2_center_spin,
+            self.dense2_width_spin, self.dense2_steps_spin,
+        )
         self.num_dips_combo.currentTextChanged.connect(self.toggle_dip2)
+        self.dense_check.toggled.connect(self._update_dense_enabled)
+        self.toggle_dip2(self.num_dips_combo.currentText())
+        self._update_dense_enabled()
+        self.dense_section.set_summary_provider(self._dense_summary)
 
-        dip_layout.addWidget(self.num_dips_combo)
-        dense_layout.addLayout(dip_layout)
-
-        self.dip1_group = QGroupBox("Dip 1")
-        dip1_layout = QVBoxLayout()
-        self.dip1_group.setLayout(dip1_layout)
-        dense_layout.addWidget(self.dip1_group)
-
-        self.dense1_center_spin = self._add_double(dip1_layout, "Dip 1 center (GHz):", 0, 10, 6, 2.87)
-        self.dense1_width_spin = self._add_double(dip1_layout, "Dip 1 width (MHz):", 0.1, 500, 2, 20)
-        self.dense1_steps_spin = self._add_int(dip1_layout, "Dip 1 steps:", 2, 100000, 30)
-
-        self.dip2_group = QGroupBox("Dip 2")
-        dip2_layout = QVBoxLayout()
-        self.dip2_group.setLayout(dip2_layout)
-        dense_layout.addWidget(self.dip2_group)
-
-        self.dense2_center_spin = self._add_double(dip2_layout, "Dip 2 center (GHz):", 0, 10, 6, 2.90)
-        self.dense2_width_spin = self._add_double(dip2_layout, "Dip 2 width (MHz):", 0.1, 500, 2, 20)
-        self.dense2_steps_spin = self._add_int(dip2_layout, "Dip 2 steps:", 2, 100000, 30)
-
-        self.dense_group.setVisible(False)
-        self.dip2_group.setVisible(False)
-
-        self.avg_spin = self._add_int(odmr_layout, "Averages:", 1, 100000, 1)
-        self.avg_spin.setToolTip(
-            "Number of full point re-acquisitions per frequency, each "
-            "producing one contrast value; these are averaged together.\n"
-            "Outer loop -- see Repeats for the averaging that happens "
-            "inside each one."
-        )
-        self.repeat_spin = self._add_int(odmr_layout, "Repeats:", 1, 100000, 1)
-        self.repeat_spin.setToolTip(
-            "Number of OFF/ON frame pairs acquired and averaged into one "
-            "contrast value per point, before Averages (above) repeats the "
-            "whole thing.\n"
-            "Inner loop."
-        )
-        self.mw_power_spin = self._add_double(odmr_layout, "MW Power (dBm):", -100, 20, 1, -10)
-
+        # ---- Magnetic field during scan (folded; summary spells it out) ---
         self.magnet_field_group = MagnetFieldGroup()
         odmr_layout.addWidget(self.magnet_field_group)
 
-        # =====================================================
-        # DELAYS SECTION
-        # =====================================================
-
-        self.delays_check = QCheckBox("Show Delays")
-        self.delays_check.setChecked(False)
-        self.delays_check.toggled.connect(self.toggle_delays_section)
-        odmr_layout.addWidget(self.delays_check)
-
-        self.delays_group = QGroupBox("Delays")
-        delays_layout = QVBoxLayout()
-        self.delays_group.setLayout(delays_layout)
-        odmr_layout.addWidget(self.delays_group)
-
+        # ---- Delays -------------------------------------------------------
+        self.delays_section = CollapsibleSection(
+            "Delays", settings_key="odmr/delays",
+            tooltip="Show or hide the timing delays. The defaults are the "
+                    "measured recommendations; change them only for a reason.")
+        odmr_layout.addWidget(self.delays_section)
+        delays_form = self.delays_section.body_layout()
         self.trigger_delay_spin = self._add_double(
-            delays_layout, "Camera Trigger Delay (s):", 0.0, 10.0, 4, 0.02
-        )
-        self.trigger_delay_spin.setToolTip(
+            delays_form, "Camera trigger delay:", 0.0, 10.0, 4, 0.02, "s",
             "Delay before the first camera trigger pulse.\n"
             "Recommended: 0.02 s.\n"
             "Below ~0.02 s, ~1 frame in 9 stalls ~400 ms (root cause "
             "unconfirmed). Rig testing at 0/5/20/150 ms found no "
             "measurable contrast difference -- this delay doesn't affect "
-            "ESR contrast, only scan-time predictability."
-        )
-
+            "ESR contrast, only scan-time predictability.")
         self.fire_delay_spin = self._add_double(
-            delays_layout, "Fire Delay (s):", 0.0, 10.0, 4, 0.010
-        )
-        self.fire_delay_spin.setToolTip(
+            delays_form, "Fire delay:", 0.0, 10.0, 4, 0.010, "s",
             "Delay before Pulse Streamer fires after reset.\n"
             "Recommended: 0.010 s. Measured: below 0.010 s, pulse.run() "
             "intermittently blocks 300-1000 ms (a Swabian RPC stall, not "
             "camera arming -- arming now happens once per scan, not per "
             "frame). 0.010 s eliminated the stalls entirely in testing and "
-            "was faster overall than 0.005 s once the stall tail is counted."
-        )
-
+            "was faster overall than 0.005 s once the stall tail is counted.")
         self.reset_delay_spin = self._add_double(
-            delays_layout, "Reset Delay (s):", 0.0, 10.0, 4, 0.010
-        )
-        self.reset_delay_spin.setToolTip(
+            delays_form, "Reset delay:", 0.0, 10.0, 4, 0.010, "s",
             "Delay after resetting Swabian digital outputs to a clean "
             "baseline before acquisition (the magnet polarity relay is "
             "preserved at its commanded state, not zeroed).\n"
@@ -274,84 +294,72 @@ class ODMRPanel(QWidget):
             "intermittently blocks 300-1000 ms (the Swabian needs recovery "
             "time before accepting a new streamed sequence). 0.010 s "
             "eliminated the stalls entirely in testing and was faster "
-            "overall than 0.005 s once the stall tail is counted."
-        )
-
+            "overall than 0.005 s once the stall tail is counted.")
         self.mw_settle_spin = self._add_double(
-            delays_layout, "MW Settle (s):", 0.0, 10.0, 4, 0.0
-        )
-        self.mw_settle_spin.setToolTip(
+            delays_form, "MW settle:", 0.0, 10.0, 4, 0.0, "s",
             "Delay after setting the SG386's frequency, before acquisition "
             "-- frequency settling only. Unrelated to MW on/off gating, "
             "which is done by the fast switch (Pulse Streamer channel 2), "
             "not this delay.\n"
-            "Recommended: 0.0 s currently. Use 0.05–0.1 s only if ESR disappears after frequency jumps."
-        )
-
+            "Recommended: 0.0 s currently. Use 0.05–0.1 s only if ESR "
+            "disappears after frequency jumps.")
         self.pulse_lead_spin = self._add_double(
-            delays_layout,
-            "Pulse Lead (s):", 0.0, 1.0, 4, 0.002
-        )
-        self.pulse_lead_spin.setToolTip(
+            delays_form, "Pulse lead:", 0.0, 1.0, 4, 0.002, "s",
             "Laser and MW switch on this long before the camera trigger "
             "fires.\n"
             "Recommended: 0.002 s.\n"
             "A sweep at 2/1/0.5/0.2/0 ms found no measurable contrast "
             "dependence, though the lower values overlap the trigger-delay "
             "stall regime (see Camera Trigger Delay), so that comparison "
-            "isn't fully clean."
-        )
-
+            "isn't fully clean.")
         self.pulse_tail_spin = self._add_double(
-            delays_layout,
-            "Pulse Tail (s):", 0.0, 1.0, 4, 0.002
-        )
-        self.pulse_tail_spin.setToolTip(
+            delays_form, "Pulse tail:", 0.0, 1.0, 4, 0.002, "s",
             "Laser and MW remain ON this long after the camera exposure "
             "ends, within the pulse sequence itself.\n"
             "Recommended: 0.002 s.\n"
             "Costs no wall-clock scan time -- nothing waits on it; it only "
             "extends how long the sequence holds these channels on "
-            "hardware."
-        )
-        self.delays_group.setVisible(False)
+            "hardware.")
+        self.delays_section.set_summary_provider(self._delays_summary)
 
-        self.stability_group = StabilitySettingsGroup()
+        # ---- Stability check (on/off in the header) -----------------------
+        self.stability_group = StabilitySettingsGroup(settings_key="odmr/stability")
         odmr_layout.addWidget(self.stability_group)
 
-        self.save_check = QCheckBox("Save data")
-        self.save_check.setChecked(False)
-        odmr_layout.addWidget(self.save_check)
-
-        mode_layout = QHBoxLayout()
-        mode_layout.addWidget(QLabel("Plot mode:"))
-
+        # ---- Plot & fit (open by default) ---------------------------------
+        self.fit_section = CollapsibleSection(
+            "Plot & fit", expanded=True, settings_key="odmr/fit")
+        odmr_layout.addWidget(self.fit_section)
+        fit_form = self.fit_section.body_layout()
         self.plot_mode_combo = QComboBox()
         self.plot_mode_combo.addItems(["Normalized ESR", "Mean I_on / I_off"])
-
-        mode_layout.addWidget(self.plot_mode_combo)
-        odmr_layout.addLayout(mode_layout)
-
-        fit_layout = QHBoxLayout()
-        fit_layout.addWidget(QLabel("Fit type:"))
-
+        self.plot_mode_combo.setToolTip(
+            "What the plot shows: the normalized ESR spectrum (ON/OFF, %), or "
+            "the mean ON and OFF counts per pixel. Display only.")
+        fit_form.addRow(self._tipped("Plot mode:", self.plot_mode_combo),
+                        self.plot_mode_combo)
         self.fit_type_combo = QComboBox()
         self.fit_type_combo.addItems(["Single Lorentzian", "Double Lorentzian"])
-
-        fit_layout.addWidget(self.fit_type_combo)
-        odmr_layout.addLayout(fit_layout)
-
+        self.fit_type_combo.setToolTip(
+            "Model for \"Fit Lorentzian\": one dip, or two dips (e.g. a "
+            "strain- or field-split pair).")
+        fit_form.addRow(self._tipped("Fit type:", self.fit_type_combo),
+                        self.fit_type_combo)
         self.fit_button = QPushButton("Fit Lorentzian")
         self.fit_button.setEnabled(False)
-        odmr_layout.addWidget(self.fit_button)
-
+        self.fit_button.setToolTip(
+            "Fit the spectrum currently shown with the selected fit type. "
+            "Enabled once data is available; results appear below.")
+        fit_form.addRow(self.fit_button)
         self.initial_fit_parameters_button = QPushButton("Supply Initial Fit Parameters")
-        odmr_layout.addWidget(self.initial_fit_parameters_button)
-
-        self.fit_group = QGroupBox("Fit Results")
-        fit_result_layout = QVBoxLayout()
-        self.fit_group.setLayout(fit_result_layout)
-
+        self.initial_fit_parameters_button.setToolTip(
+            "Give starting values for the fit (dip locations in GHz; "
+            "optionally contrast and FWHM). Use it when the automatic guess "
+            "misses a dip.")
+        fit_form.addRow(self.initial_fit_parameters_button)
+        self.fit_group = QWidget()
+        fit_result_layout = QVBoxLayout(self.fit_group)
+        fit_result_layout.setContentsMargins(0, 4, 0, 0)
         self.fit_label = QLabel(
             "f0 = --\n"
             "FWHM = --\n"
@@ -359,51 +367,56 @@ class ODMRPanel(QWidget):
             "SNR = --\n"
             "R² = --"
         )
-
+        self.fit_label.setToolTip("Result of the last fit.")
         fit_result_layout.addWidget(self.fit_label)
-        odmr_layout.addWidget(self.fit_group)
+        fit_form.addRow(self.fit_group)
+        self.fit_section.set_summary_provider(self._fit_summary)
 
-        self.statistics_group = QGroupBox("ODMR Statistics")
-        statistics_layout = QVBoxLayout(self.statistics_group)
+        # ---- ODMR statistics (folded) -------------------------------------
+        self.statistics_group = CollapsibleSection(
+            "ODMR Statistics", settings_key="odmr/statistics")
+        odmr_layout.addWidget(self.statistics_group)
+        statistics_form = self.statistics_group.body_layout()
         self.statistics_summary_label = QLabel("Statistics: No completed acquisition")
         self.statistics_summary_label.setWordWrap(True)
-        statistics_layout.addWidget(self.statistics_summary_label)
+        self.statistics_summary_label.setToolTip(
+            "Availability of the per-pixel statistics of the last completed "
+            "scan (saved in odmr_statistics.h5).")
+        statistics_form.addRow(self.statistics_summary_label)
         self.statistics_details_button = QPushButton("How are these calculated?")
-        statistics_layout.addWidget(self.statistics_details_button)
-        odmr_layout.addWidget(self.statistics_group)
+        self.statistics_details_button.setToolTip(
+            "Explain how the final mean, fast/slow noise and combined "
+            "uncertainty are calculated.")
+        statistics_form.addRow(self.statistics_details_button)
         self.statistics_dialog = None
         self.statistics_details_button.clicked.connect(self.show_statistics_explanation)
+        self.statistics_group.set_summary_provider(
+            lambda: self.statistics_summary_label.text().splitlines()[0])
 
+        # ---- Tools --------------------------------------------------------
         self.analysis_button = QPushButton("ODMR Analysis")
-        odmr_layout.addWidget(self.analysis_button)
+        self.analysis_button.setToolTip(
+            "Open the offline ODMR analysis window (load a saved "
+            "odmr_statistics.h5, fit per pixel, reconstruct Bz). Touches no "
+            "hardware.")
         self.analysis_button.clicked.connect(self.analysis_requested.emit)
-
         self.sequence_button = QPushButton("Show Pulse Sequence")
-        odmr_layout.addWidget(self.sequence_button)
+        self.sequence_button.setToolTip(
+            "Show the pulse sequence (laser, MW switch, camera trigger) that "
+            "the current delay settings produce.")
+        self.tools_row = QWidget()
+        self.tools_row.setLayout(style.button_row(self.analysis_button,
+                                                  self.sequence_button))
+        odmr_layout.addWidget(self.tools_row)
 
         odmr_layout.addStretch()
 
         # Horizontal scrolling is off, so the column must be at least as
-        # wide as the controls want -- measured with the collapsible
-        # sections shown, so expanding them never clips -- plus room for
-        # the vertical scrollbar.
-        collapsible = (self.dense_group, self.dip2_group, self.delays_group)
-        for group in collapsible:
-            group.setVisible(True)
-        controls_width = self.control_box.sizeHint().width()
-        for group in collapsible:
-            group.setVisible(False)
-        self.control_scroll_area.setMinimumWidth(
-            controls_width
-            + self.control_scroll_area.verticalScrollBar().sizeHint().width()
-            + 2 * self.control_scroll_area.frameWidth()
-        )
+        # wide as the controls want; sections report their folded bodies.
+        style.fit_column_width(self.control_scroll_area, self.control_box)
 
-        plot_box = QGroupBox("ODMR Plot")
+        plot_box, plot_layout = style.card("ODMR Plot", form=False)
         main_layout.addWidget(plot_box, 4)
-
-        plot_layout = QVBoxLayout()
-        plot_box.setLayout(plot_layout)
 
         self.plot = pg.PlotWidget()
         self.plot.setLabel("left", "Normalized Fluorescence (%)")
@@ -413,8 +426,39 @@ class ODMRPanel(QWidget):
 
         self.curve = self.plot.plot([], [], pen="y", symbol="o", symbolSize=6)
 
+    # ---- section summaries ---------------------------------------------------
+
+    def _dense_summary(self):
+        if not self.dense_check.isChecked():
+            return "Off"
+        dips = [(self.dense1_center_spin, self.dense1_width_spin, self.dense1_steps_spin)]
+        if self.num_dips_combo.currentText() == "2":
+            dips.append((self.dense2_center_spin, self.dense2_width_spin,
+                         self.dense2_steps_spin))
+        parts = [f"{c.value():.6f} GHz, {w.value():g} MHz wide, {n.value()} pts"
+                 for c, w, n in dips]
+        return f"{len(dips)} dip{'s' if len(dips) > 1 else ''}: " + "; ".join(parts)
+
+    def _delays_summary(self):
+        def ms(spin):
+            return f"{spin.value() * 1000:g} ms"
+        return (f"trigger {ms(self.trigger_delay_spin)}, fire {ms(self.fire_delay_spin)}, "
+                f"reset {ms(self.reset_delay_spin)}, settle {ms(self.mw_settle_spin)}, "
+                f"lead {ms(self.pulse_lead_spin)}, tail {ms(self.pulse_tail_spin)}")
+
+    def _fit_summary(self):
+        lines = [line for line in self.fit_label.text().splitlines() if line.strip()]
+        if not lines or lines[0].startswith("f0 = --"):
+            return f"{self.plot_mode_combo.currentText()}; no fit yet"
+        return ", ".join(lines[:3])
+
+    def _update_dense_enabled(self, _checked=None):
+        for field in self._dense_fields:
+            field.setEnabled(self.dense_check.isChecked())
+
     def set_statistics_status(self, message):
         self.statistics_summary_label.setText(message)
+        self.statistics_group.refresh_summary()
 
     def update_statistics(self, result):
         """Display processor-provided availability and final-mean validity."""
@@ -452,6 +496,7 @@ class ODMRPanel(QWidget):
             f"Combined uncertainty: {'Available' if combined_available else 'Unavailable'}\n"
             f"Valid data: {valid_percent:.1f}% ({valid}/{total})"
         )
+        self.statistics_group.refresh_summary()
 
     def show_statistics_explanation(self):
         if self.statistics_dialog is None:
@@ -467,6 +512,16 @@ class ODMRPanel(QWidget):
         run_button.BLOCKED: "Waiting for stable counts",
     }
     WAITING_TOOLTIP = "Use \"Start anyway\" or \"Cancel\" below the controls."
+    RUN_BUTTON_TOOLTIP = {
+        run_button.IDLE: (
+            "Start an ODMR scan with the settings below. The magnetic field "
+            "is set first, then every frequency is measured; the plot shows "
+            "the mean of the completed sweeps."),
+        run_button.RUNNING: (
+            "Stop the scan. Completed sweeps are kept (and saved if \"Save "
+            "data\" is on); a partly done sweep is dropped."),
+        run_button.BLOCKED: WAITING_TOOLTIP,
+    }
 
     def set_run_button_state(self, state):
         """IDLE: "Start", green. RUNNING: "Stop", red. Driven by the
@@ -474,43 +529,31 @@ class ODMRPanel(QWidget):
         grey and disabled while the stability check waits."""
         style_run_button(
             self.run_stop_button, state, self.RUN_BUTTON_TEXT[state],
-            self.WAITING_TOOLTIP if state == run_button.BLOCKED else "",
+            self.RUN_BUTTON_TOOLTIP[state],
         )
 
-    def toggle_dense_section(self, checked):
-        self.dense_group.setVisible(checked)
-
-    def toggle_delays_section(self, checked):
-        self.delays_group.setVisible(checked)
-
     def toggle_dip2(self, text):
-        self.dip2_group.setVisible(text == "2")
+        """Show the Dip 2 rows only with 2 dips (values are kept)."""
+        form = self.dense_section.body_layout()
+        for spin in (self.dense2_center_spin, self.dense2_width_spin,
+                     self.dense2_steps_spin):
+            form.setRowVisible(spin, text == "2")
 
-    def _add_double(self, layout, label, min_val, max_val, decimals, default):
-        row = QHBoxLayout()
-        row.addWidget(QLabel(label))
+    @staticmethod
+    def _tipped(text, field):
+        label = QLabel(text)
+        label.setToolTip(field.toolTip())
+        return label
 
-        spin = QDoubleSpinBox()
-        spin.setRange(min_val, max_val)
-        spin.setDecimals(decimals)
-        spin.setValue(default)
-
-        row.addWidget(spin)
-        layout.addLayout(row)
-
+    def _add_double(self, form, label, min_val, max_val, decimals, default,
+                    unit="", tooltip=""):
+        spin = style.double_spin(min_val, max_val, decimals, default, unit, tooltip)
+        form.addRow(self._tipped(label, spin), spin)
         return spin
 
-    def _add_int(self, layout, label, min_val, max_val, default):
-        row = QHBoxLayout()
-        row.addWidget(QLabel(label))
-
-        spin = QSpinBox()
-        spin.setRange(min_val, max_val)
-        spin.setValue(default)
-
-        row.addWidget(spin)
-        layout.addLayout(row)
-
+    def _add_int(self, form, label, min_val, max_val, default, tooltip=""):
+        spin = style.int_spin(min_val, max_val, default, tooltip=tooltip)
+        form.addRow(self._tipped(label, spin), spin)
         return spin
 
     def get_config(self):
@@ -599,6 +642,7 @@ class ODMRPanel(QWidget):
                 f"R² = {fit['r2']:.5f}\n"
                 f"RMSE = {fit['rmse']:.4f}"
             )
+        self.fit_section.refresh_summary()
 
     def update_plot_normalized(self, x, y):
         self.plot.clear()

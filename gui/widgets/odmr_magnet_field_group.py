@@ -4,16 +4,26 @@ Display and form only: what the modes do is in
 experiments/odmr_experiment.py::ODMRExperiment.setup_magnet_field().
 """
 
+from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import (
-    QComboBox, QDoubleSpinBox, QFormLayout, QGridLayout, QGroupBox, QLabel,
+    QComboBox, QDoubleSpinBox, QFormLayout, QGridLayout, QLabel,
     QSizePolicy, QStackedWidget, QToolButton, QVBoxLayout, QWidget,
 )
 
 from experiments.odmr_experiment import (
     FIELD_MODE_CUSTOM, FIELD_MODE_LEAVE, FIELD_MODE_ZERO,
     VECTOR_ENTRY_COMPONENTS, VECTOR_ENTRY_DIRECTION,
+    commanded_vector_gauss, direction_entry, format_direction, vector_entry,
 )
 from framework.field_direction import unit_direction, vector_along
+from gui import style
+from gui.widgets.collapsible_section import CollapsibleSection
+
+
+def _tipped_label(text, tooltip):
+    label = QLabel(text)
+    label.setToolTip(tooltip)
+    return label
 
 # Combo text -> config value, in display order (default first).
 MODE_TEXTS = {
@@ -106,24 +116,69 @@ def _gauss_spin(tooltip):
     return spin
 
 
-class MagnetFieldGroup(QGroupBox):
+def field_summary_text(config, magnet):
+    """The applied field, spelled out, for the collapsed section header.
+
+    E.g. "Field: calibrated zero (0, 0, 0) G", "Field: 4 G along
+    [0.707, 0.707, 0] = (2.8284, 2.8284, 0) G", "Field: magnet off (lab
+    background)". Reads only cached magnet state (no I/O).
+    """
+    if magnet is None:
+        return "Field: no magnet available (not controlled)"
+    mode = config.get("magnet_field_mode", FIELD_MODE_LEAVE)
+    if mode == FIELD_MODE_LEAVE:
+        if not magnet.is_enabled():
+            return "Field: magnet off (lab background)"
+        vector = magnet.get_vector()
+        model = [None if vector.get(a) is None else vector[a] * 10.0
+                 for a in ("x", "y", "z")]
+        return f"Field: left as is, magnet on, model {_format_gauss(model)} G"
+    try:
+        target = commanded_vector_gauss(config, mode)
+    except ValueError:
+        return "Field: invalid direction (zero vector); a scan will be refused"
+    if mode == FIELD_MODE_ZERO:
+        return f"Field: calibrated zero {_format_gauss(target)} G"
+    if vector_entry(config) == VECTOR_ENTRY_DIRECTION:
+        direction, magnitude = direction_entry(config)
+        return (f"Field: {magnitude:g} G along {format_direction(direction)} = "
+                f"{_format_gauss(target)} G")
+    return f"Field: custom {_format_gauss(target)} G"
+
+
+def _format_gauss(values):
+    return "(" + ", ".join(
+        "?" if v is None else f"{round(v, 4) + 0.0:g}" for v in values) + ")"
+
+
+class MagnetFieldGroup(CollapsibleSection):
     """"Magnetic field during scan": mode plus a custom vector in G, entered
-    as X/Y/Z components or as a magnitude along a direction."""
+    as X/Y/Z components or as a magnitude along a direction.
+
+    A collapsible section, folded by default; the folded header always
+    spells out the field the scan will apply (field_summary_text()).
+    """
 
     def __init__(self, parent=None):
-        super().__init__("Magnetic field during scan", parent)
+        super().__init__(
+            "Magnetic field during scan", expanded=False,
+            settings_key="odmr/magnet_field", parent=parent,
+            tooltip=("Show or hide the field settings. Folded, the line below "
+                     "the title still shows the field the scan will apply."),
+        )
         self.setToolTip(GROUP_TOOLTIP)
-        layout = QFormLayout(self)
+        layout = self.body_layout()
+        self._magnet = None
 
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(list(MODE_TEXTS))
         self.mode_combo.setToolTip(MODE_TOOLTIP)
-        layout.addRow(QLabel("Mode:"), self.mode_combo)
+        layout.addRow(_tipped_label("Mode:", MODE_TOOLTIP), self.mode_combo)
 
         self.entry_combo = QComboBox()
         self.entry_combo.addItems(list(ENTRY_TEXTS))
         self.entry_combo.setToolTip(ENTRY_TOOLTIP)
-        layout.addRow(QLabel("Enter as:"), self.entry_combo)
+        layout.addRow(_tipped_label("Enter as:", ENTRY_TOOLTIP), self.entry_combo)
 
         # One page per entry. A stacked widget's size hint covers both pages,
         # so the panel's column width fits the wider direction page too.
@@ -136,7 +191,7 @@ class MagnetFieldGroup(QGroupBox):
         self.component_spins = {}
         for axis in ("X", "Y", "Z"):
             spin = _gauss_spin(_component_tooltip(axis))
-            components_layout.addRow(QLabel(f"{axis} (G):"), spin)
+            components_layout.addRow(QLabel(f"{axis}:"), spin)
             self.component_spins[axis] = spin
         self.x_spin = self.component_spins["X"]
         self.y_spin = self.component_spins["Y"]
@@ -204,6 +259,25 @@ class MagnetFieldGroup(QGroupBox):
         self._update_entry_page()
         self._update_direction_labels()
         self._update_enabled()
+
+        # The summary follows every control here, and (1 Hz, cached reads
+        # only) the magnet's own on/off state for "Leave magnet as is".
+        self.set_summary_provider(
+            lambda: field_summary_text(self.get_config(), self._magnet)
+        )
+        self._summary_timer = QTimer(self)
+        self._summary_timer.setInterval(1000)
+        self._summary_timer.timeout.connect(self.refresh_summary)
+
+    def set_magnet(self, magnet):
+        """The magnet whose state the summary describes (None: no magnet)."""
+        self._magnet = magnet
+        self.set_available(magnet is not None)
+        if magnet is not None:
+            self._summary_timer.start()
+        else:
+            self._summary_timer.stop()
+        self.refresh_summary()
 
     # ---- mode -----------------------------------------------------------
 
@@ -289,10 +363,10 @@ class MagnetFieldGroup(QGroupBox):
             unit = unit_direction(self.raw_field_direction())
         except ValueError:
             self.normalised_label.setText("⚠ Zero vector: choose a direction.")
-            self.normalised_label.setStyleSheet("color: #c06000;")
+            style.warning_style(self.normalised_label)
             self.applied_label.setText("Applied: none (a scan will be refused)")
             return
-        self.normalised_label.setStyleSheet("")
+        style.warning_style(self.normalised_label, on=False)
         self.normalised_label.setText(
             "n̂ = (" + ", ".join(f"{n:.3f}" for n in unit) + ")"
         )
