@@ -26,6 +26,7 @@ import gui.zero_field_worker as zero_field_worker_module  # noqa: E402
 from framework.image_cube import ImageCube  # noqa: E402
 from gui import zero_field_queue as queue_model  # noqa: E402
 from gui.widgets.zero_field_widget import ZeroFieldWidget  # noqa: E402
+from gui.widgets import run_button  # noqa: E402
 from gui.zero_field_window import ZeroFieldWindow  # noqa: E402
 from tests.test_main_window_close_safety import _make_main_window  # noqa: E402
 from tests.test_zero_field_timing import make_camera, make_magnet  # noqa: E402
@@ -516,11 +517,18 @@ class ControlPanelLayoutTests(QueueWindowTestCase):
         self.assertIs(scroll.widget(), w.controls_group)
         self.assertFalse(scroll.isAncestorOf(w.run_stop_button))
         self.assertTrue(w.left_panel.isAncestorOf(w.run_stop_button))
-        # Directly above the scroll area in the left column.
+        # Start/Stop, then the run status (GUI redesign: moved up from the
+        # bottom of the scroll area), then the scroll area.
         left = w.left_panel.layout()
         self.assertIs(left.itemAt(0).widget(), w.run_stop_button)
-        self.assertIs(left.itemAt(1).widget(), scroll)
-        # Every control group, in its original order, inside the scroll area.
+        self.assertIs(left.itemAt(1).widget(), w.status_panel)
+        self.assertIs(left.itemAt(2).widget(), scroll)
+        for label in (w.progress_bar, w.status_label, w.current_point_label,
+                      w.current_scan_label, w.current_field_label,
+                      w.current_signal_label):
+            self.assertTrue(w.status_panel.isAncestorOf(label), label)
+            self.assertFalse(scroll.isAncestorOf(label), label)
+        # Cards, then collapsible sections, inside the scroll area.
         groups = [
             left_item.widget().title()
             for left_item in (
@@ -531,18 +539,20 @@ class ControlPanelLayoutTests(QueueWindowTestCase):
         ]
         self.assertEqual(
             groups,
-            ["Output Directory", "Magnetic Field", "Multi-Scan Averaging",
-             "Stability check", "Camera Acquisition"],
+            ["Output", "Field sweep", "Settling", "Multi-scan averaging",
+             "Reference normalization", "Stability check", "Image display"],
         )
         for control in (
             w.output_directory_edit, w.browse_output_button, w.save_data_check,
             w.field_start_spin, w.field_axis_combo, w.post_flip_settling_spin,
             w.averaging_enabled_check, w.alternate_direction_check,
             w.reference_field_spin, w.display_mode_combo, w.colormap_combo,
-            w.line_profile_check, w.save_button, w.progress_bar,
-            w.status_label, w.current_signal_label,
+            w.line_profile_check, w.save_button,
         ):
             self.assertTrue(scroll.isAncestorOf(control), control)
+        self.assertIs(w.averaging_section.header_checkbox, w.averaging_enabled_check)
+        self.assertIs(w.reference_section.header_checkbox, w.reference_enabled_check)
+        self.assertTrue(w.reference_section.body.isAncestorOf(w.reference_field_spin))
         # The plot and image stay outside it.
         self.assertFalse(scroll.isAncestorOf(w.plot))
         self.assertFalse(scroll.isAncestorOf(w.image_view))
@@ -551,6 +561,54 @@ class ControlPanelLayoutTests(QueueWindowTestCase):
         self.assertEqual(scroll.verticalScrollBarPolicy(),
                          Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.assertTrue(scroll.widgetResizable())
+
+    def test_default_fold_states_and_summaries(self):
+        w = self.window.widget
+        for section in (w.settling_section, w.averaging_section,
+                        w.reference_section, w.stability_group, w.display_section):
+            self.assertFalse(section.is_expanded(), section.title())
+        self.assertEqual(w.settling_section.summary(),
+                         "100 ms per point, +500 ms after a relay flip")
+        self.assertEqual(w.averaging_section.summary(), "Off")
+        self.assertEqual(w.reference_section.summary(), "Off")
+        w.averaging_enabled_check.setChecked(True)
+        w.num_scans_spin.setValue(4)
+        w.alternate_direction_check.setChecked(True)
+        self.assertEqual(w.averaging_section.summary(),
+                         "On: 4 scans, alternating direction")
+        w.reference_enabled_check.setChecked(True)
+        self.assertEqual(w.reference_section.summary(), "On, reference -8 G")
+
+    def test_folding_never_changes_the_config(self):
+        w = self.window.widget
+        w.averaging_enabled_check.setChecked(True)
+        w.alternate_direction_check.setChecked(True)
+        w.reference_enabled_check.setChecked(True)
+        before = w.get_config()
+        sections = (w.settling_section, w.averaging_section, w.reference_section,
+                    w.stability_group, w.display_section)
+        for expanded in (True, False):
+            for section in sections:
+                section.set_expanded(expanded)
+            self.assertEqual(w.get_config(), before)
+
+    def test_units_in_suffixes_and_every_control_has_a_tooltip(self):
+        from PyQt6.QtWidgets import (QAbstractButton, QAbstractSpinBox,
+                                     QComboBox, QLineEdit, QProgressBar)
+        w = self.window.widget
+        for spin, suffix, decimals in (
+                (w.field_start_spin, " G", 4), (w.field_stop_spin, " G", 4),
+                (w.reference_field_spin, " G", 4)):
+            self.assertEqual((spin.suffix(), spin.decimals()), (suffix, decimals))
+        self.assertEqual(w.settling_time_spin.suffix(), " ms")
+        self.assertEqual(w.post_flip_settling_spin.suffix(), " ms")
+        controls = [c for kind in (QAbstractButton, QAbstractSpinBox, QComboBox,
+                                   QLineEdit, QProgressBar)
+                    for c in w.left_panel.findChildren(kind)
+                    if not isinstance(c.parentWidget(), (QAbstractSpinBox, QComboBox))]
+        missing = [c.text() if hasattr(c, "text") else type(c).__name__
+                   for c in controls if not c.toolTip().strip()]
+        self.assertEqual(missing, [])
 
     def test_controls_fit_the_column_and_scroll_vertically(self):
         window, w = self.window, self.window.widget
@@ -621,7 +679,9 @@ class ControlPanelLayoutTests(QueueWindowTestCase):
         self.assertEqual(button.text(), "Queue running")
         self.assertTrue(_pump_until(lambda: not self.window.queue_active()))
         self._assert_button("Start", "green")
-        self.assertEqual(button.toolTip(), "")
+        # GUI redesign: every control has a tooltip, so idle is no longer "".
+        self.assertEqual(button.toolTip(),
+                         self.window.widget.RUN_BUTTON_TOOLTIP[run_button.IDLE])
 
     def test_get_config_defaults_unchanged(self):
         # The defaults get_config() returned before the layout change.

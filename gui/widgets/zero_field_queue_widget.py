@@ -10,7 +10,6 @@ from PyQt6.QtGui import QBrush, QColor, QFont
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
-    QDoubleSpinBox,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
@@ -22,10 +21,18 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from gui import style
+from gui.widgets import run_button
 from gui.zero_field_queue import ON_FAILURE_CHOICES, RUNNING
 
 
 _RUNNING_BRUSH = QBrush(QColor(255, 236, 150))
+
+
+def _tipped(text, field):
+    label = QLabel(text)
+    label.setToolTip(field.toolTip())
+    return label
 
 
 class ZeroFieldQueueWidget(QWidget):
@@ -43,27 +50,51 @@ class ZeroFieldQueueWidget(QWidget):
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
+        self.table.setToolTip(
+            "Queued runs in list order: settings summary, status, and the "
+            "file each run wrote. Select a row to edit or reorder it.")
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        layout.addWidget(self.table, 4)
+        layout.addWidget(self.table, 3)
 
-        side = QVBoxLayout()
-        layout.addLayout(side, 1)
+        # Two columns of cards beside the table: editing on the left, running
+        # on the right, so the dock stays low and the plots keep their height.
+        side = QHBoxLayout()
+        side.setSpacing(style.COLUMN_SPACING)
+        layout.addLayout(side, 2)
+        edit_column = QVBoxLayout()
+        edit_column.setSpacing(style.COLUMN_SPACING)
+        run_column = QVBoxLayout()
+        run_column.setSpacing(style.COLUMN_SPACING)
+        side.addLayout(edit_column, 1)
+        side.addLayout(run_column, 1)
 
+        # ---- Edit the list ----------------------------------------------
+        edit_box, edit_layout = style.card("Entries", form=False)
+        edit_column.addWidget(edit_box)
         edit_grid = QGridLayout()
-        side.addLayout(edit_grid)
+        edit_layout.addLayout(edit_grid)
         self.add_button = QPushButton("Add to queue")
         self.add_button.setToolTip(
             "Store the current settings, output directory and save options as "
             "a new entry. Changing the form afterwards does not change it."
         )
         self.remove_button = QPushButton("Remove")
+        self.remove_button.setToolTip(
+            "Remove the selected entry (not the one running).")
         self.move_up_button = QPushButton("Move up")
+        self.move_up_button.setToolTip(
+            "Move the selected entry one place earlier. Pending entries run in "
+            "list order, picked when each run starts.")
         self.move_down_button = QPushButton("Move down")
+        self.move_down_button.setToolTip("Move the selected entry one place later.")
         self.duplicate_button = QPushButton("Duplicate")
+        self.duplicate_button.setToolTip(
+            "Add a pending copy of the selected entry (same settings and "
+            "output folder).")
         self.clear_button = QPushButton("Clear pending")
         self.clear_button.setToolTip("Remove every pending entry.")
         self.load_into_form_button = QPushButton("Load entry into form")
@@ -71,27 +102,39 @@ class ZeroFieldQueueWidget(QWidget):
             "Copy the selected entry's settings back into the form, to edit "
             "and add again. The entry itself is not changed."
         )
-        self.save_queue_button = QPushButton("Save queue…")
-        self.load_queue_button = QPushButton("Load queue…")
         buttons = (
             self.add_button, self.duplicate_button,
             self.remove_button, self.clear_button,
             self.move_up_button, self.move_down_button,
-            self.load_into_form_button, self.save_queue_button,
-            self.load_queue_button,
         )
         for position, button in enumerate(buttons):
             edit_grid.addWidget(button, position // 2, position % 2)
+        edit_grid.addWidget(self.load_into_form_button, 3, 0, 1, 2)
 
-        options = QGridLayout()
-        side.addLayout(options)
-        options.addWidget(QLabel("Pause between runs (s):"), 0, 0)
-        self.pause_spin = QDoubleSpinBox()
-        self.pause_spin.setRange(0.0, 86400.0)
-        self.pause_spin.setDecimals(1)
-        self.pause_spin.setValue(0.0)
-        options.addWidget(self.pause_spin, 0, 1)
-        options.addWidget(QLabel("On failure:"), 1, 0)
+        # ---- Queue files --------------------------------------------------
+        file_box, file_layout = style.card("Queue file", form=False)
+        edit_column.addWidget(file_box)
+        edit_column.addStretch()
+        self.save_queue_button = QPushButton("Save queue…")
+        self.save_queue_button.setToolTip(
+            "Save every entry's settings, output folder and stability check "
+            "to a JSON queue file (run status is not saved).")
+        self.load_queue_button = QPushButton("Load queue…")
+        self.load_queue_button.setToolTip(
+            "Replace the list with the entries of a saved queue file, all "
+            "pending. A file with any invalid or unreachable entry is refused "
+            "as a whole.")
+        file_layout.addLayout(style.button_row(self.save_queue_button,
+                                               self.load_queue_button))
+
+        # ---- Run ------------------------------------------------------------
+        run_box, options = style.card("Run")
+        run_column.addWidget(run_box)
+        self.pause_spin = style.double_spin(
+            0.0, 86400.0, 1, 0.0, "s",
+            "Wait between one run's end and the next run's start, in seconds "
+            "(e.g. to let the setup settle).")
+        options.addRow(_tipped("Pause between runs:", self.pause_spin), self.pause_spin)
         self.on_failure_combo = QComboBox()
         self.on_failure_combo.addItems(ON_FAILURE_CHOICES)
         self.on_failure_combo.setToolTip(
@@ -99,14 +142,15 @@ class ZeroFieldQueueWidget(QWidget):
             "(field out of range, unusable output directory). A stopped run "
             "is not a failure."
         )
-        options.addWidget(self.on_failure_combo, 1, 1)
+        options.addRow(_tipped("On failure:", self.on_failure_combo),
+                       self.on_failure_combo)
 
-        run_row = QHBoxLayout()
-        side.addLayout(run_row)
         self.run_queue_button = QPushButton("Run queue")
         self.run_queue_button.setStyleSheet(
-            "background-color: green; color: white; font-weight: bold;"
-        )
+            run_button.run_button_stylesheet(run_button.IDLE))
+        self.run_queue_button.setToolTip(
+            "Run the pending entries one after another, in list order. Each "
+            "entry's field range is checked again just before it starts.")
         self.stop_current_button = QPushButton("Stop current run")
         self.stop_current_button.setToolTip(
             "Stop the running entry (marked stopped) and continue with the next."
@@ -116,16 +160,19 @@ class ZeroFieldQueueWidget(QWidget):
             "Stop the running entry and do not start any more. Entries not "
             "yet run stay pending."
         )
-        run_row.addWidget(self.run_queue_button)
-        run_row.addWidget(self.stop_current_button)
-        run_row.addWidget(self.stop_queue_button)
+        options.addRow(self.run_queue_button)
+        options.addRow(style.button_row(self.stop_current_button,
+                                        self.stop_queue_button))
 
         self.queue_status_label = QLabel("Queue: idle")
+        self.queue_status_label.setToolTip(
+            "Queue progress: run k of N, pausing, or the finished summary.")
+        self.queue_status_label.setWordWrap(True)
         font = self.queue_status_label.font()
         font.setBold(True)
         self.queue_status_label.setFont(font)
-        side.addWidget(self.queue_status_label)
-        side.addStretch()
+        run_column.addWidget(self.queue_status_label)
+        run_column.addStretch()
 
     def selected_row(self):
         """Index of the selected entry, or None."""

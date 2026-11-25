@@ -256,8 +256,11 @@ class ZeroFieldGuiUnitsTests(unittest.TestCase):
         self.assertEqual(config["field_start"], -5.0)
         self.assertEqual(config["field_stop"], 5.0)
         labels = {label.text() for label in widget.findChildren(QLabel)}
-        self.assertIn("Start Field (G):", labels)
-        self.assertIn("Stop Field (G):", labels)
+        # GUI redesign: the unit moved from the label into the spin box suffix.
+        self.assertIn("Start field:", labels)
+        self.assertIn("Stop field:", labels)
+        self.assertEqual(widget.field_start_spin.suffix(), " G")
+        self.assertEqual(widget.field_stop_spin.suffix(), " G")
 
         widget.reset_scan(3)
         self.assertEqual(widget.current_field_label.text(), "Current magnetic field: -- G")
