@@ -6,7 +6,28 @@ This file documents how the code actually works, not how it was originally inten
 
 ## Conventions
 
-- **Every user-facing control must have a tooltip explaining what it does, its units, and when to use it.** (Standing convention, from 2026-11-24. Controls written before then are not all compliant; new and changed controls must be. `tests/test_stability_check.py` checks it for the stability-check controls.)
+- **Every user-facing control must have a tooltip explaining what it does, its units, and when to use it.** (Standing convention, from 2026-11-24.) Since the GUI redesign (2026-11-25) every control in every window has one; an audit in `--sim` found none missing. Window tests check it: `test_odmr_window_layout.py`, `test_zero_field_queue.py`, `test_main_window_layout.py`, `test_magnetic_field_gui_units.py`, `test_stability_check.py`.
+
+## GUI layout rules
+
+Every window is built from one set of pieces, so a new feature reuses the look instead of adding its own:
+- `gui/style.py`: spacing and colour constants, `card(title)` (a `QGroupBox` with the card look and a form layout), `form_layout()`, `button_row()`, `double_spin()`/`int_spin()` (unit in the suffix), `muted()`/`warning_style()`, `status_label()`, `fit_column_width()`. `apply_app_style(app)` installs the app stylesheet; it only matches group boxes marked `card="true"` and the section widget's named parts, so pyqtgraph's plots and image views keep their native look. Don't nest a card directly inside a card (the inner title would lose its bold).
+- `gui/widgets/collapsible_section.py::CollapsibleSection`: arrow + title, a one-line summary shown while folded, an optional header checkbox for on/off features, `body_layout()` for the controls. `title()` works like a group box's.
+
+Rules:
+- **Fixed at the top** of an experiment window's control column: the run/stop button, progress and run status. Below them, in the scroll area: the essential scan parameters in an open card, then everything else in `CollapsibleSection`s, **folded by default**, each with a summary of what it is set to.
+- **Folding only hides controls; it never changes a setting.** `get_config()` reads folded controls exactly as shown ones. A feature that is on/off puts its existing checkbox in the section header (ticking it also unfolds the section; unticking leaves it). Verified across the redesign: `get_config()` of both panels was identical for the same inputs (7 input sets each).
+- **New controls go into the section they belong to; a new feature gets its own section**, rather than growing an open card.
+- **Units in spin-box suffixes**, never in labels (text fields keep units in their labels). Decimals by quantity: GHz 6, G 4, dBm 1, MHz 2, ms integers, s as many as needed; **no control may lose precision it has**.
+- **Every control has a tooltip** (see Conventions).
+- **Column width** comes from `style.fit_column_width()`. Sections report their body's width even while folded; rows hidden for another reason are passed as `also_measure`. Never widen a column for a row that is usually hidden.
+- **Open/closed state** is remembered across restarts (QSettings: the registry, `HKCU\Software\NV Control\nv_control`, or an INI file named by `NV_CONTROL_UI_STATE_FILE`) via `settings_key`, but only after `enable_state_persistence()`, which only the app entry points call (`gui/main_window.py::main()`, `odmr_analysis_main.py`). Windows built by tests and scripts always get the defaults. Only open/closed state is stored, never a setting. `tests/test_app_exit.py` points its launched app at a temporary INI file.
+- **Tests:** `tests/test_collapsible_section.py` (section and style).
+
+Window layouts (details in each window's section below):
+- **Main window:** "Camera" card (Start/Stop Stream, exposure, binning, baseline); "Acquisition ROI" section (folded; summary = the ROI in use); "Experiments" card (ODMR, Zero-Field Imaging); "Hardware" card (Magnet). Right: "Live view" card (colormap + image) and the "Count statistics" section (open by default). The state ("State: IDLE") is in the status bar. The disabled placeholder buttons and the empty "Utilities" box were removed (see "Not implemented"). Tests: `tests/test_main_window_layout.py`.
+- **Magnet window:** power button; "Experiment lock" card; tabs. Manual Control: "Manual command" card (axis, field in G with 4 decimals, Apply / Refresh / Magnetic Zero), "Commanded / Model Status" (selected axis), and the model-vector card, which also shows each coil's relay polarity (`polarity_labels`). The status line (`status_label`) is in the status bar. Texts and attributes are unchanged.
+- **ODMR analysis window:** unchanged layout, card style; map Min/Max keep 9 decimals.
 
 ## What this is
 
@@ -83,7 +104,7 @@ Simulated classes have full method parity with their real counterparts, not just
 ```
 
 - `live_view_colormap` — the main-window live view. The "Colormap:" combo sits directly above the image (`MainWindow.colormap_combo`).
-- `zfe_colormap` — the Zero Field image. The combo is `ZeroFieldWidget.colormap_combo` (in "Camera Acquisition"), which is the reference implementation.
+- `zfe_colormap` — the Zero Field image. The combo is `ZeroFieldWidget.colormap_combo` (in the "Image display" section), which is the reference implementation.
 - There is **no `odmr_colormap`**: the ODMR window shows only a spectrum plot, with no image to colour. The separate ODMR analysis window's map has its own colormap list and is not persisted.
 
 Both selectors offer the same list: `gui/display_settings.py::COLORMAP_NAMES` (Gray, Viridis, Plasma, Inferno, Magma). A test keeps it equal to the ZFE widget's hard-coded items.
@@ -117,7 +138,7 @@ Both selectors offer the same list: `gui/display_settings.py::COLORMAP_NAMES` (G
 - `ODMRWorker` pre-allocates `pixel_data` as float32 `(averages, 2, n_freq, H, W)` at the first point. Statistic index 0 holds the normalised mean and index 1 the repeat SD.
 - At `_finish()` it builds `statistics_cube`, an `ImageCube` with `axis_order ["average", "statistic", "frequency", "y", "x"]`. Only **completed** sweeps are included; a partial sweep after stop/error is dropped. The metadata records completion, stop, and error status plus pixel-repair counts.
 - `ODMRWindow.odmr_finished()` validates it with `framework/analysis/odmr_statistics.py`: `load_odmr_statistics()` and `calculate_odmr_statistics()`.
-- The panel's "ODMR Statistics" box shows availability. Its "How are these calculated?" dialog explains the maths.
+- The panel's "ODMR Statistics" section (folded by default; its summary is the first status line) shows availability. Its "How are these calculated?" dialog explains the maths.
 - When saving is on, the cube is saved as `odmr_statistics.h5` in the scan's output folder.
 
 **The maths** is in `calculate_odmr_statistics()`:
@@ -133,7 +154,7 @@ Both selectors offer the same list: `gui/display_settings.py::COLORMAP_NAMES` (G
 
 **Rule: zero-field ESR is taken at calibrated zero, not with coils off.** With the coils off, the lab background (~1.2 G, mostly Z) splits each strain line into sub-components and inflates the apparent splitting. Measured at the rig: 2E = 6.87 MHz and FWHM 5.3 MHz with the coils off, against 2E = 5.52 MHz and FWHM 3.6 MHz at calibrated zero. ODMR files saved before this setting existed don't record the field, so their ESRs can't be interpreted reliably.
 
-**GUI:** the "Magnetic field during scan" group in the ODMR panel (`gui/widgets/odmr_magnet_field_group.py::MagnetFieldGroup`).
+**GUI:** the "Magnetic field during scan" section in the ODMR panel (`gui/widgets/odmr_magnet_field_group.py::MagnetFieldGroup`, a `CollapsibleSection`), **folded by default**. Folded, its summary always spells out the applied field (`field_summary_text()`): "Field: calibrated zero (0, 0, 0) G", "Field: custom (2, -1, 3) G", "Field: 4 G along [0.707, 0.707, 0] = (2.8284, 2.8284, 0) G", "Field: magnet off (lab background)", "Field: left as is, magnet on, model (…) G", "Field: no magnet available (not controlled)". It is refreshed on every change of the group's controls and once a second from the magnet's cached state (`is_enabled()`/`get_vector()`, no I/O); `ODMRWindow` hands the magnet over with `set_magnet()`.
 - Mode: "Field zero at diamond" (default) / "Custom vector" / "Leave magnet as is". Every control has a tooltip.
 - "Enter as:" (enabled only for "Custom vector") picks how the custom vector is given, on a `QStackedWidget` page each:
   - "Components (X, Y, Z)" (default): X, Y, Z spinboxes in G (default 0, ±10000).
@@ -232,9 +253,9 @@ Confirmed unused by the running application; each is either an abandoned duplica
 - `experiments/pulsed_experiment.py` (`PulsedExperiment`) — abstract stub, no subclasses anywhere in the repo. `ODMRExperiment` builds its own pulse sequences without inheriting from it.
 - `hardware/camera/base_camera.py` (`BaseCamera` ABC) — no camera class actually subclasses it; `AndorNeo`, `AndorNeoAndor3`, and `SimCamera` are independently duck-typed.
 
-## Not implemented — disabled placeholders only
+## Not implemented
 
-Rabi, Ramsey, T1, and T2 experiments do not exist as code. `gui/main_window.py` has four buttons for them, all `.setEnabled(False)` with no click handler wired up. One of them is misspelled in the source — the button is labeled/named "Ramsy", not "Ramsey". **Do not silently fix this spelling** if you're working nearby; it's recorded here deliberately, not accidentally missed. SmarAct XYZ stages, an Event Camera, and a C4 Lock-In Camera are documented-as-planned only — no driver code exists for any of them. The unused `stages`/`MCS2` configuration remains. The unused orphan EventCamera fields and its stale `detector2=6` assignment were removed after auditing every digital call site; channel 6 now belongs exclusively to the X polarity relay.
+Rabi, Ramsey, T1, and T2 experiments do not exist as code. The main window used to show disabled placeholder buttons for them (one labelled "Ramsy"), plus disabled "Microwave" and "Power Supplies" buttons; all six were removed in the GUI redesign (2026-11-25, the user's decision). Add a button when the experiment or tool exists, not before. SmarAct XYZ stages, an Event Camera, and a C4 Lock-In Camera are documented-as-planned only — no driver code exists for any of them. The unused `stages`/`MCS2` configuration remains. The unused orphan EventCamera fields and its stale `detector2=6` assignment were removed after auditing every digital call site; channel 6 now belongs exclusively to the X polarity relay.
 
 ## Known open issues (Zero Field experiment)
 
@@ -249,7 +270,7 @@ Camera-contention and ROI-validation findings from the same audit are fixed — 
 
 **Field range is validated before a Zero Field scan starts.** `ZeroFieldWindow._start_run()` (called by `start_scan()` and by the run queue) calls `_preflight_field_range()` first, before any state change, thread, or worker exists; the check itself is `field_range_problem()`. It runs each axis's existing `MagnetAxis.plan_field()` (pure calculation, no I/O) for the vector at both sweep endpoints: the swept axis at `field_start`/`field_stop` × 0.1 mT/G, the other axes at 0.0 mT (the GUI always zeroes them). Endpoints suffice because required current on a branch is |target − intercept| / ratio, maximal at an endpoint of a linear sweep. With reference normalization on, the reference vector (swept axis at `reference_field_gauss`, others 0.0 mT) is checked the same way, and an unreachable reference is refused with the same dialog. A `ValueError` (out of range / non-finite) shows "Field range out of bounds" with the axis's approximate reachable range in Gauss, derived from `max_current` and both calibration branches, and aborts the start. `RuntimeError`s from `plan_field()` deliberately do **not** block: before the magnet's first `enable()` every relay is unsynchronized and `plan_field()` raises for any nonzero current, a state the scan's own `setup_scan()` resolves — blocking on it would refuse every first scan after launch. Previously an unreachable target raised mid-scan, after data had been acquired. For a vector sweep every axis is checked at s·n̂ for both endpoints and the reference (each axis is linear in s, so endpoints still suffice); the message names the failing axis and the direction, and a zero or invalid direction is refused first, as "Invalid field direction".
 
-**Relay flips get extra settling and are marked in the data.** A flip (`_switch_polarity()`: zero/off/discharge/switch/settle/on) is a far larger transient than an incremental step, and flips happen near field zero — X ~0.12 G, Z ~1.17 G, Y's gap ~0.063 G on this rig — exactly where ZFE resolves. `ZeroFieldExperiment(post_flip_settling_ms=...)` (constructor default 0.0; GUI "Post-flip extra settling (ms)", default 500, range 0–60000, passed via `ZeroFieldWorker`) sleeps that much **after** the normal `settling_time_ms` sleep, only at points whose field command flipped a relay; like the normal settling sleep it is not interruptible by stop. Flips from `setup_scan()`'s own `set_vector(0, 0, 0)` (e.g. X/Z moving to their negative branch; every later scan of a multi-scan run, whose previous sweep ended positive) are attributed to point 0, since they occur immediately before it with no settling in between. Per acquired point the experiment records `relay_flip_occurred` (bool) and `relay_flip_axes` (sorted comma-joined names: `"X"`, `"X,Z"`, `""`), truncated with `field_values_gauss` on an early stop. They are stored as **ImageCube metadata lists**, not separate HDF5 datasets — the same mechanism as `field_values_gauss`, so they reach the single-scan streamed file (writer `update_metadata()` + `merge_hdf5_metadata`), raw per-scan files, and the atomic-saved average without any writer or file-format change. They are written in `_run_single_sweep()`'s `finally`, so a hard process kill mid-scan leaves a streamed file without them. In the multi-scan average a point is flagged if a flip preceded it in any averaged scan, with the union of axes. `post_flip_settling_ms` is recorded in metadata.
+**Relay flips get extra settling and are marked in the data.** A flip (`_switch_polarity()`: zero/off/discharge/switch/settle/on) is a far larger transient than an incremental step, and flips happen near field zero — X ~0.12 G, Z ~1.17 G, Y's gap ~0.063 G on this rig — exactly where ZFE resolves. `ZeroFieldExperiment(post_flip_settling_ms=...)` (constructor default 0.0; GUI "Post-flip extra settling" in the "Settling" section, ms, default 500, range 0–60000, passed via `ZeroFieldWorker`) sleeps that much **after** the normal `settling_time_ms` sleep, only at points whose field command flipped a relay; like the normal settling sleep it is not interruptible by stop. Flips from `setup_scan()`'s own `set_vector(0, 0, 0)` (e.g. X/Z moving to their negative branch; every later scan of a multi-scan run, whose previous sweep ended positive) are attributed to point 0, since they occur immediately before it with no settling in between. Per acquired point the experiment records `relay_flip_occurred` (bool) and `relay_flip_axes` (sorted comma-joined names: `"X"`, `"X,Z"`, `""`), truncated with `field_values_gauss` on an early stop. They are stored as **ImageCube metadata lists**, not separate HDF5 datasets — the same mechanism as `field_values_gauss`, so they reach the single-scan streamed file (writer `update_metadata()` + `merge_hdf5_metadata`), raw per-scan files, and the atomic-saved average without any writer or file-format change. They are written in `_run_single_sweep()`'s `finally`, so a hard process kill mid-scan leaves a streamed file without them. In the multi-scan average a point is flagged if a flip preceded it in any averaged scan, with the union of axes. `post_flip_settling_ms` is recorded in metadata.
 
 **Requested vs modelled field are both recorded per Zero Field point.** `field_values_gauss` (and `scan_axis_values`) stay exactly what they were: the **requested** linspace, in G — unchanged for backward compatibility. Alongside them, `_run_single_sweep()` snapshots the magnet right after each point's `set_vector()` (`_model_snapshot()`) and records three more per-point metadata lists, truncated with the others on an early stop and carried through the same streaming/average/raw-file paths as the relay-flip lists:
 - `model_field_values_gauss` — the swept axis's **modelled** field, in **G** (`MagnetAxis.get_field()` × 10).
@@ -265,8 +286,8 @@ All three are calibration-model values, **not measurements** (there is no field 
 **Why it exists.** At the rig, slow fluorescence drift within one sweep (0.4–0.6%) is larger than the ~0.3% zero-field dip. If every scan sweeps the same way, drift that repeats per scan survives averaging and looks like field dependence. Pairing a forward and a reverse sweep and averaging by field cancels drift that is linear in time.
 
 **How it is switched on.**
-- GUI: "Alternate sweep direction" in "Multi-Scan Averaging" (`ZeroFieldWidget.alternate_direction_check`, default off).
-  - It is enabled only while "Enable averaging" is checked.
+- GUI: "Alternate sweep direction" in the "Multi-scan averaging" section (`ZeroFieldWidget.alternate_direction_check`, default off).
+  - It is enabled only while averaging is on (the section header's "On" checkbox, `averaging_enabled_check`).
   - `get_config()["alternate_direction"]` is `isChecked() and isEnabled()`, so a disabled-but-checked box reports False.
   - With an odd "Number of Scans" a non-blocking "⚠ Odd number of scans" label appears; the scan still runs.
 - Experiment: `ZeroFieldExperiment(alternate_direction=False)`, passed through by `ZeroFieldWorker`. It only takes effect together with `averaging_enabled`; `_alternating` is the effective flag.
@@ -307,8 +328,8 @@ All three are calibration-model values, **not measurements** (there is no field 
 **Why it exists.** At the rig, slow environmental drift is ~1% peak-to-peak over minutes, against ~0.06% point-to-point noise and a ~0.15–0.3% zero-field dip. Bidirectional sweeps cancel only drift that is linear in time, and need many scans. Like ODMR's ON/OFF pairing, this mode measures every point twice: at its field (signal, S) and at a fixed off-resonant reference field (R). It stores the per-pixel ratio, so slow multiplicative drift common to both halves divides out.
 
 **How it is switched on.**
-- GUI: "Reference field normalization" checkbox and "Reference field (G)" spinbox (default −8.0, ±10000, 4 decimals), in "Multi-Scan Averaging" next to "Alternate sweep direction".
-  - It works with or without multi-scan averaging, so it is not tied to the averaging checkbox.
+- GUI: the "Reference normalization" section: its header "On" checkbox (`reference_enabled_check`) and "Reference field" (G suffix; default −8.0, ±10000, 4 decimals).
+  - It works with or without multi-scan averaging, so it has its own section (it used to sit under "Multi-Scan Averaging").
   - The spinbox is enabled only while the box is checked.
   - `get_config()["reference_enabled"]` is `isChecked() and isEnabled()`. `reference_field_gauss` is always reported.
 - Experiment: `ZeroFieldExperiment(reference_enabled=False, reference_field_gauss=-8.0)`, passed through by `ZeroFieldWorker`.
@@ -368,10 +389,10 @@ All three are calibration-model values, **not measurements** (there is no field 
 
 **How it is switched on.**
 - GUI: "Vector" is the fourth "Sweep Axis" item (`ZeroFieldWidget.VECTOR_TEXT`).
-  - It shows `field_direction_box`: nx/ny/nz spinboxes (default 1, 1, 1; ±1000, 4 decimals), quick-pick buttons "<110>" (1,1,0) and "<111>" (1,1,1), and a label with the normalised n̂. A zero vector is flagged there.
+  - It shows `field_direction_box`: nx/ny/nz spinboxes in rows (default 1, 1, 1; ±1000, 4 decimals), preset buttons X, Y, Z, <110>, <1-10>, <111> (`direction_preset_buttons`; `direction_110_button`/`direction_111_button` are the same buttons), and a label with the normalised n̂. A zero vector is flagged there.
   - Start/Stop Field and the reference field are then the **signed magnitude s along n̂**. The labels are unchanged.
   - `get_config()` adds `field_axis: "vector"` and `field_direction` (normalised). With X/Y/Z it is exactly as before, with no `field_direction` key. `set_config()` accepts both.
-  - The direction box's column width is computed before it is hidden, so showing it never clips the column.
+  - The column width is measured with the direction box shown (`style.fit_column_width(..., also_measure=...)`), so showing it never clips; its rows are stacked, so it no longer widens the column (547 → 335 px).
 - Experiment: `ZeroFieldExperiment(field_axis="vector", field_direction=[nx, ny, nz])`, passed through by `ZeroFieldWorker`.
   - `field_direction` is normalised once by `unit_direction()` (`framework/field_direction.py`, shared with ODMR's direction entry; still importable from `experiments/zero_field_experiment.py`). It is required for "vector" and refused for X/Y/Z.
   - `unit_direction()` rejects a zero, non-finite or non-3-number direction, and returns an already-unit vector unchanged, so normalising again (queue file, experiment) never changes the last digit.
@@ -455,21 +476,23 @@ No experiment, worker, magnet or hardware file was changed for it.
 
 ## Zero Field window layout
 
-- **Left column** (`ZeroFieldWidget.left_panel`):
+- **Left column** (`ZeroFieldWidget.left_panel`), built with the shared pieces (see "GUI layout rules"):
   - The run/stop button is fixed at the top.
-  - Every other control is below it in `control_scroll_area`, a `QScrollArea` set up exactly like the ODMR panel's: resizable, vertical scrollbar as needed, horizontal always off. Its widget is the "Zero Field Parameters" group (`controls_group`), with the groups in their original order.
-  - The scroll area's minimum width is the controls' size hint plus the scrollbar, so nothing is clipped horizontally.
-  - The plot, the image and the bottom "Run Queue" dock are outside it.
+  - Directly under it, outside the scroll area, the run status (`status_panel`): progress bar, status, current point, current scan, current field and signal. They used to be at the bottom of the scroll area.
+  - Below, `control_scroll_area` (resizable, vertical scrollbar as needed, horizontal always off). Its widget `controls_group` (now a plain `QWidget`) holds the "Output" card (directory, Browse, "Save data", "Save Data") and the "Field sweep" card (start, stop, points, sweep axis with the vector direction, frames per point), always open; then the sections, folded by default: "Settling", "Multi-scan averaging" (on/off in the header), "Reference normalization" (on/off in the header), "Stability check", "Image display" (display only).
+  - The column width comes from `style.fit_column_width()`: 335 px (was 547 px, sized for the hidden vector-direction row).
+  - The plot, the image and the bottom "Run Queue" dock are outside it. The dock's controls are in "Entries", "Queue file" and "Run" cards in two columns beside the table, so the dock stays low.
   - Below the scroll area, the stability-check wait bar (hidden unless waiting; see "Count stability check before experiments").
+  - Controls height at the defaults about 566 px, 986 px with every section open (was 1266 px), measured 2026-11-25.
 - **Run/stop button.** It is one toggle driving `toggle_scan()`. Its styling is shared with the ODMR run button: `gui/widgets/run_button.py::style_run_button()`, where IDLE is green, RUNNING red and BLOCKED grey and disabled. Text and background colours are both explicit, so it reads the same in light and dark themes. The ODMR button now uses the same texts and colours (see "ODMR window layout").
-  - Idle: "Start", green. Running: "Stop", red. A running queue: "Queue running", grey, disabled.
+  - Idle: "Start", green. Running: "Stop", red. A running queue: "Queue running", grey, disabled. Each state has a tooltip (`RUN_BUTTON_TOOLTIP`).
   - It follows the window's `run_started`/`run_finished` signals (`_update_run_button()`), not the click, so completion, stop and error all return it to "Start".
   - `ZeroFieldWidget.set_running_state()` now only sets the status line.
 - **Default size** is 1100×960. That fits 1920×1080 with the taskbar visible (1032 px available, 991 px with the title bar), and it is clamped to a smaller screen. The window's minimum height is about 540 px, set by the plot and queue areas; below the default height the controls scroll.
 
 ## Live count statistics (main window)
 
-A "Count statistics" panel under the live view, like a power meter's statistics screen, for watching focus/laser drift. `gui/widgets/count_statistics_panel.py::CountStatisticsPanel` (Qt) on top of `framework/count_statistics.py` (GUI-free: `frame_sample()`, `RunningStatistics`, `CountLog`).
+A "Count statistics" panel under the live view, like a power meter's statistics screen, for watching focus/laser drift. It is a `CollapsibleSection`, **open by default**; folded, it keeps running and its summary shows the status, mean, std and sample count (refreshed with the labels at 4 Hz). `gui/widgets/count_statistics_panel.py::CountStatisticsPanel` (Qt) on top of `framework/count_statistics.py` (GUI-free: `frame_sample()`, `RunningStatistics`, `CountLog`).
 
 - **Source of samples.** `MainWindow.update_image()` calls `count_statistics_panel.add_frame(frame)` with each frame it already got from `get_latest_frame()`. One sample = the mean counts over the whole frame, which *is* the acquisition ROI (the camera AOI). **The panel never calls the camera.** Raw counts: `baseline_counts` is not subtracted, and a baseline change does not reset.
 - **Repeated frames are dropped.** The 30 ms timer can poll faster than the camera delivers, and `get_latest_frame()` returns a copy of the same frame again; the drivers keep no frame counter. `frame_sample()` returns a fingerprint (shape, exact sum, 64 strided pixels) and an identical one is skipped, so a frame is never counted twice.
@@ -489,19 +512,19 @@ A "Count statistics" panel under the live view, like a power meter's statistics 
 **Where the code is.**
 - `framework/stability.py` (GUI-free): `StabilitySettings`, `window_statistics()`, `evaluate()`, `record()`, `status_text()`.
 - `gui/stability_gate.py`: `StabilityMonitor` (one per app), `StabilityCheck` (one per wait), `StabilityWaitController` (per window).
-- `gui/widgets/stability_check_group.py`: `StabilitySettingsGroup` ("Stability check" group) and `StabilityWaitBar`.
+- `gui/widgets/stability_check_group.py`: `StabilitySettingsGroup` (the "Stability check" `CollapsibleSection`; its on/off checkbox `enabled_check` is in the header, labelled "On") and `StabilityWaitBar`.
 
 **Samples.** The same per-frame mean counts as the count-statistics panel: `CountStatisticsPanel.sample_accepted(t, value)` fires for every accepted live frame (repeats already dropped), and `samples_invalidated` on an ROI/exposure/binning change, which restarts the check's window. Nothing here touches the camera.
 
 **Live view.** `StabilityMonitor` is built by `MainWindow` with `start_stream()`/`stop_stream()`/`timer.isActive()`. If the live view is off when a check begins, it is started; when the last check ends it is stopped again — **before** the experiment is started, which then takes the camera as usual. A running live view is left running.
 
 **Rule** (`evaluate()`), over samples with `now − window_s < t ≤ now`:
-- relative std = sample SD (ddof=1) / mean × 100 ≤ "Max std (%)";
-- |drift| = |least-squares slope| × 60 / mean × 100 ≤ "Max drift (%/min)" (limits inclusive);
+- relative std = sample SD (ddof=1) / mean × 100 ≤ "Max std" (%);
+- |drift| = |least-squares slope| × 60 / mean × 100 ≤ "Max drift" (%/min) (limits inclusive);
 - and the window is really covered: `window_s` since the check (or last settings reset) began, ≥ 10 samples, first sample ≤ 2 s after the window start, newest ≤ 2 s old.
 - Evaluated at 4 Hz. Timeout from the check's start: "Start anyway" (default) starts, "Cancel this run" does not.
 
-**Controls** (ODMR panel after "Delays"; Zero Field after "Multi-Scan Averaging"; all with tooltips): "Check count stability before start" (default off), "Window (s)" 60, "Max std (%)" 0.30, "Max drift (%/min)" 0.50, "Timeout (s)" 600, "On timeout". The fields are enabled only with the box checked.
+**Controls** (a section, folded by default: ODMR after "Delays"; Zero Field after "Reference normalization"; all with tooltips): the header checkbox "On" (check count stability before start; default off), "Window" 60 s, "Max std" 0.30 %, "Max drift" 0.50 %/min, "Timeout" 600 s (units in the suffixes), "On timeout". The fields are enabled only with the box checked. Folded, the summary says "Off", the limits when on, or "Not available (no live view)".
 - **Not part of `get_config()`**: they decide when a run starts, not how it scans. Like the windows' other settings they live in the form for the window's lifetime; nothing is written to `setupInfo.json`.
 - A window built without a monitor (tests, `hardware_manager=None` harnesses) disables the group.
 
@@ -531,13 +554,19 @@ A "Count statistics" panel under the live view, like a power meter's statistics 
 ## ODMR window layout
 
 Same shape as the Zero Field window.
-- **Left column** (`ODMRPanel.left_panel`): the run/stop button fixed at the top, the progress bar, current-frequency label, time label and "Field:" status line (`field_label`) fixed directly under it (outside the scroll area), and below them `control_scroll_area` (vertical scrollbar as needed, horizontal always off) holding the "ODMR Parameters" group (`control_box`) with every other control in its original order (plus the "Magnetic field during scan" group after the dense-region section and the "Stability check" group after Delays). The plot is outside it. Below the scroll area is the stability-check wait bar, hidden unless waiting.
-  - The scroll area's minimum width is the controls' size hint **measured with the Dense ESR Region, Dip 2 and Delays sections shown**, plus the scrollbar, so expanding them never clips horizontally.
+- **Left column** (`ODMRPanel.left_panel`): the run/stop button fixed at the top, the progress bar, current-frequency label, time label and "Field:" status line (`field_label`) fixed directly under it (outside the scroll area), and below them `control_scroll_area` (vertical scrollbar as needed, horizontal always off). Its widget `control_box` (now a plain `QWidget`) holds, built with the shared pieces (see "GUI layout rules"):
+  - the "Scan" card, always open (`scan_group`): start, stop, steps, averages, repeats, MW power, "Save data";
+  - sections, folded by default with a summary: "Dense points near ESR dips" (`dense_section`; `dense_check`, the `use_dense_region` setting, is its header checkbox "On"; Dip 2 rows are hidden with 1 dip via `QFormLayout.setRowVisible()`; the dense fields are greyed while it is off), "Magnetic field during scan" (`magnet_field_group`), "Delays" (`delays_section`; replaces the old "Show Delays" checkbox), "Stability check" (`stability_group`);
+  - "Plot & fit" (`fit_section`), open by default: plot mode, fit type, Fit, Supply Initial Fit Parameters, results (`fit_group`);
+  - "ODMR Statistics" (`statistics_group`), folded;
+  - a tools row (`tools_row`): ODMR Analysis | Show Pulse Sequence.
+  The plot is outside it. Below the scroll area is the stability-check wait bar, hidden unless waiting.
+  - The column width comes from `style.fit_column_width()`; folded sections report their bodies' width, so opening any of them never clips. 287 px (was 303 px).
 - **Run/stop button.** One toggle driving `ODMRWindow.toggle_odmr()`; Stop goes through the unchanged `stop_odmr()` path. Styled by `ODMRPanel.set_run_button_state()` with the shared `style_run_button()`: idle "Start" on green, running "Stop" on red (previously "Run ODMR"/"Stop ODMR").
   - It follows the window's own `run_started`/`run_finished` signals, not the click. `run_finished` is emitted from `odmr_finished()`, which the worker's `finished_signal` reaches on completion, stop and error, so all three return it to "Start".
   - `ODMRPanel.set_running_state()` was removed; `run_odmr()`/`odmr_finished()` no longer style the button directly.
-- **Default size** is 1200×900, clamped to the screen's available area (minus 40 px for the title bar). It fits 1920×1080 with the taskbar. The controls now scroll even when collapsed: the control box's size hint is about 1148 px collapsed and 1716 px with Dense, Dip 2 and Delays expanded (measured 2026-11-25; it was about 734 px before the "Magnetic field during scan" and "Stability check" groups were added).
-- The layout change left controls, defaults and `get_config()` unchanged; the later "Magnetic field during scan" group added two `get_config()` keys (see "ODMR magnetic field during scan"). **Tests:** `tests/test_odmr_window_layout.py` (real scans on sim hardware).
+- **Default size** is 1200×900, clamped to the screen's available area (minus 40 px for the title bar). It fits 1920×1080 with the taskbar. Controls height (size hint) at the defaults about 828 px, 1342 px with every section open (measured 2026-11-25; before the redesign 1148 / 1716 px).
+- The layout changes left controls, defaults and `get_config()` unchanged; the "Magnetic field during scan" group added its own `get_config()` keys (see "ODMR magnetic field during scan"). Units are in the suffixes (GHz 6 decimals, MHz 2, dBm 1, s 4); each run-button state has a tooltip (`RUN_BUTTON_TOOLTIP`). **Tests:** `tests/test_odmr_window_layout.py` (real scans on sim hardware: structure, default fold states and summaries, folding never changes `get_config()`, units, a tooltip on every control).
 
 ## Known hardware quirks (ODMR timing)
 
@@ -573,7 +602,7 @@ These are characterized properties of the current rig/sample, not code facts —
 
 ## Testing safety — read before running pytest with `--hardware`
 
-`tests/` contains 103 test files (excluding `__init__.py`/`conftest.py`). Only 46 are real, hardware-free pytest tests — see `tests/conftest.py::ALLOWED_FILES` for the current, authoritative list rather than a copy here that will drift the next time a file is added to it (as just happened for this change). **The other ~57 are ad-hoc scripts that command real lab hardware — the Andor camera, the SG386 microwave source over VISA, the Swabian pulse streamer, the Helmholtz power supplies — unconditionally at module import time, not just inside a test function.** Several have no `if __name__ == "__main__":` guard at all: importing them fires a relay, streams a pulse, or turns on a power-supply output as a side effect of Python loading the file.
+`tests/` contains 106 test files (excluding `__init__.py`/`conftest.py`). Only 49 are real, hardware-free pytest tests — see `tests/conftest.py::ALLOWED_FILES` for the current, authoritative list rather than a copy here that will drift the next time a file is added to it (as just happened for this change). **The other ~57 are ad-hoc scripts that command real lab hardware — the Andor camera, the SG386 microwave source over VISA, the Swabian pulse streamer, the Helmholtz power supplies — unconditionally at module import time, not just inside a test function.** Several have no `if __name__ == "__main__":` guard at all: importing them fires a relay, streams a pulse, or turns on a power-supply output as a side effect of Python loading the file.
 
 `pytest.ini` (`testpaths = tests`) plus `tests/conftest.py`'s `pytest_ignore_collect` hook gate this: a bare `pytest` run only collects the files named in `ALLOWED_FILES`. The gate is an allowlist, not a denylist — anything not explicitly named there is excluded from collection entirely, so it is never imported. Passing `--hardware` lifts the restriction and collects everything, including every hardware-commanding script.
 
