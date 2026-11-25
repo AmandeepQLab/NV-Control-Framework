@@ -95,7 +95,10 @@ class LayoutTests(ODMRWindowLayoutTestCase):
         self.assertFalse(scroll.isAncestorOf(p.run_stop_button))
         left = p.left_panel.layout()
         self.assertIs(left.itemAt(0).widget(), p.run_stop_button)
-        self.assertIs(left.itemAt(1).widget(), scroll)
+        self.assertIs(left.itemAt(1).widget(), p.progress_bar)
+        self.assertIs(left.itemAt(2).widget(), p.freq_label)
+        self.assertIs(left.itemAt(3).widget(), p.time_label)
+        self.assertIs(left.itemAt(4).widget(), scroll)
         self.assertEqual(scroll.horizontalScrollBarPolicy(),
                          Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.assertEqual(scroll.verticalScrollBarPolicy(),
@@ -112,7 +115,7 @@ class LayoutTests(ODMRWindowLayoutTestCase):
             p.dense_check, p.dense_group, p.delays_check, p.delays_group,
             p.stability_group, p.save_check, p.fit_button, p.initial_fit_parameters_button,
             p.fit_group, p.statistics_group, p.analysis_button,
-            p.sequence_button, p.progress_bar, p.freq_label, p.time_label,
+            p.sequence_button,
         ])
         for control in (
             p.fstart_spin, p.fstop_spin, p.steps_spin, p.avg_spin, p.repeat_spin,

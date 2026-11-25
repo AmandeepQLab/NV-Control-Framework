@@ -113,6 +113,22 @@ class ODMRPanel(QWidget):
         self.set_run_button_state(run_button.IDLE)
         left_layout.addWidget(self.run_stop_button)
 
+        # Progress bar, current-frequency and time labels fixed directly
+        # below the run/stop button, outside the scroll area, so they stay
+        # visible next to the button.
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("Progress: 0 / 0")
+        self.progress_bar.setTextVisible(True)
+        left_layout.addWidget(self.progress_bar)
+
+        self.freq_label = QLabel("Current frequency: -- GHz")
+        left_layout.addWidget(self.freq_label)
+
+        self.time_label = QLabel("Time: estimated -- | actual --")
+        left_layout.addWidget(self.time_label)
+
         self.control_box = QGroupBox("ODMR Parameters")
 
         odmr_layout = QVBoxLayout()
@@ -350,19 +366,6 @@ class ODMRPanel(QWidget):
 
         self.sequence_button = QPushButton("Show Pulse Sequence")
         odmr_layout.addWidget(self.sequence_button)
-
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setFormat("Progress: 0 / 0")
-        self.progress_bar.setTextVisible(True)
-        odmr_layout.addWidget(self.progress_bar)
-
-        self.freq_label = QLabel("Current frequency: -- GHz")
-        odmr_layout.addWidget(self.freq_label)
-
-        self.time_label = QLabel("Time: estimated -- | actual --")
-        odmr_layout.addWidget(self.time_label)
 
         odmr_layout.addStretch()
 

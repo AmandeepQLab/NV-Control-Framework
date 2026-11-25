@@ -991,12 +991,16 @@ class ODMRAcquisitionGuiIntegrationTests(unittest.TestCase):
         self.assertIs(scroll_area.widget(), self.panel.control_box)
         self.assertFalse(scroll_area.widget().isAncestorOf(self.panel.plot))
 
-        # Left column (fixed run button above the scroll area), then the plot.
+        # Left column (fixed run button and progress bar above the scroll
+        # area), then the plot.
         main_layout = self.panel.layout()
         self.assertIs(main_layout.itemAt(0).widget(), self.panel.left_panel)
         left = self.panel.left_panel.layout()
         self.assertIs(left.itemAt(0).widget(), self.panel.run_stop_button)
-        self.assertIs(left.itemAt(1).widget(), scroll_area)
+        self.assertIs(left.itemAt(1).widget(), self.panel.progress_bar)
+        self.assertIs(left.itemAt(2).widget(), self.panel.freq_label)
+        self.assertIs(left.itemAt(3).widget(), self.panel.time_label)
+        self.assertIs(left.itemAt(4).widget(), scroll_area)
         self.assertIs(main_layout.itemAt(1).widget(), self.panel.plot.parentWidget())
 
     def test_existing_acquisition_controls_remain_available(self):
