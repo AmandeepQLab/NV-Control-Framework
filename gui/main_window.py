@@ -37,6 +37,7 @@ from framework.acquisition_state import (
 from framework.roi import validate_roi
 from gui.live_view_controller import LiveViewTimerController
 from gui.widgets.count_statistics_panel import CountStatisticsPanel
+from gui.widgets.collapsible_section import CollapsibleSection
 from gui.stability_gate import StabilityMonitor
 from gui.display_settings import (
     COLORMAP_NAMES,
@@ -53,6 +54,21 @@ LOGGER = logging.getLogger(__name__)
 
 # How long a "Stop and Close" waits for worker threads before closing anyway.
 _CLOSE_WAIT_TIMEOUT_MS = 10_000
+
+
+def _tipped(text, field):
+    """A form label carrying its field's tooltip."""
+    label = QLabel(text)
+    label.setToolTip(field.toolTip())
+    return label
+
+
+def _refresh_roi_summary(window):
+    """Refresh the ROI section's summary. getattr: tests call
+    _sync_roi_controls() on lightweight stand-ins without the section."""
+    section = getattr(window, "roi_section", None)
+    if section is not None:
+        section.refresh_summary()
 
 
 class MainWindow(QMainWindow):
@@ -120,46 +136,31 @@ class MainWindow(QMainWindow):
         central.setLayout(main_layout)
 
         # =====================================================
-        # LEFT CONTROL PANEL
+        # LEFT CONTROL PANEL (cards and sections, gui/style.py)
         # =====================================================
 
         left_panel = QVBoxLayout()
+        left_panel.setSpacing(style.COLUMN_SPACING)
         main_layout.addLayout(left_panel, 2)
 
         # =====================================================
         # CAMERA
         # =====================================================
 
-        camera_group = QGroupBox("Camera")
-
-        camera_layout = QVBoxLayout()
-
-        camera_group.setLayout(camera_layout)
-
+        camera_group, camera_form = style.card("Camera")
+        self.camera_group = camera_group
         left_panel.addWidget(camera_group)
 
-        # =====================================================
-        # CAMERA CONTROLS
-        # =====================================================
-
-        # -----------------------------
-        # Stream buttons
-        # -----------------------------
-
         self.start_button = QPushButton("Start Stream")
+        self.start_button.setToolTip(
+            "Start the live view: the camera streams and the image and count "
+            "statistics update continuously. Experiments pause it while they "
+            "own the camera.")
         self.start_button.clicked.connect(self.start_stream)
-        camera_layout.addWidget(self.start_button)
-
         self.stop_button = QPushButton("Stop Stream")
+        self.stop_button.setToolTip("Stop the live view (the camera stops streaming).")
         self.stop_button.clicked.connect(self.stop_stream)
-        camera_layout.addWidget(self.stop_button)
-
-        # -----------------------------
-        # Exposure
-        # -----------------------------
-
-        exposure_layout = QHBoxLayout()
-        exposure_layout.addWidget(QLabel("Exposure (ms):"))
+        camera_form.addRow(style.button_row(self.start_button, self.stop_button))
 
         try:
             exposure_min_s, exposure_max_s = self.camera.get_exposure_limits()
@@ -178,6 +179,7 @@ class MainWindow(QMainWindow):
         self.exposure_spin = QDoubleSpinBox()
         self.exposure_spin.setRange(exposure_min_s * 1000.0, exposure_max_s * 1000.0)
         self.exposure_spin.setDecimals(3)
+        self.exposure_spin.setSuffix(" ms")
         self.exposure_spin.setValue(10.0)
         self.exposure_spin.setToolTip(
             "Camera exposure time, in milliseconds. Pushed to the camera "
@@ -188,16 +190,7 @@ class MainWindow(QMainWindow):
             "ms) is queried live from the camera at startup."
         )
         self.exposure_spin.valueChanged.connect(self.set_exposure)
-
-        exposure_layout.addWidget(self.exposure_spin)
-        camera_layout.addLayout(exposure_layout)
-
-        # -----------------------------
-        # Binning
-        # -----------------------------
-
-        binning_layout = QHBoxLayout()
-        binning_layout.addWidget(QLabel("Binning:"))
+        camera_form.addRow(_tipped("Exposure:", self.exposure_spin), self.exposure_spin)
 
         self.binning_spin = QSpinBox()
         self.binning_spin.setRange(1, 8)
@@ -207,20 +200,12 @@ class MainWindow(QMainWindow):
             "camera; changes the acquired frame's pixel dimensions."
         )
         self.binning_spin.valueChanged.connect(self.set_binning)
-
-        binning_layout.addWidget(self.binning_spin)
-        camera_layout.addLayout(binning_layout)
-
-        # -----------------------------
-        # Camera baseline (dark-count offset)
-        # -----------------------------
-
-        baseline_layout = QHBoxLayout()
-        baseline_layout.addWidget(QLabel("Camera Baseline (counts):"))
+        camera_form.addRow(_tipped("Binning:", self.binning_spin), self.binning_spin)
 
         self.baseline_spin = QDoubleSpinBox()
         self.baseline_spin.setRange(0.0, 65535.0)
         self.baseline_spin.setDecimals(1)
+        self.baseline_spin.setSuffix(" counts")
         self.baseline_spin.setValue(0.0)
         self.baseline_spin.setToolTip(
             "Camera dark-count offset, subtracted from ROI means before ODMR "
@@ -235,9 +220,8 @@ class MainWindow(QMainWindow):
             "contrast is."
         )
         self.baseline_spin.valueChanged.connect(self.set_baseline_counts)
-
-        baseline_layout.addWidget(self.baseline_spin)
-        camera_layout.addLayout(baseline_layout)
+        camera_form.addRow(_tipped("Camera baseline:", self.baseline_spin),
+                           self.baseline_spin)
 
         # Full-sensor coordinates for camera acquisition.  Experiments
         # receive this value but never define a separate acquisition ROI
@@ -251,168 +235,104 @@ class MainWindow(QMainWindow):
             baseline_counts=self.baseline_spin.value(),
         )
 
-        # -----------------------------
-        # ROI
-        # -----------------------------
+        # =====================================================
+        # ROI (collapsible; the summary is the current ROI)
+        # =====================================================
 
-        roi_box = QGroupBox("ROI")
-        camera_layout.addWidget(roi_box)
-
-        roi_layout = QVBoxLayout()
-        roi_box.setLayout(roi_layout)
+        self.roi_section = CollapsibleSection(
+            "Acquisition ROI", settings_key="main/roi",
+            tooltip="Show or hide the ROI coordinates. The line below the "
+                    "title always shows the ROI in use.")
+        left_panel.addWidget(self.roi_section)
+        roi_form = self.roi_section.body_layout()
 
         self.roi_label = QLabel("Acquisition ROI: None")
-        roi_layout.addWidget(self.roi_label)
+        self.roi_label.setWordWrap(True)
+        self.roi_label.setToolTip(
+            "The acquisition ROI every experiment uses (the camera AOI), in "
+            "effective binned pixels. Drag the red box on the image or edit "
+            "the coordinates below.")
+        roi_form.addRow(self.roi_label)
 
-        coordinates_box = QGroupBox("ROI Coordinates")
-        coordinates_box.setToolTip(
+        coordinates_tooltip = (
             "Effective binned-pixel coordinates, 0-based. X/Y is the top-left "
             "corner; Width/Height extend from there. Applied on "
             "Enter/focus-out."
         )
-        coordinates_layout = QGridLayout(coordinates_box)
         self.roi_coordinate_spins = {}
-        for row, coordinate in enumerate(("X", "Y", "Width", "Height")):
-            coordinates_layout.addWidget(QLabel(f"{coordinate}:"), row, 0)
+        for coordinate in ("X", "Y", "Width", "Height"):
             spin = QSpinBox()
             spin.setRange(
                 -1_000_000 if coordinate in ("X", "Y") else 0,
                 1_000_000,
             )
+            spin.setSuffix(" px")
             spin.setKeyboardTracking(False)
+            spin.setToolTip(f"ROI {coordinate.lower()}. {coordinates_tooltip}")
             spin.editingFinished.connect(self.apply_roi_coordinates)
-            coordinates_layout.addWidget(spin, row, 1)
+            roi_form.addRow(_tipped(f"{coordinate}:", spin), spin)
             self.roi_coordinate_spins[coordinate.lower()] = spin
-        roi_layout.addWidget(coordinates_box)
 
         self.reset_roi_button = QPushButton("Reset ROI")
         self.reset_roi_button.setToolTip(
             "Clear the acquisition ROI back to the full sensor."
         )
         self.reset_roi_button.clicked.connect(self.reset_acquisition_roi)
-        roi_layout.addWidget(self.reset_roi_button)
+        roi_form.addRow(self.reset_roi_button)
+        self.roi_section.set_summary_provider(lambda: self.roi_label.text())
 
         # =====================================================
         # EXPERIMENTS
         # =====================================================
 
-        experiment_group = QGroupBox("Experiments")
-        experiment_layout = QVBoxLayout()
-        experiment_group.setLayout(experiment_layout)
+        experiment_group, experiment_layout = style.card("Experiments", form=False)
+        self.experiment_group = experiment_group
         left_panel.addWidget(experiment_group)
-        experiment_layout.setSpacing(8)
-        experiment_layout.setContentsMargins(10, 10, 10, 10)
+
+        self.open_odmr_button = QPushButton("ODMR")
+        self.open_odmr_button.setToolTip(
+            "Open the ODMR window: microwave frequency sweeps with the camera "
+            "(ESR spectra, statistics, fits).")
+        self.open_odmr_button.clicked.connect(self.open_odmr_window)
+        self.open_odmr_button.setMinimumHeight(36)
+
+        self.open_zero_field_button = QPushButton("Zero-Field Imaging")
+        self.open_zero_field_button.setToolTip(
+            "Open the Zero Field window: fluorescence images while sweeping "
+            "the magnetic field, with multi-scan averaging and a run queue.")
+        self.open_zero_field_button.clicked.connect(self.open_zero_field_window)
+        self.open_zero_field_button.setMinimumHeight(36)
+        experiment_layout.addLayout(style.button_row(
+            self.open_odmr_button, self.open_zero_field_button))
 
         # =====================================================
         # HARDWARE
         # =====================================================
 
-        hardware_group = QGroupBox("Hardware")
-
-        hardware_layout = QVBoxLayout()
-
-        hardware_group.setLayout(hardware_layout)
-
+        hardware_group, hardware_layout = style.card("Hardware", form=False)
+        self.hardware_group = hardware_group
         left_panel.addWidget(hardware_group)
 
-        # -----------------------------------------------------
-        # Magnet Control
-        # -----------------------------------------------------
-
         self.open_magnet_button = QPushButton("Magnet")
-
+        self.open_magnet_button.setToolTip(
+            "Open the magnet window: switch the coils on/off, set a field per "
+            "axis, see the commanded/model field. Locked while an experiment "
+            "runs.")
         self.open_magnet_button.setMinimumHeight(36)
-
         self.open_magnet_button.clicked.connect(
             self.open_magnet_window
         )
-
-        hardware_layout.addWidget(
-            self.open_magnet_button
-        )
-
-        # -----------------------------------------------------
-        # Future Hardware
-        # -----------------------------------------------------
-
-        self.open_microwave_button = QPushButton("Microwave")
-
-        self.open_microwave_button.setEnabled(False)
-
-        hardware_layout.addWidget(
-            self.open_microwave_button
-        )
-
-        self.open_power_supply_button = QPushButton("Power Supplies")
-
-        self.open_power_supply_button.setEnabled(False)
-
-        hardware_layout.addWidget(
-            self.open_power_supply_button
-        )
-
-        # =====================================================
-        # OPEN ODMR WINDOW
-        # =====================================================
-        self.open_odmr_button = QPushButton("ODMR")
-        self.open_odmr_button.clicked.connect(self.open_odmr_window)
-        experiment_layout.addWidget(self.open_odmr_button)
-        self.open_odmr_button.setMinimumHeight(36)
-        
-        # =====================================================
-        # Zero-Field IMAGING
-        # =====================================================
-        
-        self.open_zero_field_button = QPushButton("Zero-Field Imaging")
-        self.open_zero_field_button.clicked.connect(self.open_zero_field_window)
-        experiment_layout.addWidget(self.open_zero_field_button)
-        self.open_zero_field_button.setMinimumHeight(36)
-
-        # =====================================================
-        # upcoming Experiments (disabled for now)
-        # =====================================================
-        
-        #Rabi Button
-        self.open_rabi_button = QPushButton("Rabi")
-        self.open_rabi_button.setEnabled(False)
-        experiment_layout.addWidget(self.open_rabi_button)
-
-        #Ramsy Button
-        self.open_ramsy_button = QPushButton("Ramsy")
-        self.open_ramsy_button.setEnabled(False)
-        experiment_layout.addWidget(self.open_ramsy_button)
-
-        #T1 Button
-        self.open_t1_button = QPushButton("T1")
-        self.open_t1_button.setEnabled(False)
-        experiment_layout.addWidget(self.open_t1_button)
-
-        #T2 Button
-        self.open_t2_button = QPushButton("T2")
-        self.open_t2_button.setEnabled(False)
-        experiment_layout.addWidget(self.open_t2_button)
-
-        # =====================================================
-        # STATUS
-        # =====================================================
-        status_box = QGroupBox("Status")
-        left_panel.addWidget(status_box)
-        status_layout = QVBoxLayout()
-        status_box.setLayout(status_layout)
-
-        self.state_label = QLabel("State: IDLE")
-        status_layout.addWidget(self.state_label)
+        hardware_layout.addWidget(self.open_magnet_button)
 
         left_panel.addStretch()
+
         # =====================================================
-        # UTILITIES
+        # STATUS (in the window's status bar)
         # =====================================================
 
-        utility_group = QGroupBox("Utilities")
-        utility_layout = QVBoxLayout()
-        utility_group.setLayout(utility_layout)
-        left_panel.addWidget(utility_group)
-        utility_layout.addWidget(QLabel("Future tools"))
+        self.state_label = QLabel("State: IDLE")
+        self.state_label.setToolTip("Live-view state of the main window.")
+        self.statusBar().addPermanentWidget(self.state_label)
 
         # =====================================================
         # RIGHT IMAGE PANEL
@@ -423,9 +343,12 @@ class MainWindow(QMainWindow):
 
         # Same selector as the Zero Field window's (gui/display_settings.py).
         colormap_row = QHBoxLayout()
-        colormap_row.addWidget(QLabel("Colormap:"))
         self.colormap_combo = QComboBox()
         self.colormap_combo.addItems(COLORMAP_NAMES)
+        self.colormap_combo.setToolTip(
+            "Colour map of the live view. Display only; applied at once and "
+            "remembered (setupInfo.json, display.live_view_colormap).")
+        colormap_row.addWidget(_tipped("Colormap:", self.colormap_combo))
         colormap_row.addWidget(self.colormap_combo)
         colormap_row.addStretch()
         right_panel.addLayout(colormap_row)
@@ -977,6 +900,7 @@ class MainWindow(QMainWindow):
             sensor_dimensions = self._sensor_dimensions or self._read_sensor_dimensions()
             if sensor_dimensions is None:
                 self.roi_label.setText("Acquisition ROI: Full sensor")
+                _refresh_roi_summary(self)
                 return
             width, height = sensor_dimensions
             width //= binning
@@ -1002,6 +926,7 @@ class MainWindow(QMainWindow):
             blocker = QSignalBlocker(spin)
             spin.setValue(value)
             del blocker
+        _refresh_roi_summary(self)
 
         x0, y0, x1, y1 = overlay_roi
         self._syncing_roi_controls = True
