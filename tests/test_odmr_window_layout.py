@@ -98,7 +98,8 @@ class LayoutTests(ODMRWindowLayoutTestCase):
         self.assertIs(left.itemAt(1).widget(), p.progress_bar)
         self.assertIs(left.itemAt(2).widget(), p.freq_label)
         self.assertIs(left.itemAt(3).widget(), p.time_label)
-        self.assertIs(left.itemAt(4).widget(), scroll)
+        self.assertIs(left.itemAt(4).widget(), p.field_label)
+        self.assertIs(left.itemAt(5).widget(), scroll)
         self.assertEqual(scroll.horizontalScrollBarPolicy(),
                          Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.assertEqual(scroll.verticalScrollBarPolicy(),
@@ -112,7 +113,8 @@ class LayoutTests(ODMRWindowLayoutTestCase):
         widgets = [layout.itemAt(i).widget() for i in range(layout.count())]
         widgets = [w for w in widgets if w is not None]
         self.assertEqual(widgets, [
-            p.dense_check, p.dense_group, p.delays_check, p.delays_group,
+            p.dense_check, p.dense_group, p.magnet_field_group,
+            p.delays_check, p.delays_group,
             p.stability_group, p.save_check, p.fit_button, p.initial_fit_parameters_button,
             p.fit_group, p.statistics_group, p.analysis_button,
             p.sequence_button,
@@ -135,6 +137,10 @@ class LayoutTests(ODMRWindowLayoutTestCase):
             "dense2_center": 2.90e9, "dense2_width": 20e6, "dense2_steps": 30,
             "fire_delay_s": 0.010, "reset_delay_s": 0.010, "mw_settle_s": 0.0,
             "pulse_lead_s": 0.002, "pulse_tail_s": 0.002,
+            # Added with "Magnetic field during scan". This hardware has no
+            # magnet, so the group is disabled and reports leave-as-is.
+            "magnet_field_mode": "leave_as_is",
+            "magnet_custom_vector_gauss": [0.0, 0.0, 0.0],
         })
 
     def test_default_size_fits_1920x1080_with_taskbar(self):

@@ -13,6 +13,7 @@ from PyQt6.QtGui import QFontDatabase
 from gui.widgets import run_button
 from gui.widgets.run_button import style_run_button
 from gui.widgets.stability_check_group import StabilitySettingsGroup, StabilityWaitBar
+from gui.widgets.odmr_magnet_field_group import MagnetFieldGroup
 
 # Moved to a shared module (also used by the ODMR analysis window);
 # re-exported here so existing imports keep working.
@@ -129,6 +130,16 @@ class ODMRPanel(QWidget):
         self.time_label = QLabel("Time: estimated -- | actual --")
         left_layout.addWidget(self.time_label)
 
+        # The field held during the current/last scan (set at run start).
+        self.field_label = QLabel("Field: --")
+        self.field_label.setWordWrap(True)
+        self.field_label.setToolTip(
+            "Magnetic field held at the diamond during the current or last "
+            "scan, from \"Magnetic field during scan\". Commanded or model "
+            "values in gauss, not a measurement."
+        )
+        left_layout.addWidget(self.field_label)
+
         self.control_box = QGroupBox("ODMR Parameters")
 
         odmr_layout = QVBoxLayout()
@@ -210,6 +221,9 @@ class ODMRPanel(QWidget):
             "Inner loop."
         )
         self.mw_power_spin = self._add_double(odmr_layout, "MW Power (dBm):", -100, 20, 1, -10)
+
+        self.magnet_field_group = MagnetFieldGroup()
+        odmr_layout.addWidget(self.magnet_field_group)
 
         # =====================================================
         # DELAYS SECTION
@@ -524,7 +538,12 @@ class ODMRPanel(QWidget):
             "mw_settle_s": self.mw_settle_spin.value(),
             "pulse_lead_s": self.pulse_lead_spin.value(),
             "pulse_tail_s": self.pulse_tail_spin.value(),
+
+            **self.magnet_field_group.get_config(),
         }
+
+    def set_field_status(self, text):
+        self.field_label.setText(text)
 
     def get_plot_mode(self):
         return self.plot_mode_combo.currentText()

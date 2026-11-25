@@ -136,6 +136,11 @@ class ODMRWorker(QObject):
 
     def start(self):
         try:
+            # The scan's magnetic field first, before the camera lease and
+            # any MW or camera action: an unreachable vector is refused
+            # here with nothing else touched. The field then stays fixed.
+            # "Leave magnet as is" only reads the magnet state.
+            self.experiment.setup_magnet_field()
             self._camera_lease = exclusive_camera_access(self.hardware["camera"])
             self._camera_lease.__enter__()
             self.experiment.configure_acquisition()
@@ -369,6 +374,7 @@ class ODMRWorker(QObject):
                 for count in row if count is not None
             ),
         })
+        metadata.update(self.experiment.magnet_field_record or {})
         axes = {
             "axis_order": ["average", "statistic", "frequency", "y", "x"],
             "average": list(range(self.completed_averages)),

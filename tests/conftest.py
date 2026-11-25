@@ -51,6 +51,7 @@ ALLOWED_FILES = frozenset(
         "test_zero_field_queue.py",
         "test_zero_field_vector.py",
         "test_odmr_window_layout.py",
+        "test_odmr_magnet_field.py",
         "test_count_statistics.py",
         "test_stability_check.py",
         "test_zero_field_averaging_module.py",

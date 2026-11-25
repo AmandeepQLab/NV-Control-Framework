@@ -1000,7 +1000,8 @@ class ODMRAcquisitionGuiIntegrationTests(unittest.TestCase):
         self.assertIs(left.itemAt(1).widget(), self.panel.progress_bar)
         self.assertIs(left.itemAt(2).widget(), self.panel.freq_label)
         self.assertIs(left.itemAt(3).widget(), self.panel.time_label)
-        self.assertIs(left.itemAt(4).widget(), scroll_area)
+        self.assertIs(left.itemAt(4).widget(), self.panel.field_label)
+        self.assertIs(left.itemAt(5).widget(), scroll_area)
         self.assertIs(main_layout.itemAt(1).widget(), self.panel.plot.parentWidget())
 
     def test_existing_acquisition_controls_remain_available(self):

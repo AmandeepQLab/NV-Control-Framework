@@ -14,6 +14,81 @@ from sequencing.pulse_sequence import PulseSequence
 LOGGER = logging.getLogger(__name__)
 
 
+# =====================================================
+# MAGNETIC FIELD DURING AN ODMR SCAN
+# =====================================================
+# config["magnet_field_mode"]. A config without the key (direct callers,
+# older scripts and tests) means FIELD_MODE_LEAVE: no magnet command at all,
+# exactly as before this setting existed. The GUI's default is
+# FIELD_MODE_ZERO, because zero-field ESR must be taken at calibrated zero,
+# not with the coils off (see CLAUDE.md).
+FIELD_MODE_ZERO = "field_zero"
+FIELD_MODE_CUSTOM = "custom_vector"
+FIELD_MODE_LEAVE = "leave_as_is"
+FIELD_MODES = (FIELD_MODE_ZERO, FIELD_MODE_CUSTOM, FIELD_MODE_LEAVE)
+
+COILS_OFF_NOTE = "coils off: diamond sees the lab background field"
+NO_MAGNET_NOTE = "no magnet available: field neither controlled nor recorded"
+
+_AXES = ("x", "y", "z")
+
+MAGNET_FIELD_DEFINITIONS = {
+    "magnet_field_mode": (
+        "field_zero: magnet enabled and calibrated zero (0, 0, 0) G commanded "
+        "for the whole scan; custom_vector: magnet enabled and "
+        "magnet_commanded_vector_gauss commanded for the whole scan; "
+        "leave_as_is: ODMR sent no magnet command."
+    ),
+    "magnet_enabled": "Whether the coil supplies were enabled during the scan.",
+    "magnet_commanded_vector_gauss": (
+        "[x, y, z] total field ODMR commanded at scan setup, in G (null in "
+        "leave_as_is). Calibrated: 0 G means the lab background is cancelled."
+    ),
+    "magnet_model_vector_gauss": (
+        "[x, y, z] field of the magnet's calibration model at scan setup, in "
+        "G. A model value, not a measurement: there is no field readback."
+    ),
+    "magnet_model_polarity": "Relay branch per axis [x, y, z]: '+', '-', '?' (unknown).",
+    "magnet_calibration_background_gauss": (
+        "Only with the coils off: [x, y, z] zero-current intercept of each "
+        "axis's retained calibration branch, in G. A calibration estimate of "
+        "the lab background field at the diamond, not a measurement."
+    ),
+}
+
+
+class MagnetFieldRangeError(ValueError):
+    """The requested ODMR field can't be reached by the magnet."""
+
+
+def magnet_field_problem(magnet, vector_gauss):
+    """(axis_name, message) if *vector_gauss* can't be reached, else None.
+
+    Runs each axis's plan_field() -- pure calculation, no I/O -- as the Zero
+    Field pre-scan check does. Only ValueError (out of range / non-finite)
+    counts. RuntimeError is a relay-state precondition, notably the
+    unsynchronized relays before the magnet's first enable(), which the
+    scan's own enable() resolves; set_vector() re-validates afterwards.
+    """
+    for name, value_gauss in zip(_AXES, vector_gauss):
+        try:
+            getattr(magnet, name).plan_field(value_gauss * 0.1 + 0.0)
+        except ValueError as error:
+            return name, str(error)
+        except RuntimeError:
+            continue
+    return None
+
+
+def _polarity_symbol(polarity):
+    """'+'/'-' for a synchronized relay branch, '?' when unknown."""
+    return {1: "+", -1: "-"}.get(getattr(polarity, "value", None), "?")
+
+
+def _gauss(value_mT):
+    return None if value_mT is None else float(value_mT) * 10.0
+
+
 class InvalidPixelNeighborhoodError(RuntimeError):
     """An invalid OFF pixel has no valid pixel in its immediate neighborhood."""
 
@@ -69,9 +144,10 @@ class ODMRExperiment(ScanExperiment):
     scan_axis_name = "frequency"
     scan_axis_unit = "Hz"
 
-    # ODMR never commands the magnet; whatever bias field is set stays put
-    # for the whole scan. Read by MainWindow when announcing a run, so
-    # MagnetControlWindow can warn accordingly (see CLAUDE.md).
+    # ODMR sets the field at most once, at scan setup (setup_magnet_field()),
+    # and it then stays fixed for the whole scan. Read by MainWindow when
+    # announcing a run, so MagnetControlWindow can warn accordingly (see
+    # CLAUDE.md).
     MAGNET_IS_SWEPT = False
 
     def __init__(self, hardware, config, acquisition_roi=None):
@@ -115,6 +191,10 @@ class ODMRExperiment(ScanExperiment):
         # None until configure_acquisition() runs.
         self.actual_exposure_s = None
 
+        # What setup_magnet_field() did and saw; merged into saved metadata.
+        # None until it runs.
+        self.magnet_field_record = None
+
     # =====================================================
     # SETUP
     # =====================================================
@@ -129,7 +209,110 @@ class ODMRExperiment(ScanExperiment):
         than staying silenced from a previous one."""
         self._baseline_margin_warned = False
 
+    # =====================================================
+    # MAGNETIC FIELD (set once, before any MW or camera action)
+    # =====================================================
+
+    def magnet_field_mode(self):
+        """The effective mode: FIELD_MODE_LEAVE without a magnet."""
+        mode = self.config.get("magnet_field_mode", FIELD_MODE_LEAVE)
+        if mode not in FIELD_MODES:
+            raise ValueError(f"Unknown magnet_field_mode {mode!r}")
+        if self._magnet() is None:
+            return FIELD_MODE_LEAVE
+        return mode
+
+    def _magnet(self):
+        get = getattr(self.hw, "get", None)
+        return get("magnet") if callable(get) else None
+
+    def target_field_gauss(self):
+        """(x, y, z) G this scan commands, or None in FIELD_MODE_LEAVE."""
+        mode = self.magnet_field_mode()
+        if mode == FIELD_MODE_ZERO:
+            return (0.0, 0.0, 0.0)
+        if mode == FIELD_MODE_CUSTOM:
+            vector = self.config.get("magnet_custom_vector_gauss", (0.0, 0.0, 0.0))
+            if len(vector) != 3:
+                raise ValueError("magnet_custom_vector_gauss needs three values")
+            return tuple(float(v) for v in vector)
+        return None
+
+    def setup_magnet_field(self):
+        """Set the scan's field (if the mode asks for one) and record it.
+
+        Field zero / custom vector: refuse an unreachable vector before any
+        magnet command, enable the magnet if it is off, then one
+        set_vector(). Nothing changes the field again during the scan.
+        Leave as is (and no magnet): no magnet command, state only read.
+        Uses only the injected magnet object -- no concrete class import.
+        Returns the metadata record, also kept as magnet_field_record.
+        """
+        magnet = self._magnet()
+        mode = self.magnet_field_mode()
+        target = self.target_field_gauss()
+        record = {
+            "magnet_field_mode": mode,
+            "magnet_available": magnet is not None,
+            "magnet_enabled_by_scan": False,
+            "magnet_commanded_vector_gauss": None if target is None else list(target),
+            "magnet_relay_flip_axes": None,
+            "magnet_field_definitions": dict(MAGNET_FIELD_DEFINITIONS),
+        }
+        if target is not None:
+            problem = magnet_field_problem(magnet, target)
+            if problem is not None:
+                axis, message = problem
+                raise MagnetFieldRangeError(
+                    f"{message} Requested ODMR field: "
+                    f"({', '.join(f'{v:g}' for v in target)}) G "
+                    f"({axis.upper()} axis out of range)."
+                )
+            if not magnet.is_enabled():
+                magnet.enable()
+                record["magnet_enabled_by_scan"] = True
+            flipped = magnet.set_vector(
+                bx=target[0] * 0.1 + 0.0,
+                by=target[1] * 0.1 + 0.0,
+                bz=target[2] * 0.1 + 0.0,
+            )
+            flipped = flipped if isinstance(flipped, (set, frozenset)) else ()
+            record["magnet_relay_flip_axes"] = ",".join(sorted(flipped))
+        record.update(self._magnet_state_record(magnet))
+        self.magnet_field_record = record
+        return record
+
+    @staticmethod
+    def _magnet_state_record(magnet):
+        """Enabled state, model vector/polarity and, with the coils off, the
+        calibration background. Reads only; never commands the magnet."""
+        if magnet is None:
+            return {
+                "magnet_enabled": None,
+                "magnet_model_vector_gauss": None,
+                "magnet_model_polarity": None,
+                "magnet_field_note": NO_MAGNET_NOTE,
+            }
+        enabled = bool(magnet.is_enabled())
+        vector = magnet.get_vector()
+        get_polarities = getattr(magnet, "get_polarities", None)
+        polarities = get_polarities() if callable(get_polarities) else {}
+        record = {
+            "magnet_enabled": enabled,
+            "magnet_model_vector_gauss": [_gauss(vector.get(a)) for a in _AXES],
+            "magnet_model_polarity": [_polarity_symbol(polarities.get(a)) for a in _AXES],
+        }
+        if not enabled:
+            # Zero current: each axis sits at its retained branch's
+            # intercept (positive before the relays are synchronized).
+            record["magnet_calibration_background_gauss"] = [
+                _gauss(getattr(magnet, a).current_to_field(0.0)) for a in _AXES
+            ]
+            record["magnet_field_note"] = COILS_OFF_NOTE
+        return record
+
     def setup_scan(self):
+        self.setup_magnet_field()
         self.configure_acquisition()
         self.image_cube.scan_axis_name = self.scan_axis_name
         self.image_cube.scan_axis_unit = self.scan_axis_unit

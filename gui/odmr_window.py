@@ -1,5 +1,11 @@
 import config
-from experiments.odmr_experiment import ODMRExperiment
+from experiments.odmr_experiment import (
+    FIELD_MODE_CUSTOM,
+    FIELD_MODE_LEAVE,
+    FIELD_MODE_ZERO,
+    ODMRExperiment,
+    magnet_field_problem,
+)
 import numpy as np # type: ignore
 import time
 
@@ -63,6 +69,61 @@ CAMERA_PER_FRAME_OVERHEAD_S = 0.0132
 # Dense/Delays sections expanded, the controls scroll.
 _DEFAULT_WINDOW_SIZE = (1200, 900)
 _TITLE_BAR_ALLOWANCE_PX = 40
+
+
+def _format_vector(values):
+    return "(" + ", ".join("?" if v is None else f"{v:g}" for v in values) + ")"
+
+
+def target_field_gauss(config):
+    """(x, y, z) G a scan with *config* commands, or None (leave as is)."""
+    mode = config.get("magnet_field_mode", FIELD_MODE_LEAVE)
+    if mode == FIELD_MODE_ZERO:
+        return (0.0, 0.0, 0.0)
+    if mode == FIELD_MODE_CUSTOM:
+        return tuple(float(v) for v in config["magnet_custom_vector_gauss"])
+    return None
+
+
+def field_status_text(config, magnet):
+    """The "Field:" status line for a scan about to start with *config*."""
+    if magnet is None:
+        return "Field: no magnet available (not controlled)"
+    mode = config.get("magnet_field_mode", FIELD_MODE_LEAVE)
+    target = target_field_gauss(config)
+    if mode == FIELD_MODE_ZERO:
+        return f"Field: calibrated zero {_format_vector(target)} G"
+    if mode == FIELD_MODE_CUSTOM:
+        return f"Field: custom {_format_vector(target)} G"
+    if not magnet.is_enabled():
+        return "Field: coils off (background)"
+    vector = magnet.get_vector()
+    model = [None if vector.get(a) is None else vector[a] * 10.0 for a in ("x", "y", "z")]
+    return f"Field: left as is, coils on, model {_format_vector(model)} G"
+
+
+def axis_limit_note(magnet, name):
+    """Approximate reachable range of one axis, in Gauss, from its config."""
+    note = f"Check your calibration limits in setupInfo.json (Helmholtz.{name.upper()})."
+    try:
+        axis = getattr(magnet, name)
+        positive = axis.calibration["positive"]
+        negative = axis.calibration["negative"]
+        max_current = axis.max_current
+        upper_gauss = 10.0 * (
+            positive["magnetic_field_offset"]
+            + positive["magnetic_field_ratio"] * max_current
+        )
+        lower_gauss = 10.0 * (
+            negative["magnetic_field_offset"]
+            - negative["magnetic_field_ratio"] * max_current
+        )
+    except (AttributeError, KeyError, TypeError):
+        return note
+    return (
+        f"{name.upper()}-axis reachable range is about {lower_gauss:.1f} G to "
+        f"{upper_gauss:.1f} G (max_current {max_current:g} A). {note}"
+    )
 
 
 class ODMRWindow(QMainWindow):
@@ -134,6 +195,37 @@ class ODMRWindow(QMainWindow):
             )
         self.panel.stability_group.set_available(stability_monitor is not None)
 
+        # Without a magnet the field group is disabled and scans leave the
+        # field untouched (as "Leave magnet as is").
+        self.panel.magnet_field_group.set_available(self._magnet() is not None)
+
+    def _magnet(self):
+        get = getattr(self.hardware, "get", None)
+        return get("magnet") if callable(get) else None
+
+    def _preflight_magnet_field(self, config):
+        """Return False (after telling the user) if the field can't be set.
+
+        Same rule as the Zero Field pre-scan check: plan_field() on every
+        axis, pure calculation; only an out-of-range/non-finite target
+        refuses. Runs before any state change, thread or stability wait.
+        """
+        target = target_field_gauss(config)
+        magnet = self._magnet()
+        if target is None or magnet is None:
+            return True
+        problem = magnet_field_problem(magnet, target)
+        if problem is None:
+            return True
+        axis, message = problem
+        QMessageBox.critical(
+            self,
+            "Magnetic field out of range",
+            f"{message}\n\nRequested field during scan: "
+            f"{_format_vector(target)} G.\n{axis_limit_note(magnet, axis)}",
+        )
+        return False
+
     # =====================================================
     # RUN / STOP TOGGLE
     # =====================================================
@@ -155,6 +247,9 @@ class ODMRWindow(QMainWindow):
     def request_start(self):
         """Start a run; with the stability check on, wait for stable counts
         first. With it off this is exactly run_odmr()."""
+        # Refuse an unreachable field before waiting, not after.
+        if not self._preflight_magnet_field(self.panel.get_config()):
+            return
         settings = self.panel.stability_group.get_settings()
         if not settings.enabled or self.stability is None:
             self.run_odmr()
@@ -220,6 +315,10 @@ class ODMRWindow(QMainWindow):
         acquisition_roi = acquisition_state.acquisition_roi
 
         config = self.panel.get_config()
+        # Checked again just before starting (the form or the magnet may
+        # have changed during a stability wait); nothing has started yet.
+        if not self._preflight_magnet_field(config):
+            return
         config["exposure_s"] = acquisition_state.exposure_s
         config["baseline_counts"] = acquisition_state.baseline_counts
         # Recorded in config.json and the statistics cube's metadata. With
@@ -246,6 +345,7 @@ class ODMRWindow(QMainWindow):
         self.panel.fit_button.setEnabled(False)
         self.panel.update_progress(0, config["steps"])
         self.panel.update_frequency(config["f_start"] / 1e9)
+        self.panel.set_field_status(field_status_text(config, self._magnet()))
 
         self.panel.plot.enableAutoRange(False)
         self.panel.plot.setXRange(
@@ -541,6 +641,15 @@ class ODMRWindow(QMainWindow):
             estimated_s=estimated_s,
             actual_s=actual_s
         )
+
+        # What the scan did with the magnet (ODMRExperiment.
+        # setup_magnet_field()), recorded in config.json; the statistics
+        # cube gets the same keys from the worker.
+        magnet_record = getattr(
+            getattr(self.odmr_worker, "experiment", None), "magnet_field_record", None
+        )
+        if magnet_record and self.current_config is not None:
+            self.current_config.update(magnet_record)
 
         if (
             self.current_config is not None
