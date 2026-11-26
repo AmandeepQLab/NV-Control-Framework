@@ -85,20 +85,8 @@ class ZeroFieldWidget(QWidget):
         # Scroll content (attribute name kept: controls_group).
         controls = QWidget()
         self.controls_group = controls
-        control_layout = QVBoxLayout(controls)
-        control_layout.setContentsMargins(0, 0, 4, 0)
-        control_layout.setSpacing(style.COLUMN_SPACING)
-
-        self.control_scroll_area = QScrollArea()
-        self.control_scroll_area.setWidgetResizable(True)
-        self.control_scroll_area.setVerticalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAsNeeded
-        )
-        self.control_scroll_area.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        self.control_scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
-        self.control_scroll_area.setWidget(controls)
+        # Bottom margin and a plainly visible scroll bar (style.control_column).
+        self.control_scroll_area, control_layout = style.control_column(controls)
         left_layout.addWidget(self.control_scroll_area, 1)
 
         # Stability-check wait line, fixed below the scroll area; shown

@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Assistant-facing guide to this repository. Last verified against the code: 2026-08-10.
+Assistant-facing guide to this repository. Last verified against the code: 2026-08-10; GUI and exit behaviour re-checked 2026-11-26.
 
 This file documents how the code actually works, not how it was originally intended to work — every claim below was checked against the current source, not carried forward from comments, commit messages, or prior documentation. If you change something this file describes, update this file in the same change.
 
@@ -12,7 +12,8 @@ This file documents how the code actually works, not how it was originally inten
 
 Every window is built from one set of pieces, so a new feature reuses the look instead of adding its own:
 - `gui/style.py`: spacing and colour constants, `card(title)` (a `QGroupBox` with the card look and a form layout), `form_layout()`, `button_row()`, `double_spin()`/`int_spin()` (unit in the suffix), `muted()`/`warning_style()`, `status_label()`, `fit_column_width()`. `apply_app_style(app)` installs the app stylesheet; it only matches group boxes marked `card="true"` and the section widget's named parts, so pyqtgraph's plots and image views keep their native look. Don't nest a card directly inside a card (the inner title would lose its bold).
-- `gui/widgets/collapsible_section.py::CollapsibleSection`: arrow + title, a one-line summary shown while folded, an optional header checkbox for on/off features, `body_layout()` for the controls. `title()` works like a group box's.
+- `gui/widgets/collapsible_section.py::CollapsibleSection`: arrow + title, a one-line summary shown while folded, an optional header checkbox for on/off features, `body_layout()` for the controls. `title()` works like a group box's. `body=` folds an existing widget instead of the default form body (it then takes the section's extra height; used by the Zero Field Run Queue).
+- `style.control_column(content)`: the scrolling control column of an experiment window (ODMR, Zero Field). Returns `(scroll_area, layout)`; the layout has a bottom margin (`COLUMN_BOTTOM_MARGIN`, 12 px) so the last section is never flush with, or cut by, the bottom edge, and the scroll area is named `controlScrollArea`, which the app stylesheet gives a solid 12 px vertical scroll bar (plainly visible whenever the column overflows; the Windows 11 style's own bar is a thin line).
 
 Rules:
 - **Fixed at the top** of an experiment window's control column: the run/stop button, progress and run status. Below them, in the scroll area: the essential scan parameters in an open card, then everything else in `CollapsibleSection`s, **folded by default**, each with a summary of what it is set to.
@@ -21,13 +22,14 @@ Rules:
 - **Units in spin-box suffixes**, never in labels (text fields keep units in their labels). Decimals by quantity: GHz 6, G 4, dBm 1, MHz 2, ms integers, s as many as needed; **no control may lose precision it has**.
 - **Every control has a tooltip** (see Conventions).
 - **Column width** comes from `style.fit_column_width()`. Sections report their body's width even while folded; rows hidden for another reason are passed as `also_measure`. Never widen a column for a row that is usually hidden.
-- **Open/closed state** is remembered across restarts (QSettings: the registry, `HKCU\Software\NV Control\nv_control`, or an INI file named by `NV_CONTROL_UI_STATE_FILE`) via `settings_key`, but only after `enable_state_persistence()`, which only the app entry points call (`gui/main_window.py::main()`, `odmr_analysis_main.py`). Windows built by tests and scripts always get the defaults. Only open/closed state is stored, never a setting. `tests/test_app_exit.py` points its launched app at a temporary INI file.
+- **Open/closed state** is remembered across restarts (QSettings: the registry, `HKCU\Software\NV Control\nv_control`, or an INI file named by `NV_CONTROL_UI_STATE_FILE`) via `settings_key`, but only after `enable_state_persistence()`, which only the app entry points call (`gui/main_window.py::main()`, `odmr_analysis_main.py`). Windows built by tests and scripts always get the defaults. Only open/closed state and a few layout values (`load_layout_state()`/`save_layout_state()`: the Zero Field Run Queue dock's height) are stored, never a setting. `tests/test_app_exit.py` points its launched app at a temporary INI file; `tests/test_zero_field_queue_dock.py` enables persistence on a temporary INI file and disables it again.
 - **Tests:** `tests/test_collapsible_section.py` (section and style).
 
 Window layouts (details in each window's section below):
-- **Main window:** "Camera" card (Start/Stop Stream, exposure, binning, baseline); "Acquisition ROI" section (folded; summary = the ROI in use); "Experiments" card (ODMR, Zero-Field Imaging); "Hardware" card (Magnet). Right: "Live view" card (colormap + image) and the "Count statistics" section (open by default). The state ("State: IDLE") is in the status bar. The disabled placeholder buttons and the empty "Utilities" box were removed (see "Not implemented"). Tests: `tests/test_main_window_layout.py`.
+- **Main window:** "Camera" card (Start/Stop Stream, exposure, binning, baseline); "Acquisition ROI" section (folded; summary = the ROI in use); "Experiments" card (ODMR, Zero-Field Imaging); "Hardware" card (Magnet). Right: "Live view" card (colormap + image + the "Normalization" section, folded) and the "Count statistics" section (open by default). The left column ends with free space (a stretch) for future cards. The state ("State: IDLE") is in the status bar. The disabled placeholder buttons and the empty "Utilities" box were removed (see "Not implemented"). Tests: `tests/test_main_window_layout.py`.
 - **Magnet window:** power button; "Experiment lock" card; tabs. Manual Control: "Manual command" card (axis, field in G with 4 decimals, Apply / Refresh / Magnetic Zero), "Commanded / Model Status" (selected axis), and the model-vector card, which also shows each coil's relay polarity (`polarity_labels`). The status line (`status_label`) is in the status bar. Texts and attributes are unchanged.
 - **ODMR analysis window:** unchanged layout, card style; map Min/Max keep 9 decimals.
+- **Live view "Normalization"** (`gui/widgets/image_normalization_section.py::ImageNormalizationSection`, `MainWindow.normalization_section`): pyqtgraph ImageView's own normalization box (Menu > Normalization), as a section folded by default under the image. It reuses pyqtgraph's widgets (`image_view.ui.norm*`), so their signals and what they do are unchanged; they are laid out in label/field rows ("Operation:", "Mean of:", "Blur X/Y/T:") at their natural width. pyqtgraph's box stays hidden; the Menu entry opens/closes the section instead, and the yellow normalization ROI/time region are drawn only while it is open (as pyqtgraph did). Summary: "Off" or e.g. "Divide by ROI mean, blur X 0 / Y 0 / T 0". **It has no visible effect on the live view**: in pyqtgraph 0.14 the ROI/Frame/Time-range sources apply only to 3-D stacks with a time axis (the live view shows 2-D frames), and the blur spin boxes are not read anywhere. The tooltips say so. Clicking Divide/Subtract before the first frame makes pyqtgraph print a `ValueError` traceback ("Must specify min and max levels"); the app carries on.
 
 ## What this is
 
@@ -419,7 +421,7 @@ All three are calibration-model values, **not measurements** (there is no field 
 
 ## Zero Field run queue
 
-**What it is.** Several Zero Field runs with different settings, executed one after another unattended. The "Run Queue" panel is a non-closable bottom dock in `ZeroFieldWindow`. The code is in three places:
+**What it is.** Several Zero Field runs with different settings, executed one after another unattended. The "Run Queue" panel is a bottom dock in `ZeroFieldWindow` (collapsible; see "Zero Field window layout"). The code is in three places:
 - `gui/zero_field_queue.py` — the GUI-free model: `QueueEntry`, `summarize()`, `validate_config()`, queue files, `QueueLog`;
 - `gui/widgets/zero_field_queue_widget.py` — display and buttons only;
 - the "RUN QUEUE" section of `gui/zero_field_window.py` — editing and execution.
@@ -472,7 +474,7 @@ No experiment, worker, magnet or hardware file was changed for it.
 
 **Status.** "Queue: run k of N" (N = entries started in this execution plus those still pending), "Queue: pausing …", and a finished summary. The running row is highlighted in bold.
 
-**Tests:** `tests/test_zero_field_queue.py`, which runs real queues on SimCamera and a real `Magnet` over simulated supplies.
+**Tests:** `tests/test_zero_field_queue.py`, which runs real queues on SimCamera and a real `Magnet` over simulated supplies. The dock (fold, height, summary, remembered state): `tests/test_zero_field_queue_dock.py`.
 
 ## Zero Field window layout
 
@@ -481,9 +483,11 @@ No experiment, worker, magnet or hardware file was changed for it.
   - Directly under it, outside the scroll area, the run status (`status_panel`): progress bar, status, current point, current scan, current field and signal. They used to be at the bottom of the scroll area.
   - Below, `control_scroll_area` (resizable, vertical scrollbar as needed, horizontal always off). Its widget `controls_group` (now a plain `QWidget`) holds the "Output" card (directory, Browse, "Save data", "Save Data") and the "Field sweep" card (start, stop, points, sweep axis with the vector direction, frames per point), always open; then the sections, folded by default: "Settling", "Multi-scan averaging" (on/off in the header), "Reference normalization" (on/off in the header), "Stability check", "Image display" (display only).
   - The column width comes from `style.fit_column_width()`: 335 px (was 547 px, sized for the hidden vector-direction row).
-  - The plot, the image and the bottom "Run Queue" dock are outside it. The dock's controls are in "Entries", "Queue file" and "Run" cards in two columns beside the table, so the dock stays low.
+  - The plot, the image and the bottom "Run Queue" dock are outside it.
+- **Run Queue dock.** Its content is a `CollapsibleSection` (`ZeroFieldWindow.queue_section`, "Run Queue", `body=` the queue panel) that replaces the dock's title bar, so the dock is not closable, movable or floatable; it stays at the bottom and the splitter above it resizes it. **Open by default at a compact 180 px** (`QUEUE_DOCK_DEFAULT_HEIGHT`, never below the panel's minimum, about 160 px; it was about 350 px). Folded, the dock shrinks to the header and summary (about 70 px) and the plots get the space. Summary (refreshed from `_update_queue_controls()`): "Queue: idle, N entries" (plus "(k pending)" once some have run), "Queue: running k / N", "Queue: pausing after k / N". Open/closed state (`settings_key="zero_field/queue"`) and the open height (`layout/zero_field/queue_dock_height`, recorded from resizes while open, debounced 400 ms) are remembered at app launch only; tests get the defaults. Beside the table are two cards: "Entries" (3x3 buttons: Add, Duplicate, Remove / Move up, Move down, Clear pending / Load entry into form, Save queue…, Load queue…) and "Run" (Run queue | Stop current run | Stop queue, pause, on failure, status). Texts, tooltips and attribute names are unchanged.
   - Below the scroll area, the stability-check wait bar (hidden unless waiting; see "Count stability check before experiments").
   - Controls height at the defaults about 566 px, 986 px with every section open (was 1266 px), measured 2026-11-25.
+  - The column is built by `style.control_column()`: bottom margin after the last section, solid scroll bar (see "GUI layout rules"). The ODMR column is built the same way.
 - **Run/stop button.** It is one toggle driving `toggle_scan()`. Its styling is shared with the ODMR run button: `gui/widgets/run_button.py::style_run_button()`, where IDLE is green, RUNNING red and BLOCKED grey and disabled. Text and background colours are both explicit, so it reads the same in light and dark themes. The ODMR button now uses the same texts and colours (see "ODMR window layout").
   - Idle: "Start", green. Running: "Stop", red. A running queue: "Queue running", grey, disabled. Each state has a tooltip (`RUN_BUTTON_TOOLTIP`).
   - It follows the window's `run_started`/`run_finished` signals (`_update_run_button()`), not the click, so completion, stop and error all return it to "Start".
@@ -602,7 +606,7 @@ These are characterized properties of the current rig/sample, not code facts —
 
 ## Testing safety — read before running pytest with `--hardware`
 
-`tests/` contains 106 test files (excluding `__init__.py`/`conftest.py`). Only 49 are real, hardware-free pytest tests — see `tests/conftest.py::ALLOWED_FILES` for the current, authoritative list rather than a copy here that will drift the next time a file is added to it (as just happened for this change). **The other ~57 are ad-hoc scripts that command real lab hardware — the Andor camera, the SG386 microwave source over VISA, the Swabian pulse streamer, the Helmholtz power supplies — unconditionally at module import time, not just inside a test function.** Several have no `if __name__ == "__main__":` guard at all: importing them fires a relay, streams a pulse, or turns on a power-supply output as a side effect of Python loading the file.
+`tests/` contains 107 test files (excluding `__init__.py`/`conftest.py`). Only 50 are real, hardware-free pytest tests — see `tests/conftest.py::ALLOWED_FILES` for the current, authoritative list rather than a copy here that will drift the next time a file is added to it (as just happened for this change). **The other ~57 are ad-hoc scripts that command real lab hardware — the Andor camera, the SG386 microwave source over VISA, the Swabian pulse streamer, the Helmholtz power supplies — unconditionally at module import time, not just inside a test function.** Several have no `if __name__ == "__main__":` guard at all: importing them fires a relay, streams a pulse, or turns on a power-supply output as a side effect of Python loading the file.
 
 `pytest.ini` (`testpaths = tests`) plus `tests/conftest.py`'s `pytest_ignore_collect` hook gate this: a bare `pytest` run only collects the files named in `ALLOWED_FILES`. The gate is an allowlist, not a denylist — anything not explicitly named there is excluded from collection entirely, so it is never imported. Passing `--hardware` lifts the restriction and collects everything, including every hardware-commanding script.
 

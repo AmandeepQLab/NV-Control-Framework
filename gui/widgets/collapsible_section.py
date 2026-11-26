@@ -19,7 +19,9 @@
   column sized from it never clips when the section is opened.
 - Open/closed state can be remembered across restarts (QSettings). It is
   off unless the app's entry point calls enable_state_persistence(), so
-  tests, scripts and harnesses always get the documented defaults.
+  tests, scripts and harnesses always get the documented defaults. The
+  same store keeps a few layout values (load_layout_state()/
+  save_layout_state(), e.g. the Zero Field queue dock's height).
 """
 
 import os
@@ -68,6 +70,24 @@ def state_persistence_enabled():
     return _state_store is not None
 
 
+def load_layout_state(key, default=None):
+    """A remembered layout value (e.g. a dock's height) stored under
+    "layout/<key>", or *default* when persistence is off (tests, scripts)
+    or nothing is stored. Layout only: never a setting."""
+    if _state_store is None:
+        return default
+    value = _state_store.value(f"layout/{key}")
+    return default if value is None else value
+
+
+def save_layout_state(key, value):
+    """Remember a layout value; a no-op unless persistence is enabled."""
+    if _state_store is None:
+        return
+    _state_store.setValue(f"layout/{key}", value)
+    _state_store.sync()
+
+
 def _to_bool(value):
     if isinstance(value, str):
         return value.strip().lower() in ("true", "1")
@@ -87,7 +107,9 @@ class CollapsibleSection(QFrame):
     expanded_changed = pyqtSignal(bool)
 
     def __init__(self, title, *, expanded=False, checkbox=None,
-                 settings_key=None, tooltip="", parent=None):
+                 settings_key=None, tooltip="", body=None, parent=None):
+        """*body*: an existing widget to fold instead of the default form
+        body (it then takes the section's extra height, e.g. a table)."""
         super().__init__(parent)
         self.setObjectName("collapsibleSection")
         self._title = title
@@ -133,11 +155,16 @@ class CollapsibleSection(QFrame):
         style.muted(self.summary_label)
         outer.addWidget(self.summary_label)
 
-        self.body = QWidget()
-        self.body.setObjectName("sectionBody")
-        self._body_layout = style.form_layout(self.body)
-        self._body_layout.setContentsMargins(style.SECTION_INDENT, 2, 0, 2)
-        outer.addWidget(self.body)
+        if body is None:
+            self.body = QWidget()
+            self.body.setObjectName("sectionBody")
+            self._body_layout = style.form_layout(self.body)
+            self._body_layout.setContentsMargins(style.SECTION_INDENT, 2, 0, 2)
+            outer.addWidget(self.body)
+        else:
+            self.body = body
+            self._body_layout = body.layout()
+            outer.addWidget(self.body, 1)
 
         if _state_store is not None and settings_key:
             stored = _state_store.value(self._state_key())

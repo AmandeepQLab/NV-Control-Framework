@@ -38,6 +38,7 @@ from framework.roi import validate_roi
 from gui.live_view_controller import LiveViewTimerController
 from gui.widgets.count_statistics_panel import CountStatisticsPanel
 from gui.widgets.collapsible_section import CollapsibleSection
+from gui.widgets.image_normalization_section import ImageNormalizationSection
 from gui.stability_gate import StabilityMonitor
 from gui.display_settings import (
     COLORMAP_NAMES,
@@ -367,6 +368,12 @@ class MainWindow(QMainWindow):
         self.image_view = pg.ImageView(view=self.image_plot, name="LiveView")
         live_view_layout.addWidget(self.image_view, 1)
         self._init_live_view_colormap()
+
+        # pyqtgraph's own "Normalization" box (Menu > Normalization), as a
+        # folded section under the image; same widgets, same behaviour.
+        self.normalization_section = ImageNormalizationSection(
+            self.image_view, settings_key="main/normalization")
+        live_view_layout.addWidget(self.normalization_section)
 
         # Statistics of the live-view mean counts. It only consumes frames
         # update_image() already received; it never touches the camera.

@@ -20,6 +20,9 @@ from PyQt6.QtWidgets import (
 # ---- layout constants (pixels) --------------------------------------------
 
 COLUMN_SPACING = 8          # between cards/sections in a control column
+COLUMN_BOTTOM_MARGIN = 12   # below the last card/section of a scrolling column
+SCROLLBAR_GAP = 4           # between a scrolling column's content and its bar
+CONTROL_SCROLL_AREA_NAME = "controlScrollArea"
 CARD_MARGINS = (10, 6, 10, 8)  # inside a card or section body
 ROW_SPACING = 6             # between rows of a form
 SECTION_INDENT = 6          # body indent under a section header
@@ -71,6 +74,28 @@ QToolButton#sectionToggle {
     border: none;
     font-weight: bold;
     padding: 2px 0px;
+}
+QScrollArea#controlScrollArea QScrollBar:vertical {
+    background: palette(window);
+    width: 12px;
+    margin: 0px;
+}
+QScrollArea#controlScrollArea QScrollBar::handle:vertical {
+    background: palette(mid);
+    border-radius: 4px;
+    min-height: 24px;
+    margin: 2px;
+}
+QScrollArea#controlScrollArea QScrollBar::handle:vertical:hover {
+    background: palette(dark);
+}
+QScrollArea#controlScrollArea QScrollBar::add-line:vertical,
+QScrollArea#controlScrollArea QScrollBar::sub-line:vertical {
+    height: 0px;
+}
+QScrollArea#controlScrollArea QScrollBar::add-page:vertical,
+QScrollArea#controlScrollArea QScrollBar::sub-page:vertical {
+    background: none;
 }
 """
 
@@ -172,6 +197,33 @@ def status_label(text="", tooltip=""):
     if tooltip:
         label.setToolTip(tooltip)
     return label
+
+
+def control_column(content):
+    """The scrolling control column of an experiment window.
+
+    Returns (scroll_area, layout): *content*'s vertical layout, with a
+    bottom margin so the last section's border is never flush with (and
+    cut by) the bottom edge, and the scroll area around it: vertical bar as
+    needed (drawn solid by the app stylesheet, so it is plainly visible
+    whenever the content overflows), horizontal bar off. Add the controls
+    to the layout, then a stretch, then call fit_column_width().
+    """
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtWidgets import QScrollArea, QVBoxLayout
+
+    layout = QVBoxLayout(content)
+    layout.setContentsMargins(0, 0, SCROLLBAR_GAP, COLUMN_BOTTOM_MARGIN)
+    layout.setSpacing(COLUMN_SPACING)
+
+    scroll_area = QScrollArea()
+    scroll_area.setObjectName(CONTROL_SCROLL_AREA_NAME)
+    scroll_area.setWidgetResizable(True)
+    scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
+    scroll_area.setWidget(content)
+    return scroll_area, layout
 
 
 def fit_column_width(scroll_area, content, also_measure=()):

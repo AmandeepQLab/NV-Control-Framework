@@ -7,8 +7,10 @@ from datetime import datetime
 
 import numpy as np
 
-from PyQt6.QtCore import QThread, QTimer, Qt, pyqtSignal
-from PyQt6.QtWidgets import QDockWidget, QFileDialog, QMainWindow, QMessageBox
+from PyQt6.QtCore import QEvent, QThread, QTimer, Qt, pyqtSignal
+from PyQt6.QtWidgets import (
+    QDockWidget, QFileDialog, QMainWindow, QMessageBox, QWidget,
+)
 
 from gui.display_settings import (
     ZFE_COLORMAP_KEY,
@@ -18,6 +20,11 @@ from gui.display_settings import (
 )
 from gui import zero_field_queue as queue_model
 from gui.widgets import run_button
+from gui.widgets.collapsible_section import (
+    CollapsibleSection,
+    load_layout_state,
+    save_layout_state,
+)
 from gui.widgets.zero_field_queue_widget import ZeroFieldQueueWidget
 from gui.widgets.zero_field_widget import ZeroFieldWidget
 from gui.zero_field_queue import QueueEntry, QueueLog
@@ -54,6 +61,20 @@ _TITLE_BAR_ALLOWANCE_PX = 40
 # Output file names carry this timestamp (one-second resolution), so the
 # run queue never starts two runs within the same second.
 _TIMESTAMP_FORMAT = "%Y-%m-%d_%H-%M-%S"
+
+# Run Queue dock: default open height (px) and its remembered-height key.
+# Never lower than the queue panel's own minimum.
+QUEUE_DOCK_DEFAULT_HEIGHT = 180
+_QUEUE_DOCK_HEIGHT_KEY = "zero_field/queue_dock_height"
+_QWIDGETSIZE_MAX = 16777215
+
+
+def _stored_int(value, default):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return number if number > 0 else default
 
 
 def field_range_problem(magnet, config, axis_limit_note):
@@ -821,15 +842,42 @@ class ZeroFieldWindow(QMainWindow):
         self._queue_timer.timeout.connect(self._start_next_queue_entry)
 
         self.queue_widget = ZeroFieldQueueWidget()
+        # The dock is a collapsible section like the control column's:
+        # header "Run Queue" with a one-line summary while folded. Open by
+        # default at a compact height; the splitter above it resizes it.
+        # Open/closed state and height are remembered at app launch only
+        # (gui/widgets/collapsible_section.py); tests get the defaults.
+        self.queue_section = CollapsibleSection(
+            "Run Queue", expanded=True, settings_key="zero_field/queue",
+            body=self.queue_widget,
+            tooltip="Show or hide the run queue. Folding only hides it: "
+                    "entries and a running queue are unaffected, and the line "
+                    "below the title shows the queue's state.")
+        self.queue_section.set_summary_provider(self.queue_summary_text)
         self.queue_dock = QDockWidget("Run Queue", self)
         self.queue_dock.setObjectName("ZeroFieldRunQueue")
-        # Not closable: there would be no way to get it back.
-        self.queue_dock.setFeatures(
-            QDockWidget.DockWidgetFeature.DockWidgetMovable
-            | QDockWidget.DockWidgetFeature.DockWidgetFloatable
-        )
-        self.queue_dock.setWidget(self.queue_widget)
+        # The section header replaces the dock's title bar, so the dock is
+        # neither closable (there would be no way to get it back), nor
+        # movable or floatable; it stays at the bottom, resizable.
+        self.queue_dock.setFeatures(QDockWidget.DockWidgetFeature.NoDockWidgetFeatures)
+        self.queue_dock.setTitleBarWidget(QWidget())
+        self.queue_dock.setWidget(self.queue_section)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.queue_dock)
+        self._queue_dock_height = _stored_int(
+            load_layout_state(_QUEUE_DOCK_HEIGHT_KEY), QUEUE_DOCK_DEFAULT_HEIGHT)
+        self._track_queue_dock_height = False
+        self._queue_height_save_timer = QTimer(self)
+        self._queue_height_save_timer.setSingleShot(True)
+        self._queue_height_save_timer.setInterval(400)
+        self._queue_height_save_timer.timeout.connect(
+            lambda: save_layout_state(_QUEUE_DOCK_HEIGHT_KEY, self._queue_dock_height))
+        self._queue_track_timer = QTimer(self)
+        self._queue_track_timer.setSingleShot(True)
+        self._queue_track_timer.setInterval(0)
+        self._queue_track_timer.timeout.connect(self._resume_queue_height_tracking)
+        self.queue_dock.installEventFilter(self)
+        self.queue_section.expanded_changed.connect(self._apply_queue_dock_height)
+        self._apply_queue_dock_height(self.queue_section.is_expanded())
 
         q = self.queue_widget
         q.add_button.clicked.connect(self.add_to_queue)
@@ -1211,6 +1259,71 @@ class ZeroFieldWindow(QMainWindow):
 
     # ---- display -------------------------------------------------------
 
+    def queue_summary_text(self):
+        """The Run Queue section's one-line summary (shown while folded)."""
+        started = len(getattr(self, "_queue_started", []))
+        entries = getattr(self, "queue_entries", [])
+        pending = sum(e.status == queue_model.PENDING for e in entries)
+        if getattr(self, "_queue_active", False):
+            total = started + pending
+            if self._queue_current is None and not self.stability_waiting():
+                return f"Queue: pausing after {started} / {total}"
+            return f"Queue: running {started} / {total}"
+        count = len(entries)
+        text = f"Queue: idle, {count} {'entry' if count == 1 else 'entries'}"
+        if 0 < pending < count:
+            text += f" ({pending} pending)"
+        return text
+
+    # ---- dock height (open: remembered height; folded: header only) ----
+
+    def _queue_open_height(self):
+        minimum = self.queue_section.minimumSizeHint().height()
+        return max(self._queue_dock_height, minimum)
+
+    def _apply_queue_dock_height(self, expanded):
+        dock = self.queue_dock
+        self._track_queue_dock_height = False
+        if expanded:
+            dock.setMaximumHeight(_QWIDGETSIZE_MAX)
+            self.resizeDocks([dock], [self._queue_open_height()],
+                             Qt.Orientation.Vertical)
+        else:
+            self.queue_section.layout().activate()
+            dock.setMaximumHeight(self.queue_section.sizeHint().height())
+        # Once the layout has caught up with the new limits: apply the open
+        # height again (the first resize can be clamped by the old maximum),
+        # then track user resizes again.
+        self._queue_track_timer.start()
+
+    def _resume_queue_height_tracking(self):
+        if self.queue_section.is_expanded():
+            self.resizeDocks([self.queue_dock], [self._queue_open_height()],
+                             Qt.Orientation.Vertical)
+        self._track_queue_dock_height = self.isVisible()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # The first layout pass may give the dock its size hint; apply the
+        # remembered/default height once the window is really shown.
+        self._apply_queue_dock_height(self.queue_section.is_expanded())
+
+    def eventFilter(self, watched, event):
+        if (
+            watched is getattr(self, "queue_dock", None)
+            and event.type() == QEvent.Type.Resize
+            and self._track_queue_dock_height
+            and self.queue_section.is_expanded()
+        ):
+            height = event.size().height()
+            # Below the open minimum is the folded height still in force
+            # (the unfold transition): never remember that.
+            minimum = self.queue_section.minimumSizeHint().height()
+            if height >= minimum and height != self._queue_dock_height:
+                self._queue_dock_height = height
+                self._queue_height_save_timer.start()
+        return super().eventFilter(watched, event)
+
     def _refresh_queue(self, select=None):
         self.queue_widget.set_entries(self.queue_entries)
         if select is not None:
@@ -1244,6 +1357,9 @@ class ZeroFieldWindow(QMainWindow):
         q.load_into_form_button.setEnabled(entry is not None)
         q.save_queue_button.setEnabled(count > 0)
         q.load_queue_button.setEnabled(not active)
+        section = getattr(self, "queue_section", None)
+        if section is not None:
+            section.refresh_summary()
 
     # ---- run/stop button ------------------------------------------------
 

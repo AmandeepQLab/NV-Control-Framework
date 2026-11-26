@@ -152,20 +152,8 @@ class ODMRPanel(QWidget):
         # gui/widgets/collapsible_section.py). Folding a section only hides
         # its controls; get_config() reads them as before.
         self.control_box = QWidget()
-        odmr_layout = QVBoxLayout(self.control_box)
-        odmr_layout.setContentsMargins(0, 0, 4, 0)
-        odmr_layout.setSpacing(style.COLUMN_SPACING)
-
-        self.control_scroll_area = QScrollArea()
-        self.control_scroll_area.setWidgetResizable(True)
-        self.control_scroll_area.setVerticalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAsNeeded
-        )
-        self.control_scroll_area.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        self.control_scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
-        self.control_scroll_area.setWidget(self.control_box)
+        # Bottom margin and a plainly visible scroll bar (style.control_column).
+        self.control_scroll_area, odmr_layout = style.control_column(self.control_box)
         left_layout.addWidget(self.control_scroll_area, 1)
 
         # Stability-check wait line, fixed below the scroll area; shown
