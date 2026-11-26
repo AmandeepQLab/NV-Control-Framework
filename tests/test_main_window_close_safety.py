@@ -185,9 +185,12 @@ class ExperimentWindowCloseEventTests(unittest.TestCase):
     shutdown; see test_zero_field_window_save_toggle.py, point 2)."""
 
     def _close(self, window_class, running_attr, running):
+        # What closing does once the user has confirmed it
+        # (gui/close_confirmation.py asks first; tested in
+        # tests/test_close_confirmation.py).
         window = SimpleNamespace(**{running_attr: running}, request_stop=Mock())
         event = Mock()
-        window_class.closeEvent(window, event)
+        window_class.confirmed_close_event(window, event)
         return window, event
 
     def test_running_scan_requests_stop_and_ignores_close(self):
@@ -199,7 +202,7 @@ class ExperimentWindowCloseEventTests(unittest.TestCase):
                 event.ignore.assert_called_once()
                 event.accept.assert_not_called()
 
-    def test_idle_window_closes_without_dialog(self):
+    def test_idle_window_closes_without_a_further_dialog(self):
         for window_class, attr in ((ZeroFieldWindow, "zero_field_running"),
                                    (ODMRWindow, "odmr_running")):
             with self.subTest(window=window_class.__name__), \

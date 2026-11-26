@@ -40,6 +40,13 @@ from gui.widgets.count_statistics_panel import CountStatisticsPanel
 from gui.widgets.collapsible_section import CollapsibleSection
 from gui.widgets.image_normalization_section import ImageNormalizationSection
 from gui.post_experiment_action import PostExperimentMagnetAction
+from gui.close_confirmation import (
+    CloseConfirmation,
+    ConfirmCloseMixin,
+    close_without_confirmation,
+    confirm_close,
+    describe_magnet,
+)
 from gui.stability_gate import StabilityMonitor
 from gui.display_settings import (
     COLORMAP_NAMES,
@@ -82,7 +89,7 @@ def _refresh_roi_summary(window):
         section.refresh_summary()
 
 
-class MainWindow(QMainWindow):
+class MainWindow(ConfirmCloseMixin, QMainWindow):
 
     # Experiment lifetime, relayed to MagnetControlWindow's command lock.
     # experiment_started carries (experiment_name, magnet_is_swept), where
@@ -1242,21 +1249,58 @@ class MainWindow(QMainWindow):
 
         # "Stop and Close" already confirmed the exit; don't ask twice.
         if not (self._closing_after_stop or self._force_close):
-            reply = QMessageBox.question(
-                self,
-                "Exit NV Control",
-                "Closing the NV Control GUI will stop all running experiments.\n\n"
-                "Are you sure you want to continue?",
-                QMessageBox.StandardButton.Yes
-                | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No
-            )
-            if reply != QMessageBox.StandardButton.Yes:
+            # The shared close confirmation (gui/close_confirmation.py),
+            # describing what exit does with the hardware right now.
+            if not confirm_close(self, self.close_confirmation()):
                 event.ignore()
                 return
 
         self._shutdown_hardware()
         event.accept()
+
+    def close_confirmation(self):
+        """The exit question: what shutdown does with each device now, and
+        which open windows hold unsaved results. Only asked when nothing is
+        running (a running scan/queue gets the "Scan in progress" dialog)."""
+        facts = []
+        hardware = getattr(self, "hardware", None) or {}
+        state = describe_magnet(hardware.get("magnet"))
+        if state is not None:
+            if state.startswith("coils on"):
+                facts.append(f"Magnet: {state}; they are switched off "
+                             "(0 A, outputs off) and the supplies disconnected.")
+            else:
+                facts.append(f"Magnet: {state}; the supplies are disconnected.")
+        if hardware.get("pulse_streamer") is not None:
+            facts.append("Pulse Streamer: all outputs set LOW (including the "
+                         "polarity relays), any sequence stopped, connection closed.")
+        if hardware.get("microwave") is not None:
+            odmr = getattr(self, "odmr_window", None)
+            ran = odmr is not None and getattr(odmr, "scans_run", 0) > 0
+            facts.append(
+                "SG386: not touched at exit; its RF output and connection are "
+                "left as they are"
+                + (" (an ODMR scan this session switched RF on)." if ran else "."))
+        facts.append("Camera: live view stopped; the camera is not closed "
+                     "explicitly (released when the program ends).")
+        panel = getattr(self, "count_statistics_panel", None)
+        log = getattr(panel, "log", None)
+        if log is not None:
+            facts.append(f"Count log {getattr(log.path, 'name', log.path)} is closed.")
+        for name, window in (
+            ("ODMR window", getattr(self, "odmr_window", None)),
+            ("Zero-Field Imaging window", getattr(self, "zero_field_window", None)),
+            ("ODMR Analysis window", getattr(self, "odmr_analysis_window", None)),
+        ):
+            try:
+                notes = list(window.unsaved_results()) if window is not None else []
+                notes = [str(note) for note in notes]
+            except Exception:  # a window without the method, or a stand-in
+                notes = []
+            if notes:
+                facts.append(f"{name}: {', '.join(notes)} — lost on exit.")
+        return CloseConfirmation("Exit NV Control", "Exit NV Control?", facts,
+                                 confirm_text="Exit")
 
     def _close_tool_windows(self):
         """Close the non-experiment windows on exit.
@@ -1274,7 +1318,7 @@ class MainWindow(QMainWindow):
         magnet_window = getattr(self, "magnet_window", None)
         if magnet_window is not None:
             try:
-                magnet_window.close()
+                close_without_confirmation(magnet_window)
                 magnet_window.deleteLater()
             except Exception:
                 LOGGER.exception("Failed to close the magnet window")
@@ -1282,7 +1326,7 @@ class MainWindow(QMainWindow):
         analysis_window = getattr(self, "odmr_analysis_window", None)
         if analysis_window is not None:
             try:
-                analysis_window.close()
+                close_without_confirmation(analysis_window)
             except Exception:
                 LOGGER.exception("Failed to close the ODMR analysis window")
 
@@ -1305,13 +1349,13 @@ class MainWindow(QMainWindow):
         # window accepts its close.
         try:
             if self.odmr_window is not None:
-                self.odmr_window.close()
+                close_without_confirmation(self.odmr_window)
         except Exception:
             pass
 
         try:
             if getattr(self, "zero_field_window", None) is not None:
-                self.zero_field_window.close()
+                close_without_confirmation(self.zero_field_window)
         except Exception:
             pass
 

@@ -35,6 +35,7 @@ from gui.post_experiment_action import (  # noqa: E402
     POST_EXPERIMENT_FIELD_ZERO,
 )
 from gui.widgets import collapsible_section  # noqa: E402
+from gui import close_confirmation  # noqa: E402
 import hardware.hardware_manager as hardware_manager_module  # noqa: E402
 from hardware.hardware_manager import HardwareManager, call_with_timeout  # noqa: E402
 from hardware.pulse_streamer.sim_pulse_streamer import SimPulseStreamer  # noqa: E402
@@ -115,15 +116,16 @@ class CloseRightAfterRunTests(unittest.TestCase):
     def test_finished_run_waits_for_its_thread_then_closes_without_scan_dialog(self):
         _, thread = self._run(finished=True)
         with patch.object(self.main, "_ask_stop_and_close") as ask, \
-             patch.object(QMessageBox, "question",
-                          return_value=QMessageBox.StandardButton.Yes) as question:
+             close_confirmation.auto_answer(True) as history:
+            asked = len(history)
             self.assertFalse(self.main.close())  # deferred, not refused
             self.assertFalse(self.main.close())  # a second click: still waiting
             self.main.hw_manager.shutdown.assert_not_called()
             thread.release.set()
             self.assertTrue(_pump_until(lambda: self.main._shut_down, 3.0))
+            titles = [c.title for c in history[asked:]]
         ask.assert_not_called()
-        question.assert_called_once()  # the normal Exit confirmation
+        self.assertEqual(titles, ["Exit NV Control"])  # the normal Exit question, once
         self.main.hw_manager.shutdown.assert_called_once()
 
     def test_thread_still_alive_after_the_grace_counts_as_running(self):
@@ -340,8 +342,9 @@ class SimMainWindowTests(unittest.TestCase):
         for _ in range(3):
             self.main.open_odmr_window()
         self.assertIs(self.main.odmr_window, window)
+        # Shown ones only: hidden windows of earlier tests' apps may linger.
         odmr_windows = [w for w in QApplication.topLevelWidgets()
-                        if isinstance(w, ODMRWindow)]
+                        if isinstance(w, ODMRWindow) and not w.isHidden()]
         self.assertEqual(odmr_windows, [window])
         window.run_finished.emit()
 
@@ -480,13 +483,18 @@ _DRIVER = textwrap.dedent(
     try:
         mw.main()
     finally:
+        # Close confirmations are auto-answered "close" (environment, see
+        # tests/conftest.py); history lists every one asked.
+        from gui import close_confirmation
         say("dialogs", dialogs)
+        say("confirmations", [c.title for c in close_confirmation.history])
     """
 )
 
 
 def _run_app(mode, out_dir, ui_state):
     env = dict(os.environ, EXIT_TEST_MODE=mode, EXIT_TEST_OUT=out_dir,
+               NV_CONTROL_AUTO_CONFIRM_CLOSE="yes",
                QT_QPA_PLATFORM="offscreen", PYTHONIOENCODING="utf-8",
                NV_CONTROL_UI_STATE_FILE=ui_state)
     env.pop("NV_ODMR_TIMING", None)
@@ -507,7 +515,8 @@ class ExitRightAfterRunTests(unittest.TestCase):
         detail = "\n".join(markers) + "\n" + result.stderr[-3000:]
         self.assertEqual(result.returncode, 0, detail)
         self.assertIn("Hardware shutdown complete.", result.stdout, detail)
-        self.assertIn("EXIT-TEST: dialogs ['Exit NV Control']", markers, detail)
+        self.assertIn("EXIT-TEST: dialogs []", markers, detail)  # nothing blocked
+        self.assertIn("EXIT-TEST: confirmations ['Exit NV Control']", markers, detail)
         self.assertNotIn("Scan in progress", result.stdout, detail)
 
     def test_exit_right_after_an_odmr_scan(self):

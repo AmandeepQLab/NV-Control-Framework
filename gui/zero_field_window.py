@@ -20,6 +20,12 @@ from gui.display_settings import (
 )
 from gui import zero_field_queue as queue_model
 from gui.widgets import run_button
+from gui.close_confirmation import (
+    CloseConfirmation,
+    ConfirmCloseMixin,
+    close_without_confirmation,
+    describe_magnet,
+)
 from gui.widgets.collapsible_section import (
     CollapsibleSection,
     load_layout_state,
@@ -130,7 +136,7 @@ def field_range_problem(magnet, config, axis_limit_note):
     return None
 
 
-class ZeroFieldWindow(QMainWindow):
+class ZeroFieldWindow(ConfirmCloseMixin, QMainWindow):
     """Configure, run, monitor, and save a ZeroFieldExperiment."""
 
     # Announce a run's lifetime to MainWindow, which relays it to the magnet
@@ -182,6 +188,11 @@ class ZeroFieldWindow(QMainWindow):
         self.output_directory = self._resolve_default_output_directory()
         self.output_path = None
         self._scan_timestamp = None
+        # For the close confirmation: the last run's settings and where a
+        # "Save Data" copy went; close once a confirmed stop has finished.
+        self.last_run_config = None
+        self.last_run_saved_copy = None
+        self._close_after_stop = False
         self._save_off_warning_shown = False
         self._reference_image = None
         self._latest_averaged_image = None
@@ -370,6 +381,8 @@ class ZeroFieldWindow(QMainWindow):
         # can later synthesize a filename matching what this run would have
         # used had saving been on.
         self._scan_timestamp = timestamp
+        self.last_run_config = dict(config)
+        self.last_run_saved_copy = None
         if not config["save_data"]:
             self.output_path = None
         elif self.total_scans == 1:
@@ -659,6 +672,10 @@ class ZeroFieldWindow(QMainWindow):
     def scan_finished(self, image_cube, _fields, _signals, stopped):
         self.image_cube = image_cube
         self.zero_field_running = False
+        if self._close_after_stop:
+            # The user confirmed "Stop and Close" while the run was going.
+            self._close_after_stop = False
+            QTimer.singleShot(0, self._close_after_stopped_run)
         # Emitted first so nothing below can prevent the magnet lock from
         # being released. The worker has already finished cleanup_scan()
         # (magnet.disable()) by the time finished_signal is sent. A queue
@@ -791,6 +808,7 @@ class ZeroFieldWindow(QMainWindow):
                 self, "Zero Field Error", f"Could not save a copy: {error}"
             )
             return
+        self.last_run_saved_copy = destination
         self.widget.status_label.setText(f"Status: Saved a copy to {destination}")
 
     def _save_in_memory_cube(self):
@@ -818,6 +836,7 @@ class ZeroFieldWindow(QMainWindow):
                 self, "Zero Field Error", f"Could not save data: {error}"
             )
             return
+        self.last_run_saved_copy = destination
         self.widget.status_label.setText(f"Status: Saved data to {destination}")
 
     # =========================================================
@@ -837,6 +856,8 @@ class ZeroFieldWindow(QMainWindow):
         self._queue_started = []         # entries started by this execution
         self._queue_log = None
         self._lock_held = False          # run_started sent, run_finished not yet
+        self.queue_file = None           # last file saved to / loaded from
+        self.queue_modified = False      # entries changed since then
         self._queue_timer = QTimer(self)
         self._queue_timer.setSingleShot(True)
         self._queue_timer.timeout.connect(self._start_next_queue_entry)
@@ -908,6 +929,7 @@ class ZeroFieldWindow(QMainWindow):
         self.queue_entries.append(QueueEntry.snapshot(
             config, self.output_directory, self.widget.stability_group.get_settings()
         ))
+        self.queue_modified = True
         self._refresh_queue(select=len(self.queue_entries) - 1)
         return True
 
@@ -922,6 +944,7 @@ class ZeroFieldWindow(QMainWindow):
         if entry is None or entry.status == queue_model.RUNNING:
             return
         del self.queue_entries[row]
+        self.queue_modified = True
         self._refresh_queue(select=min(row, len(self.queue_entries) - 1))
 
     def move_queue_entry(self, step):
@@ -934,6 +957,7 @@ class ZeroFieldWindow(QMainWindow):
             return
         entries = self.queue_entries
         entries[row], entries[target] = entries[target], entries[row]
+        self.queue_modified = True
         self._refresh_queue(select=target)
 
     def duplicate_queue_entry(self):
@@ -941,13 +965,17 @@ class ZeroFieldWindow(QMainWindow):
         if entry is None:
             return
         self.queue_entries.insert(row + 1, entry.duplicate())
+        self.queue_modified = True
         self._refresh_queue(select=row + 1)
 
     def clear_pending_entries(self):
+        before = len(self.queue_entries)
         self.queue_entries = [
             entry for entry in self.queue_entries
             if entry.status != queue_model.PENDING
         ]
+        if len(self.queue_entries) != before:
+            self.queue_modified = True
         self._refresh_queue()
 
     def load_entry_into_form(self):
@@ -979,6 +1007,8 @@ class ZeroFieldWindow(QMainWindow):
         except OSError as error:
             QMessageBox.critical(self, "Zero Field Queue", f"Could not save the queue: {error}")
             return False
+        self.queue_file = Path(path)
+        self.queue_modified = False
         self.queue_widget.queue_status_label.setText(f"Queue: saved {Path(path).name}")
         return True
 
@@ -1017,6 +1047,8 @@ class ZeroFieldWindow(QMainWindow):
         self.queue_widget.pause_spin.setValue(pause_s)
         self.queue_widget.on_failure_combo.setCurrentText(on_failure)
         self._refresh_queue()
+        self.queue_file = Path(path)
+        self.queue_modified = False
         self.queue_widget.queue_status_label.setText(f"Queue: loaded {Path(path).name}")
         return True
 
@@ -1385,12 +1417,107 @@ class ZeroFieldWindow(QMainWindow):
             state = run_button.IDLE
         self.widget.set_run_button_state(state)
 
-    def closeEvent(self, event):
+    # ---- close (confirmed: gui/close_confirmation.py) ------------------
+
+    def _close_after_stopped_run(self):
+        close_without_confirmation(self)
+
+    def _run_summary(self, config):
+        if not config:
+            return "the last run"
+        axis = config.get("field_axis", "?")
+        if axis == "vector" and config.get("field_direction"):
+            axis = "along [" + ", ".join(f"{c:.3g}" for c in config["field_direction"]) + "]"
+        text = (f"{config.get('field_start', 0):g} → {config.get('field_stop', 0):g} G "
+                f"{axis}, {config.get('field_points', '?')} points")
+        if config.get("averaging_enabled") and config.get("num_scans", 1) > 1:
+            text += f", {config['num_scans']} scans"
+        return text
+
+    def last_run_text(self):
+        """One line on the last run and whether it is saved, or None."""
+        if self.last_run_config is None:
+            return None
+        what = f"The last run ({self._run_summary(self.last_run_config)})"
+        if self.output_path is not None and self.output_path.exists():
+            return f"{what} is saved: {self.output_path}."
+        if self.last_run_saved_copy is not None:
+            return f"{what} was saved with \"Save Data\" to {self.last_run_saved_copy}."
+        if self.image_cube is None or getattr(self.image_cube, "data", None) is None:
+            return f"{what} produced no data."
+        return (f"{what} is not saved (saving was off): it exists only in "
+                "memory; use \"Save Data\" to keep it.")
+
+    def queue_text(self):
+        entries = self.queue_entries
+        if not entries:
+            return "Run queue: empty."
+        pending = sum(e.status == queue_model.PENDING for e in entries)
+        count = f"{len(entries)} entr{'y' if len(entries) == 1 else 'ies'} ({pending} pending)"
+        if self.queue_file is None:
+            return f"Run queue: {count}, not saved to a queue file."
+        if self.queue_modified:
+            return f"Run queue: {count}, changed since it was saved to {self.queue_file.name}."
+        return f"Run queue: {count}, saved in {self.queue_file.name}."
+
+    def unsaved_results(self):
+        notes = []
+        text = self.last_run_text()
+        if text and "is not saved" in text:
+            notes.append("last run not saved")
+        if self.queue_entries and (self.queue_file is None or self.queue_modified):
+            notes.append("run queue not saved to a file")
+        return notes
+
+    def close_confirmation(self):
+        title = "Close Zero-Field Imaging"
+        magnet = describe_magnet(self.magnet)
+        queue_active = getattr(self, "_queue_active", False)
+        pending = sum(e.status == queue_model.PENDING for e in self.queue_entries)
+        if self.zero_field_running:
+            facts = [
+                "The run stops after the current field point (a settling wait "
+                "or acquisition in progress is not interrupted); the window "
+                "closes once it has stopped.",
+                f"Points acquired so far are in {self.output_path}."
+                if self.output_path is not None
+                else "Saving is off: the partial result stays in memory only.",
+                "The magnet is switched off by the run's own cleanup, as after any run.",
+            ]
+            if queue_active:
+                facts.insert(1, f"The run queue stops too; {pending} entr"
+                                f"{'y stays' if pending == 1 else 'ies stay'} pending.")
+            return CloseConfirmation(
+                title, "A Zero Field run is in progress. Stop it and close the window?",
+                facts, confirm_text="Stop and Close")
+        if queue_active:
+            return CloseConfirmation(
+                title, "The run queue is active (between runs). Stop it and close the window?",
+                [f"{len(self._queue_started)} run(s) started so far; {pending} entr"
+                 f"{'y stays' if pending == 1 else 'ies stay'} pending.",
+                 self.last_run_text(), self.queue_text()],
+                confirm_text="Stop Queue and Close")
+        facts = []
+        if self.stability_waiting():
+            facts.append("Waiting for stable counts before a run: closing cancels "
+                         "that start (nothing has been measured).")
+        facts.append(self.last_run_text() or "No run has been made in this window.")
+        facts.append(self.queue_text())
+        facts.append(f"Output folder for new runs: {self.output_directory}.")
+        if magnet:
+            facts.append(f"Magnet: {magnet}. Closing this window leaves it as it is.")
+        facts.append("Settings, plots and the queue are kept while the app runs: "
+                     "closing only hides this window (reopen it with Zero-Field Imaging).")
+        return CloseConfirmation(title, "Close the Zero-Field Imaging window?", facts)
+
+    def confirmed_close_event(self, event):
         # MainWindow is the close gatekeeper (it waits for worker threads
         # before shutting hardware down). Here, a running scan is asked to
-        # stop and the window stays open until it has finished; closing it
-        # afterwards is accepted normally.
+        # stop; the window stays open until it has finished, then closes by
+        # itself (the user already confirmed "Stop and Close").
         if self.zero_field_running:
+            self._close_after_stop = not getattr(
+                self, "_closing_without_confirmation", False)
             self.request_stop()
             event.ignore()
             return

@@ -16,14 +16,23 @@ from gui.widgets.stability_check_group import StabilitySettingsGroup, StabilityW
 from gui.widgets.odmr_magnet_field_group import MagnetFieldGroup
 from gui.widgets.collapsible_section import CollapsibleSection
 from gui import style
+from gui.close_confirmation import CloseConfirmation, ConfirmCloseDialogMixin
 
 # Moved to a shared module (also used by the ODMR analysis window);
 # re-exported here so existing imports keep working.
 from gui.widgets.initial_fit_parameters_dialog import InitialFitParametersDialog  # noqa: F401
 
 
-class ODMRStatisticsExplanationDialog(QDialog):
+class ODMRStatisticsExplanationDialog(ConfirmCloseDialogMixin, QDialog):
     """Readable explanation of the ODMR statistics hierarchy."""
+
+    def close_confirmation(self):
+        return CloseConfirmation(
+            "Close ODMR Statistics Explanation",
+            "Close the ODMR statistics explanation?",
+            ["It is text only; nothing is lost. Reopen it with "
+             "\"How are these calculated?\" in the ODMR Statistics section."],
+        )
 
     def __init__(self, parent=None):
         super().__init__(parent)

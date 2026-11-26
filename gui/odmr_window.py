@@ -28,6 +28,12 @@ from gui.widgets.initial_fit_parameters_dialog import (
 from gui.odmr_worker import ODMRWorker
 from data.data_manager import DataManager
 from gui.pulse_sequence_window import PulseSequenceWindow
+from gui.close_confirmation import (
+    CloseConfirmation,
+    ConfirmCloseMixin,
+    close_without_confirmation,
+    describe_magnet,
+)
 from framework.analysis.odmr_statistics import (
     calculate_odmr_statistics,
     load_odmr_statistics,
@@ -139,7 +145,7 @@ def axis_limit_note(magnet, name):
     )
 
 
-class ODMRWindow(QMainWindow):
+class ODMRWindow(ConfirmCloseMixin, QMainWindow):
 
     stop_requested = pyqtSignal()
     analysis_requested = pyqtSignal()
@@ -180,6 +186,12 @@ class ODMRWindow(QMainWindow):
         self.odmr_thread = None
         self.odmr_running = False
         self.initial_fit_guesses = {"Single Lorentzian": None, "Double Lorentzian": None}
+        # For the close confirmation: what the last scan was and where (if
+        # anywhere) it was saved; whether a fit result is shown.
+        self.scans_run = 0
+        self.last_scan = None
+        self.fit_shown = False
+        self._close_after_stop = False
 
         self.panel = ODMRPanel()
         self.setCentralWidget(self.panel)
@@ -353,6 +365,7 @@ class ODMRWindow(QMainWindow):
         config.update(stability_record or {"stability_check_enabled": False})
 
         self.current_config = config.copy()
+        self.fit_shown = False
 
         self.latest_x = None
         self.latest_y = None
@@ -640,6 +653,7 @@ class ODMRWindow(QMainWindow):
                 )
 
             self.panel.update_fit_results(fit)
+            self.fit_shown = True
 
             self.refresh_plot()
 
@@ -673,6 +687,7 @@ class ODMRWindow(QMainWindow):
     def odmr_finished(self):
 
         self.odmr_running = False
+        self.scans_run = getattr(self, "scans_run", 0) + 1
         # First, so a failure in statistics/saving below can't leave the
         # magnet control window locked.
         self.run_finished.emit()  # also returns the run button to "Start"
@@ -730,6 +745,10 @@ class ODMRWindow(QMainWindow):
         )
         if magnet_record and self.current_config is not None:
             self.current_config.update(magnet_record)
+        # getattr: tests drive odmr_finished() on lightweight stand-ins.
+        record_last_scan = getattr(self, "_record_last_scan", None)
+        if record_last_scan is not None:
+            record_last_scan(completed, total)
 
         if (
             self.current_config is not None
@@ -764,6 +783,26 @@ class ODMRWindow(QMainWindow):
             )
             if statistics_cube is not None:
                 statistics_cube.save(output_folder / "odmr_statistics.h5")
+            if getattr(self, "last_scan", None) is not None:
+                self.last_scan["saved_to"] = str(output_folder)
+
+        if getattr(self, "_close_after_stop", False):
+            # The user confirmed "Stop and Close" while the scan ran.
+            self._close_after_stop = False
+            close_without_confirmation(self)
+
+    def _record_last_scan(self, completed, total):
+        config = self.current_config or {}
+        self.last_scan = {
+            "f_start_hz": config.get("f_start"),
+            "f_stop_hz": config.get("f_stop"),
+            "points": None if self.latest_x is None else len(self.latest_x),
+            "averages": total if total is not None else config.get("averages"),
+            "completed": completed,
+            "save_data": bool(config.get("save_data", True)),
+            "has_data": self.latest_x is not None,
+            "saved_to": None,
+        }
 
     # =====================================================
     # ERROR MESSAGE
@@ -778,16 +817,85 @@ class ODMRWindow(QMainWindow):
         )
 
     # =====================================================
-    # CLOSE GUI WARNING
+    # CLOSE (confirmed: gui/close_confirmation.py)
     # =====================================================
 
-    def closeEvent(self, event):
+    def last_scan_text(self):
+        """One line on the last scan and whether it is saved, or None."""
+        scan = self.last_scan
+        if scan is None:
+            return None
+        parts = []
+        if scan["f_start_hz"] is not None and scan["f_stop_hz"] is not None:
+            parts.append(f"{scan['f_start_hz'] / 1e9:.6g}–{scan['f_stop_hz'] / 1e9:.6g} GHz")
+        if scan["points"]:
+            parts.append(f"{scan['points']} points")
+        if scan["averages"]:
+            averages = scan["averages"]
+            completed = scan["completed"]
+            if completed is not None and completed < averages:
+                parts.append(f"stopped after {completed} of {averages} averages")
+            else:
+                parts.append(f"{averages} average{'s' if averages != 1 else ''}")
+        what = f"The last scan ({', '.join(parts)})" if parts else "The last scan"
+        if not scan["has_data"]:
+            return f"{what} produced no data."
+        if scan["saved_to"]:
+            return f"{what} is saved in {scan['saved_to']}."
+        return (f"{what} is not saved (\"Save data\" was off); its spectrum "
+                "exists only in this window.")
+
+    def unsaved_results(self):
+        """Short notes on results that exist only in memory (for MainWindow's
+        exit question)."""
+        notes = []
+        if self.last_scan and self.last_scan["has_data"] and not self.last_scan["saved_to"]:
+            notes.append("last scan not saved")
+        if self.fit_shown:
+            notes.append("fit result not saved")
+        return notes
+
+    def close_confirmation(self):
+        title = "Close ODMR Experiment"
+        magnet = describe_magnet(self.hardware.get("magnet")) if self.hardware else None
+        if self.odmr_running:
+            save_on = bool((self.current_config or {}).get("save_data", True))
+            return CloseConfirmation(
+                title, "An ODMR scan is running. Stop it and close the ODMR window?",
+                [
+                    "The scan stops after the current frequency point; the "
+                    "window closes once it has stopped.",
+                    "Data acquired so far is saved (\"Save data\" is on)." if save_on
+                    else "Data acquired so far is not saved (\"Save data\" is off); "
+                         "it stays in this window.",
+                    "The post-experiment magnet action then runs as after any scan.",
+                ],
+                confirm_text="Stop and Close",
+            )
+        facts = []
+        if self.stability_waiting():
+            facts.append("Waiting for stable counts: closing cancels this start "
+                         "(nothing has been measured).")
+        facts.append(self.last_scan_text() or "No scan has been run in this window.")
+        if self.fit_shown:
+            facts.append("The fit result shown is not saved anywhere.")
+        if magnet:
+            facts.append(f"Magnet: {magnet}. Closing this window leaves it as it is"
+                         + (" (the post-experiment action already ran after the "
+                            "last scan)." if self.scans_run else "."))
+        facts.append("Settings, plot and result are kept while the app runs: "
+                     "closing only hides this window (reopen it with ODMR).")
+        return CloseConfirmation(title, "Close the ODMR window?", facts)
+
+    def confirmed_close_event(self, event):
 
         # MainWindow is the close gatekeeper (it waits for worker threads
         # before shutting hardware down). Here, a running scan is asked to
-        # stop and the window stays open until it has finished; closing it
-        # afterwards is accepted normally.
+        # stop; the window stays open until it has finished, then closes
+        # by itself (the user already confirmed "Stop and Close").
         if self.odmr_running:
+            self._close_after_stop = not getattr(
+                self, "_closing_without_confirmation", False)
             self.request_stop()
             event.ignore()
             return

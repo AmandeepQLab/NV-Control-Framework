@@ -21,6 +21,11 @@ from framework.analysis.odmr_statistics import (
     load_odmr_statistics,
 )
 from gui.odmr_analysis_worker import ODMRPixelFitWorker
+from gui.close_confirmation import (
+    CloseConfirmation,
+    ConfirmCloseMixin,
+    close_without_confirmation,
+)
 from gui.panels.odmr_analysis_panel import ODMRAnalysisPanel
 from gui.widgets.initial_fit_parameters_dialog import (
     DOUBLE_LORENTZIAN,
@@ -56,7 +61,7 @@ def display_position_to_pixel(image_x, image_y, map_shape):
     return int(np.floor(image_x)), int(np.floor(image_y))
 
 
-class ODMRAnalysisWindow(QMainWindow):
+class ODMRAnalysisWindow(ConfirmCloseMixin, QMainWindow):
     """Load an ODMR statistics file and inspect global and pixel-wise results."""
 
     def __init__(self, parent=None):
@@ -378,8 +383,9 @@ class ODMRAnalysisWindow(QMainWindow):
         self.pixel_thread = None
         self._update_actions()
         if self._close_after_pixel_fit:
+            # The user already confirmed the close; don't ask again.
             self._close_after_pixel_fit = False
-            self.close()
+            close_without_confirmation(self)
 
     def reconstruct_magnetic_map(self):
         """Run the existing Bz reconstruction on completed pixel-fit maps."""
@@ -607,13 +613,54 @@ class ODMRAnalysisWindow(QMainWindow):
             f"Acquisition status: {completion}"
         )
 
-    def closeEvent(self, event):
-        if self.pixel_thread is not None and self.pixel_thread.isRunning():
+    def results_text(self):
+        """What has been computed from the loaded file, or None."""
+        done = []
+        if self.global_fit_result is not None:
+            done.append("global double-Lorentzian fit")
+        elif self.single_fit_result is not None:
+            done.append("global single-Lorentzian fit")
+        if self.pixel_fit_result is not None:
+            done.append("pixel fit maps")
+        if self.magnetic_result is not None:
+            done.append("Bz map")
+        return ", ".join(done) if done else None
+
+    def unsaved_results(self):
+        results = self.results_text()
+        return [f"analysis results not saved ({results})"] if results else []
+
+    def pixel_fit_running(self):
+        return self.pixel_thread is not None and self.pixel_thread.isRunning()
+
+    def close_confirmation(self):
+        standalone = self.parent() is None
+        facts = []
+        if self.selected_source_path:
+            facts.append(f"Loaded file: {self.selected_source_path}.")
+        else:
+            facts.append("No file loaded.")
+        results = self.results_text()
+        if results:
+            facts.append(f"Results: {results}. They are not saved to any file "
+                         "(this window has no export).")
+        if self.pixel_fit_running():
+            facts.append("A pixel fit is running: the window closes when it finishes.")
+        facts.append(
+            "Closing ends the analysis program; everything shown here is lost."
+            if standalone else
+            "Closing only hides this window; the results stay until the app "
+            "exits (reopen it with ODMR Analysis in the ODMR window).")
+        return CloseConfirmation(
+            "Close ODMR Analysis", "Close the ODMR Analysis window?", facts)
+
+    def confirmed_close_event(self, event):
+        if self.pixel_fit_running():
             self._close_after_pixel_fit = True
             self.panel.set_status("Pixel fitting is still running; the window will close when it finishes.")
             event.ignore()
             return
-        super().closeEvent(event)
+        super().confirmed_close_event(event)
 
 
 def _ghz_guess_to_hz(guess):

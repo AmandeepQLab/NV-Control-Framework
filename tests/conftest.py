@@ -8,9 +8,20 @@ test function inside. By default, only the known-safe allowlist below is
 collected. Pass --hardware to lift the restriction.
 """
 
+import os
 import pathlib
 
 TESTS_DIR = pathlib.Path(__file__).parent.resolve()
+
+# Every window confirms before closing (gui/close_confirmation.py). No test
+# may block on that dialog: for the whole session it is answered "close" --
+# through this environment variable, so the app started in a subprocess by
+# a test inherits it, and non-GUI runs need not import Qt here. A test that
+# wants Cancel, or to see the question, uses
+# gui.close_confirmation.auto_answer(False/True) (it takes precedence) and
+# reads gui.close_confirmation.history.
+CLOSE_CONFIRMATION_AUTO_ANSWER_ENV = "NV_CONTROL_AUTO_CONFIRM_CLOSE"
+os.environ.setdefault(CLOSE_CONFIRMATION_AUTO_ANSWER_ENV, "yes")
 
 ALLOWED_FILES = frozenset(
     {
@@ -65,6 +76,7 @@ ALLOWED_FILES = frozenset(
         "test_zero_field_window_save_toggle.py",
         "test_zero_field_queue_dock.py",
         "test_gui_robustness.py",
+        "test_close_confirmation.py",
     }
 )
 

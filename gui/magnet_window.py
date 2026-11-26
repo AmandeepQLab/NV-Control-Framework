@@ -13,6 +13,11 @@ Author:
 """
 from hardware.magnet.magnet import POSITIVE, NEGATIVE
 from gui import style
+from gui.close_confirmation import (
+    CloseConfirmation,
+    ConfirmCloseMixin,
+    describe_magnet,
+)
 from gui.post_experiment_action import (
     POST_EXPERIMENT_CHOICES,
     POST_EXPERIMENT_ELECTRICAL_OFF,
@@ -102,7 +107,7 @@ def _tipped(text, field):
     return label
 
 
-class MagnetControlWindow(QMainWindow):
+class MagnetControlWindow(ConfirmCloseMixin, QMainWindow):
 
     _VECTOR_BOX_TITLE = "Commanded / Model Magnet Vector"
 
@@ -619,6 +624,26 @@ class MagnetControlWindow(QMainWindow):
                 self.post_experiment_combo.setCurrentText(action)
             finally:
                 self.post_experiment_combo.blockSignals(False)
+
+    def close_confirmation(self):
+        """Closing only hides this window; the coils are not touched."""
+        state = describe_magnet(self.magnet)
+        facts = []
+        if state and state.startswith("coils on"):
+            facts.append(f"Magnet: {state}. Closing this window does not change "
+                         "it: the coils stay energized.")
+        else:
+            facts.append(f"Magnet: {state}. Closing this window changes nothing.")
+        if self._experiment_name is not None:
+            facts.append(f"{self._experiment_name} is running; it keeps "
+                         "controlling the magnet as before.")
+        facts.append(
+            f"After every experiment, \"{self.post_experiment_action.action()}\" "
+            "is still applied (if the coils are on), whether this window is "
+            "open or not.")
+        facts.append("Closing only hides this window; reopen it with Magnet.")
+        return CloseConfirmation(
+            "Close Magnet Control", "Close the Magnet Control window?", facts)
 
     def update_field_display(self, x_mT, y_mT, z_mT):
         """Show a running Zero Field scan's commanded vector, read-only.

@@ -6,9 +6,10 @@ from PyQt6.QtWidgets import ( # type: ignore
 from gui.widgets.pulse_sequence_viewer import (
     PulseSequenceViewer
 )
+from gui.close_confirmation import CloseConfirmation, ConfirmCloseDialogMixin
 
 
-class PulseSequenceWindow(QDialog):
+class PulseSequenceWindow(ConfirmCloseDialogMixin, QDialog):
 
     """
     Generic Pulse Sequence Inspector.
@@ -45,4 +46,15 @@ class PulseSequenceWindow(QDialog):
         self.viewer.set_sequence(
             sequence,
             channel_map
+        )
+
+    def close_confirmation(self):
+        return CloseConfirmation(
+            "Close Pulse Sequence Inspector",
+            "Close the pulse sequence inspector?",
+            [
+                "It only displays the sequence; nothing is lost and no "
+                "hardware is affected.",
+                "Reopen it with \"Show Pulse Sequence\" in the ODMR window.",
+            ],
         )
