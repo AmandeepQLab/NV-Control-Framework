@@ -179,6 +179,10 @@ class HardwareManager:
                 f"Unknown microwave type: {fg_type}"
             )
 
+        # RF output off from the start: it is on only during ODMR scans
+        # (CLAUDE.md). A failure is a warning, never a startup blocker.
+        self.switch_rf_off_at_startup()
+
         # =================================================
         # CAMERA
         # =================================================
@@ -314,6 +318,22 @@ class HardwareManager:
     # =====================================================
     # SHUTDOWN
     # =====================================================
+
+    def switch_rf_off_at_startup(self):
+        """Switch the connected SG386's RF output off and log it. Returns
+        True on success; a failure is logged as a warning only."""
+        mw = self.hardware.get("microwave")
+        if mw is None:
+            return False
+        try:
+            mw.rf_off()
+        except Exception as error:
+            LOGGER.warning("Could not switch the SG386 RF output off at startup: %r", error)
+            print(f"[HardwareManager] WARNING: SG386 RF off at startup failed: {error!r}")
+            return False
+        LOGGER.info("SG386 RF output switched off at startup")
+        print("[HardwareManager] SG386 RF output switched off at startup.")
+        return True
 
     def _release_device(self, name, before_close, timeout_s):
         """Run *before_close* methods, then the driver's close() (or

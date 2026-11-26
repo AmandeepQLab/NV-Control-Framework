@@ -223,6 +223,161 @@ class ZeroFieldRunRecordsRfTests(unittest.TestCase):
             self.assertIs(self._metadata(path)["sg386_rf_on"], False, path)
 
 
+class _FlakyMicrowave(SimMicrowave):
+    """SimMicrowave whose rf_off() / is_rf_on() fail the first N times."""
+
+    def __init__(self, rf_off_failures=0, read_failures=0):
+        super().__init__()
+        self.rf_off_failures = rf_off_failures
+        self.read_failures = read_failures
+
+    def rf_off(self):
+        if self.rf_off_failures:
+            self.rf_off_failures -= 1
+            raise OSError("VISA timeout")
+        super().rf_off()
+
+    def is_rf_on(self):
+        if self.read_failures:
+            self.read_failures -= 1
+            raise OSError("no reply to ENBR?")
+        return super().is_rf_on()
+
+
+class RfOffProblemTests(unittest.TestCase):
+    def test_cases(self):
+        from framework.microwave_safety import rf_off_problem
+        self.assertIsNone(rf_off_problem({"sg386_connected": False}))
+        self.assertIsNone(rf_off_problem({
+            "sg386_connected": True, "sg386_rf_off_commanded": True, "sg386_rf_on": False}))
+        self.assertIn("could not be switched off", rf_off_problem({
+            "sg386_connected": True, "sg386_rf_off_commanded": False,
+            "sg386_error": "OSError('x')"}))
+        self.assertIn("could not be read back", rf_off_problem({
+            "sg386_connected": True, "sg386_rf_off_commanded": True, "sg386_rf_on": None}))
+        self.assertIn("still reads ON", rf_off_problem({
+            "sg386_connected": True, "sg386_rf_off_commanded": True, "sg386_rf_on": True}))
+
+
+class ZeroFieldRefusalTests(unittest.TestCase):
+    """Connected SG386 that can't be confirmed off: the run is refused."""
+
+    def _window(self, microwave):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        hardware = {"magnet": make_magnet()}
+        if microwave is not None:
+            hardware.update(microwave=microwave, pulse_streamer=SimPulseStreamer(
+                channel_map={"MW": 2}), channels={"MW": 2})
+        window = ZeroFieldWindow(
+            hardware_manager=None, hardware=hardware, camera=make_camera(),
+            acquisition_state_getter=lambda: _AcquisitionState())
+        self.addCleanup(lambda: _dispose(window))
+        window.output_directory = Path(tmp.name)
+        w = window.widget
+        w.field_start_spin.setValue(-1.0)
+        w.field_stop_spin.setValue(1.0)
+        w.field_points_spin.setValue(3)
+        w.settling_time_spin.setValue(0)
+        w.post_flip_settling_spin.setValue(0)
+        return window
+
+    def _single_run(self, window):
+        with patch.object(QMessageBox, "critical") as critical:
+            window._start_run(window.widget.get_config(), window.output_directory)
+            self.assertTrue(_pump_until(lambda: not window.zero_field_running))
+            _pump_until(lambda: window.thread is None or not _running(window.thread), 10)
+        return critical
+
+    def test_rf_off_failure_refuses_the_run(self):
+        mw = _FlakyMicrowave(rf_off_failures=1)
+        mw.connect()
+        window = self._window(mw)
+        critical = self._single_run(window)
+        critical.assert_called_once()
+        message = critical.call_args.args[2]
+        self.assertIn("could not be switched off", message)
+        self.assertIn("not started", message)
+        self.assertIsNone(window.image_cube)
+        self.assertFalse(window.output_path.exists())  # nothing acquired or written
+
+    def test_read_back_failure_refuses_the_run(self):
+        mw = _FlakyMicrowave(read_failures=1)
+        mw.connect()
+        window = self._window(mw)
+        critical = self._single_run(window)
+        self.assertIn("could not be read back", critical.call_args.args[2])
+        self.assertFalse(window.output_path.exists())
+
+    def test_no_sg386_proceeds_and_records_it(self):
+        window = self._window(None)
+        critical = self._single_run(window)
+        critical.assert_not_called()
+        metadata = ImageCube.load(window.output_path).metadata
+        self.assertIs(metadata["sg386_connected"], False)
+        self.assertNotIn("sg386_rf_on", metadata)
+
+    def _queue(self, on_failure):
+        from gui import zero_field_queue as queue_model
+        mw = _FlakyMicrowave(rf_off_failures=1)  # only the first run fails
+        mw.connect()
+        window = self._window(mw)
+        for _ in range(2):
+            self.assertTrue(window.add_to_queue())
+        window.queue_widget.on_failure_combo.setCurrentText(on_failure)
+        with patch.object(QMessageBox, "critical") as critical:
+            self.assertTrue(window.run_queue())
+            self.assertTrue(_pump_until(lambda: not window.queue_active(), 60))
+            _pump_until(lambda: window.thread is None or not _running(window.thread), 10)
+        critical.assert_not_called()  # unattended: no dialog
+        return queue_model, window.queue_entries
+
+    def test_queue_stop_on_failure(self):
+        queue_model, entries = self._queue("Stop queue")
+        self.assertEqual([e.status for e in entries],
+                         [queue_model.FAILED, queue_model.PENDING])
+        self.assertIn("could not be switched off", entries[0].message)
+
+    def test_queue_skip_to_next(self):
+        queue_model, entries = self._queue("Skip to next")
+        self.assertEqual([e.status for e in entries],
+                         [queue_model.FAILED, queue_model.DONE])
+        metadata = ImageCube.load(entries[1].output_path).metadata
+        self.assertIs(metadata["sg386_rf_on"], False)
+
+
+class StartupRfOffTests(unittest.TestCase):
+    def test_startup_switches_rf_off(self):
+        manager = HardwareManager(config_manager=None)
+        mw = SimMicrowave()
+        mw.connect()
+        mw.rf_on()
+        manager.hardware = {"microwave": mw}
+        with self.assertLogs("hardware.hardware_manager", level="INFO") as logs:
+            self.assertTrue(manager.switch_rf_off_at_startup())
+        self.assertFalse(mw.is_rf_on())
+        self.assertIn("switched off at startup", " | ".join(logs.output))
+
+    def test_startup_failure_is_a_warning_only(self):
+        manager = HardwareManager(config_manager=None)
+        manager.hardware = {"microwave": _FlakyMicrowave(rf_off_failures=1)}
+        with self.assertLogs("hardware.hardware_manager", level="WARNING") as logs:
+            self.assertFalse(manager.switch_rf_off_at_startup())
+        self.assertIn("WARNING", " | ".join(logs.output))
+
+    def test_initialize_switches_rf_off_and_never_blocks(self):
+        from config.config_manager import ConfigManager
+        config = ConfigManager("config/setupInfo.json")
+        config.load()
+        with patch.object(SimMicrowave, "rf_off", autospec=True,
+                          side_effect=OSError("VISA timeout")) as rf_off:
+            manager = HardwareManager(config, force_sim=True)
+            manager.initialize()  # does not raise
+        rf_off.assert_called_once()
+        self.assertIn("camera", manager.hardware)  # startup went on
+        manager.shutdown()
+
+
 def _running(thread):
     try:
         return thread.isRunning()

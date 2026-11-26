@@ -31,9 +31,9 @@ RF_STATE_DEFINITIONS = {
 def ensure_rf_off(microwave, pulse_streamer=None, gate_channel=None):
     """Switch the RF output off and return the state for metadata.
 
-    Never raises: a failure is logged and recorded (sg386_error), and the
-    run goes on -- with the MW switch channel low, the source alone does not
-    reach the sample except through the switch's off-state leakage.
+    Never raises: a failure is logged and recorded (sg386_error). The
+    caller decides with rf_off_problem(); a Zero Field run is refused when an
+    SG386 is connected but RF could not be confirmed off.
     """
     record = {"sg386_connected": microwave is not None}
     if microwave is not None:
@@ -80,3 +80,24 @@ def ensure_rf_off(microwave, pulse_streamer=None, gate_channel=None):
         key: text for key, text in RF_STATE_DEFINITIONS.items() if key in record
     }
     return record
+
+
+def rf_off_problem(record):
+    """Why a Zero Field run must not start, from ensure_rf_off()'s record,
+    or None. Refused when an SG386 is connected but its RF output could not
+    be switched off or confirmed off (command failed, read-back failed, or
+    it still reads ON). No SG386 at all is fine: no RF is possible."""
+    if not record.get("sg386_connected"):
+        return None
+    if not record.get("sg386_rf_off_commanded"):
+        return ("The SG386 RF output could not be switched off "
+                f"({record.get('sg386_error', 'unknown error')}). "
+                "The Zero Field run was not started.")
+    if record.get("sg386_rf_on") is None:
+        return ("The SG386 RF output state could not be read back "
+                f"({record.get('sg386_rf_state_source', 'read-back failed')}). "
+                "The Zero Field run was not started.")
+    if record.get("sg386_rf_on"):
+        return ("The SG386 RF output still reads ON after switching it off. "
+                "The Zero Field run was not started.")
+    return None

@@ -9,7 +9,7 @@ import numpy as np
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
-from framework.microwave_safety import ensure_rf_off
+from framework.microwave_safety import ensure_rf_off, rf_off_problem
 from experiments.zero_field_experiment import ZeroFieldExperiment
 from framework.fluorescence import mean_fluorescence
 from framework.image_cube import merge_hdf5_metadata
@@ -108,8 +108,14 @@ class ZeroFieldWorker(QObject):
             # switched off explicitly (if one is connected) and its state,
             # frequency, power and the MW switch channel level go into every
             # saved file's metadata (top-level keys), before anything else.
-            self.metadata.update(ensure_rf_off(
-                self.microwave, self.pulse_streamer, self.mw_gate_channel))
+            rf_record = ensure_rf_off(
+                self.microwave, self.pulse_streamer, self.mw_gate_channel)
+            problem = rf_off_problem(rf_record)
+            if problem is not None:
+                # Refused before anything else: error_signal + a failed
+                # finish (a queue then follows its "On failure" setting).
+                raise RuntimeError(problem)
+            self.metadata.update(rf_record)
             streaming = _is_hdf5_path(self.output_path)
             scan_count = (
                 self.config.get("num_scans", 1)
