@@ -824,14 +824,19 @@ class AndorNeoAndor3:
     # =====================================================
 
     def close(self):
+        """Stop acquisition and close the camera. Each step's failure is
+        logged (not silently ignored) and the next step still runs."""
 
         if self._acquisition_open:
-            self._end_held_open_acquisition()
+            try:
+                self._end_held_open_acquisition()
+            except Exception:
+                LOGGER.exception("Andor close: ending the held-open acquisition failed")
 
         try:
             self.stop_stream()
         except Exception:
-            pass
+            LOGGER.exception("Andor close: stop_stream() failed")
 
         if self.cam is not None:
 
@@ -840,13 +845,15 @@ class AndorNeoAndor3:
                     "AcquisitionStop"
                 )
             except Exception:
-                pass
+                # Raised when no acquisition is running; not an error here.
+                LOGGER.debug("Andor close: AcquisitionStop not accepted", exc_info=True)
 
             try:
                 self.cam.flush()
             except Exception:
-                pass
+                LOGGER.exception("Andor close: flush() failed")
 
-            self.cam.close()
-
-            self.cam = None
+            try:
+                self.cam.close()
+            finally:
+                self.cam = None

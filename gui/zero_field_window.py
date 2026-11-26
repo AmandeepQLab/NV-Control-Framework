@@ -423,6 +423,9 @@ class ZeroFieldWindow(ConfirmCloseMixin, QMainWindow):
             acquisition_roi,
             metadata,
             self.output_path,
+            microwave=self.hardware.get("microwave"),
+            pulse_streamer=self.hardware.get("pulse_streamer"),
+            mw_gate_channel=(self.hardware.get("channels") or {}).get("MW"),
         )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.start)

@@ -24,6 +24,9 @@ LOGGER = logging.getLogger(__name__)
 # JSON-RPC calls each time out only after 10 s; an unreachable device must
 # not hold the app's exit longer than this.
 PULSE_STREAMER_CLOSE_TIMEOUT_S = 5.0
+# Same bound for the SG386 (VISA timeout 5 s per call) and the camera.
+MICROWAVE_CLOSE_TIMEOUT_S = 5.0
+CAMERA_CLOSE_TIMEOUT_S = 5.0
 
 
 def call_with_timeout(function, timeout_s, label="call"):
@@ -312,11 +315,51 @@ class HardwareManager:
     # SHUTDOWN
     # =====================================================
 
+    def _release_device(self, name, before_close, timeout_s):
+        """Run *before_close* methods, then the driver's close() (or
+        disconnect() if it has no close()), on a bounded daemon thread.
+        Every failure is logged, and a step failing does not skip the next
+        (an RF-off error still closes the connection). Returns True if the
+        device was closed."""
+        device = self.hardware.get(name)
+        if device is None:
+            return False
+        closer = next((m for m in ("close", "disconnect")
+                       if callable(getattr(device, m, None))), None)
+        outcome = {"closed": False}
+
+        def release():
+            for method in before_close:
+                function = getattr(device, method, None)
+                if not callable(function):
+                    continue
+                try:
+                    function()
+                except Exception as error:
+                    LOGGER.exception("%s %s() failed at shutdown", name, method)
+                    print(f"[HardwareManager] {name} {method}() failed: {error!r}")
+            if closer is None:
+                LOGGER.error("%s (%s) has no close() or disconnect(); not closed",
+                             name, type(device).__name__)
+                print(f"[HardwareManager] {name} has no close()/disconnect(); not closed.")
+                return
+            try:
+                getattr(device, closer)()
+                outcome["closed"] = True
+            except Exception as error:
+                LOGGER.exception("%s %s() failed at shutdown", name, closer)
+                print(f"[HardwareManager] {name} {closer}() failed: {error!r}")
+
+        call_with_timeout(release, timeout_s, f"{name} release")
+        return outcome["closed"]
+
     def shutdown(self):
         """Release every device. Safe to call more than once.
 
         Order: magnet (0 A, outputs off) -> power supplies -> Pulse
-        Streamer -> microwave -> camera. Each step is isolated, so one
+        Streamer -> microwave (RF off, then close) -> camera (stop and
+        close). Microwave, camera and Pulse Streamer are each bounded to 5 s
+        and every failure is logged. Each step is isolated, so one
         device failing never skips the others -- except that the Pulse
         Streamer's outputs (which include the three magnet polarity relays)
         are not touched if switching the magnet off failed, since the coils
@@ -375,31 +418,13 @@ class HardwareManager:
                       "(magnet shutdown failed; relays not switched).")
 
         # --------------------------------------------
-        # Microwave
+        # Microwave (SG386): RF output off, then close the connection.
+        # Camera: stop acquisition and close (the driver's close() does
+        # both). Each bounded and independent of the other devices.
         # --------------------------------------------
 
-        if "microwave" in self.hardware:
-
-            try:
-                self.hardware["microwave"].disconnect()
-            except AttributeError:
-                pass
-            except Exception as error:
-                LOGGER.exception("Microwave disconnect failed")
-                print(f"[HardwareManager] microwave disconnect failed: {error!r}")
-
-        # --------------------------------------------
-        # Camera
-        # --------------------------------------------
-
-        if "camera" in self.hardware:
-
-            try:
-                self.hardware["camera"].disconnect()
-            except AttributeError:
-                pass
-            except Exception as error:
-                LOGGER.exception("Camera disconnect failed")
-                print(f"[HardwareManager] camera disconnect failed: {error!r}")
+        self._release_device(
+            "microwave", ("rf_off",), MICROWAVE_CLOSE_TIMEOUT_S)
+        self._release_device("camera", (), CAMERA_CLOSE_TIMEOUT_S)
 
         print("Hardware shutdown complete.")

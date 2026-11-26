@@ -169,16 +169,21 @@ class CloseRightAfterRunTests(unittest.TestCase):
 # =====================================================================
 
 def _mock_hardware(order):
-    def device(name, method):
-        mock = Mock(name=name)
-        getattr(mock, method).side_effect = lambda *a, **k: order.append(name)
+    """Mocks with only the real drivers' methods (spec), each recording
+    "<device>.<method>" in *order* when called."""
+    def device(name, *methods):
+        mock = Mock(spec=list(methods), name=name)
+        for method in methods:
+            getattr(mock, method).side_effect = (
+                lambda *a, _label=f"{name}.{method}", **k: order.append(_label))
         return mock
     return {
-        "magnet": device("magnet.disable", "disable"),
-        "power_supplies": {"X": device("ps.disconnect", "disconnect")},
-        "pulse_streamer": device("pulse.close", "close"),
-        "microwave": device("microwave.disconnect", "disconnect"),
-        "camera": device("camera.disconnect", "disconnect"),
+        "magnet": device("magnet", "disable"),
+        "power_supplies": {"X": device("ps", "disconnect")},
+        "pulse_streamer": device("pulse", "close"),
+        # SG386 and AndorNeoAndor3 have close(), not disconnect().
+        "microwave": device("microwave", "rf_off", "close"),
+        "camera": device("camera", "close"),
     }
 
 
@@ -194,7 +199,8 @@ class HardwareShutdownTests(unittest.TestCase):
         manager.shutdown()
         manager.shutdown()  # idempotent
         self.assertEqual(order, ["magnet.disable", "ps.disconnect", "pulse.close",
-                                 "microwave.disconnect", "camera.disconnect"])
+                                 "microwave.rf_off", "microwave.close",
+                                 "camera.close"])
 
     def test_unreachable_pulse_streamer_does_not_hang(self):
         order = []
@@ -209,17 +215,22 @@ class HardwareShutdownTests(unittest.TestCase):
             elapsed = time.monotonic() - start
         never.set()
         self.assertLess(elapsed, 2.0)
-        self.assertIn("camera.disconnect", order)  # later steps still ran
+        self.assertIn("camera.close", order)  # later steps still ran
 
     def test_one_failing_device_does_not_skip_the_rest(self):
         order = []
         hardware = _mock_hardware(order)
         hardware["pulse_streamer"].close.side_effect = RuntimeError("no route")
-        hardware["microwave"].disconnect.side_effect = OSError("VISA gone")
+        hardware["microwave"].rf_off.side_effect = OSError("VISA gone")
         manager = self._manager(hardware)
-        manager.shutdown()
+        with self.assertLogs("hardware.hardware_manager", level="ERROR") as logs:
+            manager.shutdown()
+        # The RF-off failure is logged, and the SG386 is still closed.
         self.assertEqual(order, ["magnet.disable", "ps.disconnect",
-                                 "camera.disconnect"])
+                                 "microwave.close", "camera.close"])
+        joined = "\n".join(logs.output)
+        self.assertIn("microwave rf_off() failed", joined)
+        self.assertIn("Pulse Streamer close failed", joined)
 
     def test_relays_not_switched_if_the_magnet_could_not_be_switched_off(self):
         order = []
@@ -228,8 +239,8 @@ class HardwareShutdownTests(unittest.TestCase):
         manager = self._manager(hardware)
         manager.shutdown()
         hardware["pulse_streamer"].close.assert_not_called()
-        self.assertEqual(order, ["ps.disconnect", "microwave.disconnect",
-                                 "camera.disconnect"])
+        self.assertEqual(order, ["ps.disconnect", "microwave.rf_off",
+                                 "microwave.close", "camera.close"])
 
     def test_call_with_timeout_reports(self):
         self.assertTrue(call_with_timeout(lambda: None, 1.0))

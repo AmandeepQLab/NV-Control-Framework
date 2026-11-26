@@ -539,6 +539,13 @@ class ODMRWorker(QObject):
         except Exception:
             LOGGER.exception("Failed to close ODMR camera acquisition")
 
+        # The SG386 RF output is on only during a scan: off on every exit
+        # path (completion, stop, error). switch_rf_off() logs a failure.
+        try:
+            self.experiment.switch_rf_off()
+        except Exception:
+            LOGGER.exception("Failed to switch the SG386 RF output off")
+
         if self._timing:
             self._collect_scan_level_timing()
             self._acquisition_counts = self.experiment.get_acquisition_counts()

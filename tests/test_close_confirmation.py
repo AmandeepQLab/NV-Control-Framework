@@ -294,8 +294,8 @@ class MessageContentTests(SimWindowsTestCase):
     def test_main_window_lists_hardware_release(self):
         text = self.main.close_confirmation().text()
         self.assertIn("Pulse Streamer: all outputs set LOW", text)
-        self.assertIn("SG386: not touched at exit", text)
-        self.assertIn("Camera: live view stopped", text)
+        self.assertIn("SG386: RF output switched off, connection closed.", text)
+        self.assertIn("Camera: live view and acquisition stopped, camera closed.", text)
         self.assertIn("Magnet: coils off", text)
 
 

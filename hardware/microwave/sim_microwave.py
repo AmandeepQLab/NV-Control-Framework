@@ -83,3 +83,7 @@ class SimMicrowave:
     def rf_off(self):
 
         self.rf_enabled = False
+
+    def is_rf_on(self):
+
+        return self.rf_enabled

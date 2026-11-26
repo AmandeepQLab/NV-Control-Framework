@@ -77,6 +77,7 @@ ALLOWED_FILES = frozenset(
         "test_zero_field_queue_dock.py",
         "test_gui_robustness.py",
         "test_close_confirmation.py",
+        "test_microwave_state.py",
     }
 )
 

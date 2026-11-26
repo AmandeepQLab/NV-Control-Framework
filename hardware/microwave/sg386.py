@@ -43,6 +43,10 @@ class SG386:
     def rf_off(self):
         self.inst.write("ENBR 0")
 
+    def is_rf_on(self):
+        """RF (Type-N) output state, read back from the instrument."""
+        return int(float(self.inst.query("ENBR?"))) == 1
+
     def close(self):
         if self.inst is not None:
             self.inst.close()

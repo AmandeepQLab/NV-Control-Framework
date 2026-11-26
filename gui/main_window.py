@@ -1275,14 +1275,9 @@ class MainWindow(ConfirmCloseMixin, QMainWindow):
             facts.append("Pulse Streamer: all outputs set LOW (including the "
                          "polarity relays), any sequence stopped, connection closed.")
         if hardware.get("microwave") is not None:
-            odmr = getattr(self, "odmr_window", None)
-            ran = odmr is not None and getattr(odmr, "scans_run", 0) > 0
-            facts.append(
-                "SG386: not touched at exit; its RF output and connection are "
-                "left as they are"
-                + (" (an ODMR scan this session switched RF on)." if ran else "."))
-        facts.append("Camera: live view stopped; the camera is not closed "
-                     "explicitly (released when the program ends).")
+            facts.append("SG386: RF output switched off, connection closed.")
+        if hardware.get("camera") is not None:
+            facts.append("Camera: live view and acquisition stopped, camera closed.")
         panel = getattr(self, "count_statistics_panel", None)
         log = getattr(panel, "log", None)
         if log is not None:

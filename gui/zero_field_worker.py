@@ -9,6 +9,7 @@ import numpy as np
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from framework.microwave_safety import ensure_rf_off
 from experiments.zero_field_experiment import ZeroFieldExperiment
 from framework.fluorescence import mean_fluorescence
 from framework.image_cube import merge_hdf5_metadata
@@ -76,6 +77,9 @@ class ZeroFieldWorker(QObject):
         acquisition_roi,
         metadata,
         output_path,
+        microwave=None,
+        pulse_streamer=None,
+        mw_gate_channel=None,
     ):
         # output_path is Optional[Path]: None means saving is off for this
         # run -- no file is written during or after acquisition, and the
@@ -88,6 +92,10 @@ class ZeroFieldWorker(QObject):
         self.acquisition_roi = acquisition_roi
         self.metadata = metadata
         self.output_path = output_path
+        # Only for the RF-off check at the run's start (ensure_rf_off()).
+        self.microwave = microwave
+        self.pulse_streamer = pulse_streamer
+        self.mw_gate_channel = mw_gate_channel
         self.experiment = None
         self._stop_requested = False
         self._single_scan_direct = False
@@ -96,6 +104,12 @@ class ZeroFieldWorker(QObject):
 
     def start(self):
         try:
+            # No microwaves during a Zero Field run: the SG386 RF output is
+            # switched off explicitly (if one is connected) and its state,
+            # frequency, power and the MW switch channel level go into every
+            # saved file's metadata (top-level keys), before anything else.
+            self.metadata.update(ensure_rf_off(
+                self.microwave, self.pulse_streamer, self.mw_gate_channel))
             streaming = _is_hdf5_path(self.output_path)
             scan_count = (
                 self.config.get("num_scans", 1)

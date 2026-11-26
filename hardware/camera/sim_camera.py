@@ -1,3 +1,4 @@
+import logging
 import numpy as np
 import threading
 import time
@@ -6,6 +7,9 @@ from contextlib import contextmanager
 from hardware.camera.streaming import StreamController
 from utils.camera_diagnostics import log_camera_snap, log_event
 
+
+
+LOGGER = logging.getLogger(__name__)
 
 class SimCamera:
 
@@ -266,12 +270,15 @@ class SimCamera:
         pass
 
     def close(self):
+        """Same steps as AndorNeoAndor3.close(): end any acquisition, stop
+        the stream; failures logged."""
         if self._acquisition_open:
             self._end_held_open_acquisition()
         try:
             self.stop_stream()
         except Exception:
-            pass
+            LOGGER.exception("SimCamera close: stop_stream() failed")
+        self.closed = True
 
     # =========================================================
     # CONFIGURATION

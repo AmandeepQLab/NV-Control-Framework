@@ -604,7 +604,27 @@ class ODMRExperiment(ScanExperiment):
 
     def cleanup(self):
 
-        super().cleanup()
+        try:
+            self.switch_rf_off()
+        finally:
+            super().cleanup()
+
+    def switch_rf_off(self):
+        """RF output off: the SG386 is on only during an ODMR scan.
+
+        Called when a scan ends, on every exit path (ODMRWorker._finish(),
+        and cleanup() for a direct run()). A failure is logged, not raised,
+        so the rest of the scan's cleanup still runs. Returns True if the
+        command was sent without error (or there is no microwave source)."""
+        mw = self.hw.get("microwave") if hasattr(self.hw, "get") else None
+        if mw is None or not hasattr(mw, "rf_off"):
+            return True
+        try:
+            mw.rf_off()
+        except Exception:
+            LOGGER.exception("Could not switch the SG386 RF output off after the ODMR scan")
+            return False
+        return True
 
     # =====================================================
     # BUILD PULSE SEQUENCE
