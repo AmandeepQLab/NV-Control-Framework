@@ -64,6 +64,7 @@ ALLOWED_FILES = frozenset(
         "test_zero_field_timing.py",
         "test_zero_field_window_save_toggle.py",
         "test_zero_field_queue_dock.py",
+        "test_gui_robustness.py",
     }
 )
 

@@ -1,3 +1,6 @@
+import logging
+import threading
+
 from hardware.microwave.sg386 import SG386
 from hardware.microwave.sim_microwave import SimMicrowave
 
@@ -14,6 +17,42 @@ from hardware.power_supply import (
     E3632A,
 )
 from hardware.magnet import Magnet
+
+LOGGER = logging.getLogger(__name__)
+
+# Upper bound on releasing the Pulse Streamer at shutdown. The vendor SDK's
+# JSON-RPC calls each time out only after 10 s; an unreachable device must
+# not hold the app's exit longer than this.
+PULSE_STREAMER_CLOSE_TIMEOUT_S = 5.0
+
+
+def call_with_timeout(function, timeout_s, label="call"):
+    """Run function() on a daemon thread and wait at most *timeout_s*.
+
+    True if it returned (an exception is logged, not raised), False if it
+    was still running when the wait ended. A call that never returns is
+    left behind on its daemon thread and does not keep the process alive.
+    """
+    outcome = {}
+
+    def target():
+        try:
+            function()
+        except Exception as error:  # reported below, on the caller's thread
+            outcome["error"] = error
+
+    thread = threading.Thread(target=target, name=f"bounded {label}", daemon=True)
+    thread.start()
+    thread.join(timeout_s)
+    if thread.is_alive():
+        LOGGER.warning("%s did not finish within %.1f s; continuing", label, timeout_s)
+        print(f"[HardwareManager] {label} did not finish within {timeout_s:g} s; continuing.")
+        return False
+    if "error" in outcome:
+        LOGGER.error("%s failed: %r", label, outcome["error"])
+        print(f"[HardwareManager] {label} failed: {outcome['error']!r}")
+    return True
+
 
 class HardwareManager:
 
@@ -274,6 +313,19 @@ class HardwareManager:
     # =====================================================
 
     def shutdown(self):
+        """Release every device. Safe to call more than once.
+
+        Order: magnet (0 A, outputs off) -> power supplies -> Pulse
+        Streamer -> microwave -> camera. Each step is isolated, so one
+        device failing never skips the others -- except that the Pulse
+        Streamer's outputs (which include the three magnet polarity relays)
+        are not touched if switching the magnet off failed, since the coils
+        may then still carry current (see CLAUDE.md: coil current must be
+        zero before closing the Pulse Streamer).
+        """
+        if getattr(self, "_shutdown_done", False):
+            return
+        self._shutdown_done = True
 
         print("\nShutting down hardware...")
 
@@ -281,19 +333,46 @@ class HardwareManager:
         # Magnet
         # --------------------------------------------
 
+        magnet_safe = True
         if "magnet" in self.hardware:
-
-            self.hardware["magnet"].disable()
+            try:
+                self.hardware["magnet"].disable()
+            except Exception as error:
+                magnet_safe = False
+                LOGGER.exception("Magnet shutdown failed")
+                print(f"[HardwareManager] magnet shutdown failed: {error!r}")
 
         # --------------------------------------------
         # Power supplies
         # --------------------------------------------
 
-        if "power_supplies" in self.hardware:
-
-            for ps in self.hardware["power_supplies"].values():
-
+        for ps in self.hardware.get("power_supplies", {}).values():
+            try:
                 ps.disconnect()
+            except Exception as error:
+                LOGGER.exception("Power supply disconnect failed")
+                print(f"[HardwareManager] power supply disconnect failed: {error!r}")
+
+        # --------------------------------------------
+        # Pulse Streamer: stop any sequence, outputs LOW, release it.
+        # Bounded, so an unreachable device can't hang the exit.
+        # --------------------------------------------
+
+        pulse = self.hardware.get("pulse_streamer")
+        if pulse is not None:
+            if magnet_safe:
+                call_with_timeout(
+                    pulse.close, PULSE_STREAMER_CLOSE_TIMEOUT_S,
+                    "Pulse Streamer close",
+                )
+            else:
+                LOGGER.warning(
+                    "Pulse Streamer outputs left as they are: the magnet "
+                    "could not be switched off, so the polarity relays are "
+                    "not switched under possible coil current."
+                )
+                print("[HardwareManager] Pulse Streamer left as is "
+                      "(magnet shutdown failed; relays not switched).")
 
         # --------------------------------------------
         # Microwave
@@ -305,6 +384,9 @@ class HardwareManager:
                 self.hardware["microwave"].disconnect()
             except AttributeError:
                 pass
+            except Exception as error:
+                LOGGER.exception("Microwave disconnect failed")
+                print(f"[HardwareManager] microwave disconnect failed: {error!r}")
 
         # --------------------------------------------
         # Camera
@@ -316,5 +398,8 @@ class HardwareManager:
                 self.hardware["camera"].disconnect()
             except AttributeError:
                 pass
+            except Exception as error:
+                LOGGER.exception("Camera disconnect failed")
+                print(f"[HardwareManager] camera disconnect failed: {error!r}")
 
         print("Hardware shutdown complete.")

@@ -182,10 +182,33 @@ class SwabianPulseStreamer:
         return self.persistent_outputs.get(channel, False)
 
     def close(self):
+        """Release the Pulse Streamer at shutdown. Safe to call twice.
+
+        1. Every output LOW (reset_outputs(preserve_persistent=False)).
+        2. Stop streaming: constant(OutputState.ZERO()) ends any sequence,
+           including the looping one step 1 leaves, and holds all outputs
+           LOW.
+        3. Drop the connection object (the SDK talks JSON-RPC over HTTP,
+           so there is no socket to close; nothing is sent afterwards).
+
+        A failing step is reported and the next one still runs. The SDK's
+        own calls time out after 10 s each; HardwareManager.shutdown()
+        bounds the whole close so an unreachable device can't hang exit.
+        Coil current must already be zero (the relays go LOW here).
+        """
+        if self.ps is None:
+            return
         try:
             # Shutdown wants everything de-energized -- including the
             # relay -- unlike the per-frame reset_outputs() default, which
             # preserves it. See reset_outputs()'s docstring.
             self.reset_outputs(preserve_persistent=False)
-        except Exception:
-            pass
+        except Exception as error:
+            print(f"[Swabian] close: resetting outputs failed: {error!r}")
+        try:
+            self.ps.constant(OutputState.ZERO())
+        except Exception as error:
+            print(f"[Swabian] close: stopping the sequence failed: {error!r}")
+        self.ps = None
+        self.sequence = None
+        print("[Swabian] Closed")

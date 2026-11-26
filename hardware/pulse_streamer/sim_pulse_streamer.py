@@ -109,7 +109,14 @@ class SimPulseStreamer:
         return self.persistent_outputs.get(channel, False)
 
     def close(self):
+        """Same steps as SwabianPulseStreamer.close(): outputs LOW, stop
+        streaming, disconnect. Safe to call twice."""
+        if getattr(self, "closed", False):
+            return
         try:
             self.reset_outputs(preserve_persistent=False)
         except Exception:
             pass
+        self.sequence = None
+        self.connected = False
+        self.closed = True

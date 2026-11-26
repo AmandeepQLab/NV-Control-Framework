@@ -65,6 +65,10 @@ class FakePS:
         self.stream_calls.append(kwargs)
         self.streamed.append((seq, kwargs))
 
+    def constant(self, state):
+        # close() stops streaming with constant(OutputState.ZERO()).
+        self.constant_calls = getattr(self, "constant_calls", []) + [state]
+
 
 def _make_streamer():
     streamer = SwabianPulseStreamer(ip_address="fake", channel_map=dict(CHANNEL_MAP))
@@ -180,10 +184,11 @@ class ResetOutputsPreservesRelayTests(unittest.TestCase):
         streamer = _make_streamer()
         for channel in RELAY_CHANNELS.values():
             streamer.set_digital_output(channel, True)
+        fake = streamer.ps  # close() drops its reference to the device
 
         streamer.close()
 
-        seq, kwargs = streamer.ps.streamed[-1]
+        seq, kwargs = fake.streamed[-1]
         self.assertEqual(kwargs, {})
         for ch in CHANNEL_MAP.values():
             pattern = _channel_pattern(seq, ch)
@@ -232,11 +237,16 @@ class UntouchedMethodsTests(unittest.TestCase):
         streamer.sync_outputs()
         self.assertEqual(streamer.ps.stream_calls[-1], {})
 
-    def test_close_only_calls_reset_outputs(self):
+    def test_close_streams_only_the_reset_then_stops_streaming(self):
         streamer = _make_streamer()
+        fake = streamer.ps
         streamer.close()
-        self.assertEqual(len(streamer.ps.stream_calls), 1)
-        self.assertEqual(streamer.ps.stream_calls[-1], {})
+        self.assertEqual(len(fake.stream_calls), 1)
+        self.assertEqual(fake.stream_calls[-1], {})
+        # Then streaming is stopped with every output held LOW.
+        self.assertEqual(len(fake.constant_calls), 1)
+        self.assertEqual(fake.constant_calls[0].getData(), (0, 0, 0))
+        self.assertIsNone(streamer.ps)
 
 
 # =====================================================

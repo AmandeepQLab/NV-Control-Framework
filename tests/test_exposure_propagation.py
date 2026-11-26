@@ -220,6 +220,13 @@ class ExposureDriftWarningTests(unittest.TestCase):
         self.assertEqual(experiment.actual_exposure_s, 0.0207)
 
 
+def _main_window_construction_source():
+    """MainWindow's construction code: __init__ connects the hardware and
+    calls _build(), which builds the window (split so a failure in _build()
+    releases the hardware)."""
+    return inspect.getsource(MainWindow.__init__) + inspect.getsource(MainWindow._build)
+
+
 class MainWindowSingleSourceOfTruthTests(unittest.TestCase):
     """MainWindow is a QMainWindow with real widgets and can't cheaply be
     constructed headlessly in this test environment (no display) --
@@ -229,13 +236,13 @@ class MainWindowSingleSourceOfTruthTests(unittest.TestCase):
     instantiation for exactly this reason."""
 
     def test_acquisition_state_built_from_spinboxes_not_dataclass_defaults(self):
-        source = inspect.getsource(MainWindow.__init__)
+        source = _main_window_construction_source()
         self.assertIn("exposure_s=self.exposure_spin.value()", source)
         self.assertIn("binning=self.binning_spin.value()", source)
         self.assertNotIn("self.acquisition_state = AcquisitionState()", source)
 
     def test_acquisition_state_constructed_after_spinboxes_exist(self):
-        source = inspect.getsource(MainWindow.__init__)
+        source = _main_window_construction_source()
         spinbox_pos = source.index("self.exposure_spin = QDoubleSpinBox()")
         state_pos = source.index("self.acquisition_state = AcquisitionState(")
         self.assertLess(
@@ -245,7 +252,7 @@ class MainWindowSingleSourceOfTruthTests(unittest.TestCase):
         )
 
     def test_camera_pushed_explicitly_at_end_of_init(self):
-        source = inspect.getsource(MainWindow.__init__)
+        source = _main_window_construction_source()
         restorer_pos = source.index("register_camera_state_restorer(")
         push_pos = source.index("self.apply_acquisition_state_to_camera()")
         self.assertLess(restorer_pos, push_pos)

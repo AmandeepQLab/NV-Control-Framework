@@ -15,7 +15,7 @@ from gui.magnet_window import MagnetControlWindow
 from experiments.odmr_experiment import ODMRExperiment
 from experiments.zero_field_experiment import ZeroFieldExperiment
 from config.config_manager import ConfigManager
-from hardware.hardware_manager import HardwareManager
+from hardware.hardware_manager import HardwareManager, call_with_timeout
 from gui.odmr_window import ODMRWindow
 from gui.odmr_analysis_window import ODMRAnalysisWindow
 from gui.zero_field_window import ZeroFieldWindow
@@ -39,6 +39,7 @@ from gui.live_view_controller import LiveViewTimerController
 from gui.widgets.count_statistics_panel import CountStatisticsPanel
 from gui.widgets.collapsible_section import CollapsibleSection
 from gui.widgets.image_normalization_section import ImageNormalizationSection
+from gui.post_experiment_action import PostExperimentMagnetAction
 from gui.stability_gate import StabilityMonitor
 from gui.display_settings import (
     COLORMAP_NAMES,
@@ -55,6 +56,15 @@ LOGGER = logging.getLogger(__name__)
 
 # How long a "Stop and Close" waits for worker threads before closing anyway.
 _CLOSE_WAIT_TIMEOUT_MS = 10_000
+
+# A close right after a run ends: how long to wait for a worker thread whose
+# window has already reported the run finished, before treating it as a
+# running scan (the Zero Field worker still writes its timing file then).
+_FINISHING_WORKER_GRACE_MS = 2_000
+
+# Hardware release when the app dies from an unhandled exception: bounded,
+# so an unreachable device can't keep a crashed process alive.
+_FATAL_ERROR_SHUTDOWN_TIMEOUT_S = 20.0
 
 
 def _tipped(text, field):
@@ -107,9 +117,29 @@ class MainWindow(QMainWindow):
 
         self.hw_manager = HardwareManager(self.cfg, force_sim=sim)
         self.hw_manager.initialize()
+        try:
+            self._build(sim)
+        except Exception:
+            # Construction failed after the hardware was connected: release
+            # it (magnet off, Pulse Streamer closed, ...) before re-raising.
+            LOGGER.exception("MainWindow construction failed; releasing hardware")
+            try:
+                self.hw_manager.shutdown()
+            except Exception:
+                LOGGER.exception("Hardware shutdown after a failed start failed")
+            raise
 
+    def _build(self, sim):
         self.hardware = self.hw_manager.get_hardware()
         self.camera = self.hardware["camera"]
+
+        # What the magnet does when an experiment or queue ends. Applied
+        # here on every experiment_finished, whether or not the magnet
+        # window was ever opened; that window only shows/changes it.
+        self.post_experiment_action = PostExperimentMagnetAction(
+            self.hardware.get("magnet"), parent=self
+        )
+        self.experiment_finished.connect(self._apply_post_experiment_action)
 
         # =====================================================
         # STATE VARIABLES
@@ -117,6 +147,7 @@ class MainWindow(QMainWindow):
 
         self.state = "IDLE"
         self.odmr_window = None
+        self.zero_field_window = None
         self.odmr_analysis_window = None
         # self.acquisition_state is constructed below, once the exposure/
         # binning/baseline spinboxes exist -- built from their displayed
@@ -434,20 +465,14 @@ class MainWindow(QMainWindow):
 
     def open_magnet_window(self):
 
-        if self.magnet_window is not None:
-
-            # Closing the magnet window only hides it (it is kept so the
-            # post-experiment action still runs), so show it again here.
-            self.magnet_window.show()
-
-            self.magnet_window.raise_()
-
-            self.magnet_window.activateWindow()
-
+        # Closing the magnet window only hides it, so reuse that instance
+        # (hidden, minimised or behind): never a second one.
+        if self._present_existing_window(self.magnet_window):
             return
 
         self.magnet_window = MagnetControlWindow(
-            self.hardware
+            self.hardware,
+            post_experiment_action=getattr(self, "post_experiment_action", None),
         )
 
         self.experiment_started.connect(self.magnet_window.on_experiment_started)
@@ -494,6 +519,34 @@ class MainWindow(QMainWindow):
         else:
             self.experiment_finished.emit()
 
+    def _apply_post_experiment_action(self):
+        """The post-experiment magnet action, after every experiment and
+        every queue (experiment_finished fires once, when none remain).
+        Never after hardware shutdown: a worker that outlives a forced close
+        must not command a magnet that is being shut down."""
+        if self._shut_down:
+            return
+        action = getattr(self, "post_experiment_action", None)
+        if action is not None:
+            action.apply()
+
+    @staticmethod
+    def _present_existing_window(window):
+        """Show and raise an existing window (hidden, minimised or behind).
+        False if there is none (or it was deleted), so the caller builds one."""
+        if window is None:
+            return False
+        try:
+            if window.isMinimized():
+                window.showNormal()
+            else:
+                window.show()
+            window.raise_()
+            window.activateWindow()
+        except RuntimeError:  # the C++ window is gone
+            return False
+        return True
+
     def _relay_zero_field_vector(self, x_mT, y_mT, z_mT):
         if self.magnet_window is not None:
             self.magnet_window.update_field_display(x_mT, y_mT, z_mT)
@@ -515,6 +568,11 @@ class MainWindow(QMainWindow):
         self._force_close = False         # wait timed out; close regardless
         self._shut_down = False           # hardware shutdown already done
         self._close_timeout_timer = None
+        # A close waiting for finished runs' threads to exit (see
+        # _finishing_worker_threads()). When the grace runs out the close is
+        # retried, and live threads then count as running scans again.
+        self._finish_grace_timer = None
+        self._finish_grace_expired = False
 
     def _register_worker_thread(self, window):
         thread = window.worker_thread()
@@ -527,6 +585,72 @@ class MainWindow(QMainWindow):
 
     def _on_worker_thread_finished(self):
         self._worker_threads.pop(self.sender(), None)
+
+    def _prune_exited_worker_threads(self):
+        """Drop threads that have exited but whose finished signal has not
+        been delivered yet (or whose QThread was already deleted)."""
+        for thread in list(self._worker_threads):
+            try:
+                exited = thread.isFinished()
+            except RuntimeError:  # deleteLater'd: it had finished
+                exited = True
+            if exited:
+                self._worker_threads.pop(thread, None)
+
+    def _finishing_worker_threads(self):
+        """Live worker threads whose run has already ended.
+
+        A window emits run_finished (dropping out of _running_experiments)
+        as soon as its worker reports finished, stopped or error, but the
+        thread exits a little later (the Zero Field worker still writes its
+        timing file). Such a thread is not a running scan. Returns those
+        threads, or None if any live thread belongs to a running experiment.
+        """
+        finishing = []
+        for thread, window in self._worker_threads.items():
+            if window in self._running_experiments:
+                return None
+            finishing.append(thread)
+        return finishing
+
+    def _wait_for_finishing_workers(self, threads):
+        """Retry the close once *threads* have exited, or when the grace
+        period ends, without blocking the GUI thread."""
+        self.statusBar().showMessage("Finishing the last scan — closing shortly…")
+        for thread in threads:
+            try:
+                # After the registry slot, so it sees the registry updated.
+                thread.finished.connect(self._on_finishing_worker_exited)
+            except RuntimeError:
+                pass
+        self._finish_grace_timer = QTimer(self)
+        self._finish_grace_timer.setSingleShot(True)
+        self._finish_grace_timer.timeout.connect(self._on_finish_grace_timeout)
+        self._finish_grace_timer.start(_FINISHING_WORKER_GRACE_MS)
+
+    def _end_finish_grace(self):
+        if self._finish_grace_timer is not None:
+            self._finish_grace_timer.stop()
+            self._finish_grace_timer = None
+        self.statusBar().clearMessage()
+
+    def _on_finishing_worker_exited(self):
+        if self._finish_grace_timer is None or self._shut_down:
+            return
+        if self._worker_threads:
+            return
+        self._end_finish_grace()
+        self.close()
+
+    def _on_finish_grace_timeout(self):
+        if self._finish_grace_timer is None or self._shut_down:
+            return
+        self._end_finish_grace()
+        self._finish_grace_expired = True
+        try:
+            self.close()
+        finally:
+            self._finish_grace_expired = False
 
     def _active_queue_windows(self):
         """Experiment windows whose run queue is active, including between
@@ -984,13 +1108,10 @@ class MainWindow(QMainWindow):
 
     def open_odmr_window(self):
 
-        # If ODMR window is already open, bring it to front
-        if (
-            self.odmr_window is not None
-            and self.odmr_window.isVisible()
-        ):
-            self.odmr_window.raise_()
-            self.odmr_window.activateWindow()
+        # Reuse the existing window, even hidden (closing an idle window
+        # only hides it) or minimised: a second instance would compete for
+        # the same hardware, and must never exist while a scan runs.
+        if self._present_existing_window(self.odmr_window):
             return
 
         self.odmr_window = ODMRWindow(
@@ -1034,13 +1155,8 @@ class MainWindow(QMainWindow):
 
     def open_zero_field_window(self):
 
-        if (
-            hasattr(self, "zero_field_window")
-            and self.zero_field_window is not None
-            and self.zero_field_window.isVisible()
-        ):
-            self.zero_field_window.raise_()
-            self.zero_field_window.activateWindow()
+        # Same rule as open_odmr_window(): one instance, shown again.
+        if self._present_existing_window(getattr(self, "zero_field_window", None)):
             return
 
         self.zero_field_window = ZeroFieldWindow(
@@ -1077,6 +1193,27 @@ class MainWindow(QMainWindow):
         if self._shut_down:
             event.accept()
             return
+
+        if self._finish_grace_timer is not None:
+            # Already waiting for a finished run's thread to exit.
+            event.ignore()
+            return
+
+        self._prune_exited_worker_threads()
+        if (
+            self._worker_threads
+            and not self._active_queue_windows()
+            and not (self._closing_after_stop or self._force_close
+                     or self._finish_grace_expired)
+        ):
+            finishing = self._finishing_worker_threads()
+            if finishing:
+                # Every run has already ended; only its thread is still
+                # exiting. Wait briefly for it instead of asking about a
+                # "running" scan; the close is retried by itself.
+                event.ignore()
+                self._wait_for_finishing_workers(finishing)
+                return
 
         # Gatekeeper: never shut hardware down under a live worker thread.
         # A Zero Field run queue between runs has no thread but is still a
@@ -1213,10 +1350,68 @@ def main():
     style.apply_app_style(app)
     enable_state_persistence()
 
-    win = MainWindow(sim=args.sim)
-    win.show()
+    windows = []
+    install_fatal_error_hook(lambda: windows[0] if windows else None)
+    try:
+        win = MainWindow(sim=args.sim)
+        windows.append(win)
+        win.show()
+        exit_code = app.exec()
+    finally:
+        # The normal Exit path has already shut the hardware down. Any other
+        # way out of the event loop (app.quit(), an exception) releases it
+        # here; MainWindow's own constructor releases it if it fails.
+        if windows:
+            release_hardware(windows[0])
 
-    sys.exit(app.exec())
+    sys.exit(exit_code)
+
+
+def release_hardware(window, timeout_s=_FATAL_ERROR_SHUTDOWN_TIMEOUT_S):
+    """Shut the hardware down unless the window already did. Bounded:
+    returns after *timeout_s* even if a device does not answer."""
+    if window is None or getattr(window, "_shut_down", True):
+        return
+    window._shut_down = True
+    finished = call_with_timeout(
+        window.hw_manager.shutdown, timeout_s, "hardware shutdown")
+    if not finished:
+        LOGGER.error("Hardware shutdown did not finish within %.0f s", timeout_s)
+
+
+def install_fatal_error_hook(window_getter):
+    """Release the hardware when a fatal error is about to end the app.
+
+    With Python's default sys.excepthook, PyQt6 ends the process with
+    qFatal() -> abort() when an exception escapes some slots (plain
+    signal/timer slots; others only print the traceback and carry on). An
+    abort runs no finally/atexit code, so the magnet, supplies and Pulse
+    Streamer used to be left as they were. sys.excepthook is deliberately
+    not replaced (that would change which errors end the app); instead a Qt
+    message handler sees the fatal message, shuts the hardware down
+    (bounded), and returns, and Qt aborts exactly as before. Other Qt
+    messages are written to stderr as Qt's default handler does.
+    """
+    from PyQt6.QtCore import QtMsgType, qInstallMessageHandler
+
+    state = {"handling": False}
+
+    def handler(mode, _context, message):
+        sys.stderr.write(f"{message}\n")
+        sys.stderr.flush()
+        if mode != QtMsgType.QtFatalMsg or state["handling"]:
+            return
+        state["handling"] = True
+        LOGGER.critical("Fatal error; releasing hardware before the app ends")
+        try:
+            release_hardware(window_getter())
+        except Exception:
+            LOGGER.exception("Hardware release after a fatal error failed")
+        sys.stdout.flush()
+        sys.stderr.flush()
+
+    qInstallMessageHandler(handler)
+    return handler
 
 
 if __name__ == "__main__":

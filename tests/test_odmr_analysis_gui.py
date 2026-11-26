@@ -917,6 +917,7 @@ class _ODMRLaunchMainWindowHarness(QMainWindow):
     """Use MainWindow launch methods without constructing or touching hardware."""
 
     open_odmr_window = MainWindow.open_odmr_window
+    _present_existing_window = staticmethod(MainWindow._present_existing_window)
     open_odmr_analysis_window = MainWindow.open_odmr_analysis_window
     _odmr_analysis_window_destroyed = MainWindow._odmr_analysis_window_destroyed
 

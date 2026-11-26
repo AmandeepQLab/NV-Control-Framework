@@ -13,6 +13,12 @@ Author:
 """
 from hardware.magnet.magnet import POSITIVE, NEGATIVE
 from gui import style
+from gui.post_experiment_action import (
+    POST_EXPERIMENT_CHOICES,
+    POST_EXPERIMENT_ELECTRICAL_OFF,
+    POST_EXPERIMENT_FIELD_ZERO,
+    PostExperimentMagnetAction,
+)
 try:
     from PyQt6.QtWidgets import (  # type: ignore[import]
         QMainWindow,
@@ -73,9 +79,14 @@ except ImportError:
 _MT_TO_GAUSS = 10.0
 _GAUSS_TO_MT = 0.1
 
-# Post-experiment magnet actions (see on_experiment_finished()).
-POST_EXPERIMENT_FIELD_ZERO = "Field zero at diamond"
-POST_EXPERIMENT_ELECTRICAL_OFF = "Electrical off"
+# Post-experiment magnet actions: POST_EXPERIMENT_FIELD_ZERO /
+# POST_EXPERIMENT_ELECTRICAL_OFF, imported above from
+# gui/post_experiment_action.py (re-exported here for existing imports).
+__all__ = [
+    "MagnetControlWindow",
+    "POST_EXPERIMENT_ELECTRICAL_OFF",
+    "POST_EXPERIMENT_FIELD_ZERO",
+]
 
 _SWEPT_OVERRIDE_WARNING = (
     "This experiment is actively sweeping the magnet field. "
@@ -99,12 +110,22 @@ class MagnetControlWindow(QMainWindow):
     # INITIALIZATION
     # =====================================================
 
-    def __init__(self, hardware):
+    def __init__(self, hardware, post_experiment_action=None):
 
         super().__init__()
 
         self.hardware = hardware
         self.magnet = hardware["magnet"]
+
+        # The app-wide post-experiment setting. MainWindow passes its own
+        # and applies it itself on every experiment_finished, so it runs
+        # even if this window was never opened; this window then only
+        # shows/changes it. Built standalone (tests, scripts), the window
+        # owns one and applies it in on_experiment_finished() as before.
+        self._owns_post_experiment_action = post_experiment_action is None
+        if post_experiment_action is None:
+            post_experiment_action = PostExperimentMagnetAction(self.magnet, parent=self)
+        self.post_experiment_action = post_experiment_action
 
         self.setWindowTitle("Magnet Control")
         self.resize(650, 500)
@@ -179,13 +200,16 @@ class MagnetControlWindow(QMainWindow):
 
         post_layout = QHBoxLayout()
         self.post_experiment_combo = QComboBox()
-        self.post_experiment_combo.addItems(
-            [POST_EXPERIMENT_FIELD_ZERO, POST_EXPERIMENT_ELECTRICAL_OFF]
+        self.post_experiment_combo.addItems(list(POST_EXPERIMENT_CHOICES))
+        self.post_experiment_combo.setCurrentText(
+            self.post_experiment_action.action()
         )
-        self.post_experiment_combo.setCurrentText(POST_EXPERIMENT_FIELD_ZERO)
         self.post_experiment_combo.setToolTip(
-            "Applies to static-field experiments (e.g. ODMR). After a Zero Field "
-            "scan the magnet is always turned off by the experiment itself."
+            "What the magnet does when an experiment or run queue ends, if the "
+            "coils are on: calibrated 0 G at the diamond, or coils off. "
+            "Applies whether or not this window is open. Matters for "
+            "static-field experiments (e.g. ODMR); after a Zero Field scan the "
+            "magnet is always turned off by the experiment itself."
         )
         post_layout.addWidget(_tipped("After experiment:", self.post_experiment_combo))
         post_layout.addWidget(self.post_experiment_combo)
@@ -417,6 +441,15 @@ class MagnetControlWindow(QMainWindow):
             self._on_override_toggled
         )
 
+        # Combo <-> the shared post-experiment setting, both ways.
+        self.post_experiment_combo.currentTextChanged.connect(
+            self.post_experiment_action.set_action
+        )
+        self.post_experiment_action.action_changed.connect(
+            self._show_post_experiment_action
+        )
+        self.post_experiment_action.applied.connect(self.status_label.setText)
+
     # =====================================================
     # MAGNET POWER
     # =====================================================
@@ -568,26 +601,24 @@ class MagnetControlWindow(QMainWindow):
     def _run_post_experiment_action(self):
         """Apply the selected post-experiment state, if the magnet is on.
 
+        Only when this window owns the setting (built standalone). Under
+        MainWindow the action is applied by MainWindow itself, before this
+        window's on_experiment_finished(), and its status text still
+        reaches this window's status line through the applied signal.
         Skipped silently when the magnet is not enabled -- including after a
         Zero Field scan, whose own cleanup already disabled it.
         """
-        if not self.magnet.is_enabled():
-            return
-        action = self.post_experiment_combo.currentText()
-        try:
-            if action == POST_EXPERIMENT_ELECTRICAL_OFF:
-                self.magnet.disable()
-                self.status_label.setText(
-                    "After experiment: magnet de-energized, outputs off."
-                )
-            else:
-                self.magnet.set_vector(bx=0.0, by=0.0, bz=0.0)
-                self.status_label.setText(
-                    "After experiment: calibrated 0 G commanded on all axes; "
-                    "compensation currents may be nonzero."
-                )
-        except Exception as err:
-            self.status_label.setText(f"After-experiment action failed: {err}")
+        if self._owns_post_experiment_action:
+            self.post_experiment_action.magnet = self.magnet
+            self.post_experiment_action.apply()
+
+    def _show_post_experiment_action(self, action):
+        if self.post_experiment_combo.currentText() != action:
+            self.post_experiment_combo.blockSignals(True)
+            try:
+                self.post_experiment_combo.setCurrentText(action)
+            finally:
+                self.post_experiment_combo.blockSignals(False)
 
     def update_field_display(self, x_mT, y_mT, z_mT):
         """Show a running Zero Field scan's commanded vector, read-only.
