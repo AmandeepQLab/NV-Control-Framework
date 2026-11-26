@@ -1,5 +1,9 @@
+import logging
 import json
 
+
+
+LOGGER = logging.getLogger(__name__)
 
 class ConfigManager:
 
@@ -19,9 +23,7 @@ class ConfigManager:
 
             self.config = json.load(f)
 
-        print(
-            f"\nLoaded config:\n{self.config_path}"
-        )
+        LOGGER.debug("Loaded config: %s", self.config_path)
 
     # =====================================================
     # GET

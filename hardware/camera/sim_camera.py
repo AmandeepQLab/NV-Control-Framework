@@ -263,7 +263,7 @@ class SimCamera:
 
         self.configure_camera()
 
-        print("\n[SimCamera] Connected (simulated).")
+        LOGGER.debug("Connected (simulated).")
 
     def configure_camera(self):
         """No SDK-level configuration needed for a synthetic camera."""

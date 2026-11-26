@@ -1,5 +1,9 @@
+import logging
 import pyvisa
 
+
+
+LOGGER = logging.getLogger(__name__)
 
 class SG386:
 
@@ -21,7 +25,8 @@ class SG386:
         self.inst.timeout = 5000
 
         idn = self.inst.query("*IDN?")
-        print("[SG386] Connected:", idn.strip())
+        self.idn = idn.strip()
+        LOGGER.debug("Connected: %s", self.idn)
         
     def set_frequency(self, frequency_hz):
         self.frequency = frequency_hz

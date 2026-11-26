@@ -1,5 +1,9 @@
+import logging
 import time
 
+
+
+LOGGER = logging.getLogger(__name__)
 
 class SimPulseStreamer:
 
@@ -19,7 +23,7 @@ class SimPulseStreamer:
 
     def connect(self):
         self.connected = True
-        print(f"[Sim Pulse Streamer] Connected (simulated){f' to {self.ip_address}' if self.ip_address else ''}")
+        LOGGER.debug("Connected (simulated)%s", f" to {self.ip_address}" if self.ip_address else "")
 
     def load_sequence(self, sequence):
         sequence.validate()
@@ -50,18 +54,18 @@ class SimPulseStreamer:
 
         events = self.compile_sequence()
 
-        print("\n[Sim Pulse Streamer START]")
-
         t0 = events[0][0] if events else 0
+        lines = []
 
         for t, state, ch in events:
 
             dt = t - t0
             time.sleep(0.01)  # slow simulation for visibility
 
-            print(f"t={dt:6d} ns | CH {ch} {state}")
+            lines.append(f"t={dt:6d} ns | CH {ch} {state}")
 
-        print("[Sim Pulse Streamer END]\n")
+        # Once per triggered frame: session log only.
+        LOGGER.debug("Sequence played (simulated):\n%s", "\n".join(lines))
 
     def reset_outputs(self, duration_ns=1000, preserve_persistent=True):
         """
@@ -86,9 +90,8 @@ class SimPulseStreamer:
             for ch in channels
         }
 
-        print(f"[Sim Pulse Streamer] reset_outputs(duration_ns={duration_ns}, "
-              f"preserve_persistent={preserve_persistent}) -> "
-              f"{self.last_reset_channels} (simulated)")
+        LOGGER.debug("reset_outputs(duration_ns=%s, preserve_persistent=%s) -> %s (simulated)",
+                     duration_ns, preserve_persistent, self.last_reset_channels)
 
     def set_digital_output(self, channel, state):
         """
@@ -100,7 +103,7 @@ class SimPulseStreamer:
         """
         Synchronize cached persistent digital outputs with hardware (simulated).
         """
-        print(f"[Sim Pulse Streamer] sync_outputs -> {self.persistent_outputs} (simulated)")
+        LOGGER.debug("sync_outputs -> %s (simulated)", self.persistent_outputs)
 
     def get_digital_output(self, channel):
         """

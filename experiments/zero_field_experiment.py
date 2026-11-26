@@ -821,7 +821,7 @@ class ZeroFieldExperiment(ScanExperiment):
         try:
             with exclusive_camera_access(self.camera):
                 self.camera.set_roi(self.acquisition_roi)
-                LOGGER.info("Zero Field acquisition ROI: %s", self.acquisition_roi)
+                LOGGER.debug("Zero Field acquisition ROI: %s", self.acquisition_roi)
 
                 # Enabling here, inside the exclusive_camera_access lease,
                 # is what keeps live-view frames out of the camera-side
@@ -889,7 +889,7 @@ class ZeroFieldExperiment(ScanExperiment):
                         stream_path = self._last_scan_stream_path
                         self._finalize_image_cube_metadata(acquired_cube)
                         self._validate_image_cube(acquired_cube)
-                        LOGGER.info("Scan %d/%d acquired.", scan_index, scan_count)
+                        LOGGER.debug("Scan %d/%d acquired.", scan_index, scan_count)
 
                         # A cooperative stop can leave acquired_cube with some but
                         # not all field_points frames -- that's an intentional
@@ -936,7 +936,7 @@ class ZeroFieldExperiment(ScanExperiment):
                                 averaged_cube, ordered_cube, reversed_sweep
                             )
                         del ordered_cube
-                        LOGGER.info("Running average updated.")
+                        LOGGER.debug("Running average updated.")
 
                         if stream_path is not None and self.stream_path_is_output:
                             # This file IS the run's deliverable (a single-scan run
@@ -958,7 +958,7 @@ class ZeroFieldExperiment(ScanExperiment):
                                     "Saving raw Zero Field scans requires a raw scan saver."
                                 )
                             self.raw_scan_filenames.append(str(filename))
-                            LOGGER.info("Raw scan saved: %s", filename)
+                            LOGGER.debug("Raw scan saved: %s", filename)
                         elif stream_path is not None:
                             # Streaming always writes a per-scan file for crash
                             # safety regardless of save_raw_scans; if the user
@@ -977,7 +977,7 @@ class ZeroFieldExperiment(ScanExperiment):
                         if acquired_cube is not averaged_cube:
                             self.image_cube = None
                             del acquired_cube
-                        LOGGER.info("Scan memory released.")
+                        LOGGER.debug("Scan memory released.")
 
                     if averaged_cube is not None:
                         self._set_averaging_metadata(averaged_cube, completed_scans)

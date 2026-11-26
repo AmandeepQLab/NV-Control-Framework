@@ -57,6 +57,7 @@ from gui.display_settings import (
     select_colormap,
 )
 from utils.camera_diagnostics import log_event
+from framework.logging_setup import log_qt_message, setup_logging
 
 
 LOGGER = logging.getLogger(__name__)
@@ -208,12 +209,10 @@ class MainWindow(ConfirmCloseMixin, QMainWindow):
             # it must never prevent the app from starting. Fall back to
             # the previous hardcoded range and say so loudly.
             exposure_min_s, exposure_max_s = 0.001, 10.0
-            print(
-                f"[MainWindow] camera.get_exposure_limits() failed "
-                f"({error!r}); falling back to the default "
-                f"{exposure_min_s * 1000:.3f}-{exposure_max_s * 1000:.0f} ms "
-                f"exposure range."
-            )
+            LOGGER.warning(
+                "camera.get_exposure_limits() failed (%r); falling back to the "
+                "default %.3f-%.0f ms exposure range.",
+                error, exposure_min_s * 1000, exposure_max_s * 1000)
 
         self.exposure_spin = QDoubleSpinBox()
         self.exposure_spin.setRange(exposure_min_s * 1000.0, exposure_max_s * 1000.0)
@@ -1380,7 +1379,17 @@ def main():
         default=False,
         help="Launch with simulated hardware instead of connecting to real instruments.",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        default=False,
+        help="Show DEBUG messages on the console too (they always go to the session log).",
+    )
     args, _ = parser.parse_known_args()
+
+    # Console: short INFO lines; session log file: everything (see
+    # framework/logging_setup.py). Before anything connects.
+    setup_logging(verbose=args.verbose)
 
     app = QApplication(sys.argv)
     # Normal launch only: the shared look, and remembered open/closed
@@ -1428,16 +1437,21 @@ def install_fatal_error_hook(window_getter):
     Streamer used to be left as they were. sys.excepthook is deliberately
     not replaced (that would change which errors end the app); instead a Qt
     message handler sees the fatal message, shuts the hardware down
-    (bounded), and returns, and Qt aborts exactly as before. Other Qt
-    messages are written to stderr as Qt's default handler does.
+    (bounded), and returns, and Qt aborts exactly as before. Every Qt
+    message, fatal included, goes into the logging setup first
+    (framework/logging_setup.py::log_qt_message(): debug/info -> DEBUG,
+    warning -> WARNING, critical/fatal -> ERROR).
     """
     from PyQt6.QtCore import QtMsgType, qInstallMessageHandler
 
     state = {"handling": False}
 
-    def handler(mode, _context, message):
-        sys.stderr.write(f"{message}\n")
-        sys.stderr.flush()
+    def handler(mode, context, message):
+        try:
+            log_qt_message(mode, context, message)
+        except Exception:  # never lose a Qt message, never raise into Qt
+            sys.stderr.write(f"{message}\n")
+            sys.stderr.flush()
         if mode != QtMsgType.QtFatalMsg or state["handling"]:
             return
         state["handling"] = True

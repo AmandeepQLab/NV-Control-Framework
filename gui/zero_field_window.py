@@ -3,6 +3,7 @@
 from pathlib import Path
 import logging
 import shutil
+import time
 from datetime import datetime
 
 import numpy as np
@@ -47,6 +48,7 @@ from framework.analysis.zero_field import mean_fluorescence_vs_field
 from framework.fluorescence import mean_fluorescence
 from framework.paths import ensure_writable_directory
 from utils.camera_diagnostics import log_event
+from framework.logging_setup import format_duration
 
 
 LOGGER = logging.getLogger(__name__)
@@ -359,7 +361,7 @@ class ZeroFieldWindow(ConfirmCloseMixin, QMainWindow):
 
         acquisition_state = self.acquisition_state_getter()
         acquisition_roi = acquisition_state.acquisition_roi
-        LOGGER.info("Using acquisition ROI from Main Window: %s", acquisition_roi)
+        LOGGER.debug("Using acquisition ROI from Main Window: %s", acquisition_roi)
 
         self.image_cube = None
         self.scan_fields = []
@@ -449,9 +451,44 @@ class ZeroFieldWindow(ConfirmCloseMixin, QMainWindow):
         # Before the thread starts, so the magnet lock is in place before
         # the worker can send any magnet command.
         self._lock_held = True
+        self._run_t0 = time.monotonic()
+        self._last_error = None
+        LOGGER.info("%s", self._run_start_line(config))
         self.run_started.emit()
         self.thread.start()
         return None
+
+    # ---- console lines (details stay in the session log) -------------
+
+    def _run_start_line(self, config):
+        scans = config.get("num_scans", 1) if config.get("averaging_enabled") else 1
+        where = (f"output {self.output_path.name}" if self.output_path is not None
+                 else "not saved (saving off)")
+        queue = ""
+        if getattr(self, "_queue_active", False) and self._queue_current is not None:
+            total = len(self._queue_started) + sum(
+                e.status == queue_model.PENDING for e in self.queue_entries)
+            queue = f" (queue run {len(self._queue_started)} of {total})"
+        return (f"Zero Field run started{queue}: {self._run_summary(config)}, "
+                f"{scans} scan{'s' if scans != 1 else ''}, {where}")
+
+    def _log_run_end(self, image_cube, stopped):
+        t0 = getattr(self, "_run_t0", None)
+        duration = format_duration(time.monotonic() - t0) if t0 is not None else "?"
+        config = self.last_run_config or {}
+        error = getattr(self, "_last_error", None)
+        if image_cube is None:
+            LOGGER.error("Zero Field run failed after %s: %s", duration,
+                         error or "the run raised an error")
+            return
+        planes = 0 if image_cube.data is None else int(image_cube.data.shape[0])
+        if self.output_path is not None:
+            saved = f"saved to {self.output_path}"
+        else:
+            saved = "not saved (use Save Data to keep it)"
+        LOGGER.info("Zero Field run %s: %d of %s points, %s, %s",
+                    "stopped" if stopped else "finished", planes,
+                    config.get("field_points", "?"), duration, saved)
 
     def _preflight_field_range(self, config):
         """Return False (after telling the user) if the sweep can't be reached.
@@ -675,6 +712,10 @@ class ZeroFieldWindow(ConfirmCloseMixin, QMainWindow):
     def scan_finished(self, image_cube, _fields, _signals, stopped):
         self.image_cube = image_cube
         self.zero_field_running = False
+        try:
+            self._log_run_end(image_cube, stopped)
+        except Exception:
+            LOGGER.exception("Could not log the run's end line")
         if self._close_after_stop:
             # The user confirmed "Stop and Close" while the run was going.
             self._close_after_stop = False
@@ -742,6 +783,8 @@ class ZeroFieldWindow(ConfirmCloseMixin, QMainWindow):
         self._save_off_warning_shown = True
 
     def show_error(self, message):
+        # For the run's end line (scan_finished() follows).
+        self._last_error = " ".join(str(message).split())
         self.zero_field_running = False
         self.widget.set_running_state(False)
         self.widget.status_label.setText("Status: Error")
@@ -1083,7 +1126,7 @@ class ZeroFieldWindow(ConfirmCloseMixin, QMainWindow):
         except OSError:
             LOGGER.exception("Could not create the Zero Field queue log in %s", directory)
             return None
-        LOGGER.info("Zero Field queue log: %s", log.path)
+        LOGGER.debug("Zero Field queue log: %s", log.path)
         return log
 
     def _start_next_queue_entry(self):
@@ -1285,6 +1328,9 @@ class ZeroFieldWindow(ConfirmCloseMixin, QMainWindow):
         if self._queue_stop_requested:
             text += " (queue stopped)"
         self.queue_widget.queue_status_label.setText(text)
+        log_note = f" (log: {self._queue_log.path})" if self._queue_log is not None else ""
+        LOGGER.log(logging.WARNING if counts[queue_model.FAILED] else logging.INFO,
+                   "%s%s", text, log_note)
         if self._queue_log is not None:
             self.queue_widget.queue_status_label.setToolTip(f"Log: {self._queue_log.path}")
         if release_lock and self._lock_held:

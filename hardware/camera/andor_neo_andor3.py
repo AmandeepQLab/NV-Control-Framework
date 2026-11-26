@@ -423,14 +423,14 @@ class AndorNeoAndor3:
 
     def connect(self):
 
-        print("\nConnecting to Andor Neo using andor3...\n")
+        LOGGER.debug("Connecting to Andor Neo using andor3...")
 
         self.cam = Andor3()
         self.cam.open(0)
 
         self.configure_camera()
 
-        print("Connected to Andor Neo using andor3.")
+        LOGGER.debug("Connected to Andor Neo using andor3.")
 
     # =====================================================
     # CONFIGURE CAMERA
@@ -647,7 +647,7 @@ class AndorNeoAndor3:
             self.cam.setInt("AOITop", 1)
             self.cam.setEnumIndex("AOIBinning", bin_map[binning])
             self.binning = binning
-            LOGGER.info("Andor AOI binning set to %dx%d", binning, binning)
+            LOGGER.debug("Andor AOI binning set to %dx%d", binning, binning)
 
         except Exception:
             LOGGER.exception("Failed to set Andor AOI binning")
@@ -790,8 +790,7 @@ class AndorNeoAndor3:
 
                 except Exception as e:
 
-                    print("Andor stream error:")
-                    print(e)
+                    LOGGER.error("Andor stream error: %s", e)
 
                 self._stream_controller.wait(0.01)
         finally:

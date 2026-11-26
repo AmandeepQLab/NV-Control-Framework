@@ -12,10 +12,14 @@ Author:
 =====================================================
 """
 
+import logging
 from hardware.power_supply.base_power_supply import (
     BasePowerSupply,
 )
 
+
+
+LOGGER = logging.getLogger(__name__)
 
 class SimPowerSupply(BasePowerSupply):
 
@@ -39,13 +43,13 @@ class SimPowerSupply(BasePowerSupply):
 
         self.connected = True
 
-        print(f"{self.name}: connected")
+        LOGGER.debug("%s: connected (simulated)", self.name)
 
     def disconnect(self):
 
         self.connected = False
 
-        print(f"{self.name}: disconnected")
+        LOGGER.debug("%s: disconnected (simulated)", self.name)
 
     # =================================================
     # OUTPUT
@@ -55,13 +59,13 @@ class SimPowerSupply(BasePowerSupply):
 
         self.output_enabled = True
 
-        print(f"{self.name}: output ON")
+        LOGGER.debug("%s: output ON", self.name)
 
     def output_off(self):
 
         self.output_enabled = False
 
-        print(f"{self.name}: output OFF")
+        LOGGER.debug("%s: output OFF", self.name)
 
     # =================================================
     # PROGRAMMING
@@ -71,19 +75,13 @@ class SimPowerSupply(BasePowerSupply):
 
         self.voltage = voltage
 
-        print(
-            f"{self.name}: voltage = "
-            f"{voltage:.3f} V"
-        )
+        LOGGER.debug("%s: voltage = %.3f V", self.name, voltage)
 
     def set_current(self, current):
 
         self.current = current
 
-        print(
-            f"{self.name}: current = "
-            f"{current:.3f} A"
-        )
+        LOGGER.debug("%s: current = %.3f A", self.name, current)
 
     # =================================================
     # MEASUREMENTS

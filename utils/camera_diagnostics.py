@@ -3,12 +3,15 @@
 import inspect
 import json
 import logging
+import os
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
 
 LOG_PATH = Path(__file__).resolve().parents[1] / "data" / "camera_diagnostics.log"
+# Overrides LOG_PATH (tests point it at a temporary directory).
+LOG_PATH_ENV = "NV_CONTROL_CAMERA_DIAGNOSTICS_LOG"
 _LOGGER_NAME = "nv_control.camera_diagnostics"
 
 
@@ -19,8 +22,9 @@ def _logger():
 
     logger.setLevel(logging.INFO)
     logger.propagate = False
-    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    path = Path(os.environ.get(LOG_PATH_ENV) or LOG_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(path, encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(message)s"))
     logger.addHandler(handler)
     return logger

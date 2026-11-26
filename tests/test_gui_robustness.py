@@ -525,7 +525,7 @@ class ExitRightAfterRunTests(unittest.TestCase):
                    if line.startswith("EXIT-TEST:")]
         detail = "\n".join(markers) + "\n" + result.stderr[-3000:]
         self.assertEqual(result.returncode, 0, detail)
-        self.assertIn("Hardware shutdown complete.", result.stdout, detail)
+        self.assertIn("Shutdown complete in", result.stdout, detail)
         self.assertIn("EXIT-TEST: dialogs []", markers, detail)  # nothing blocked
         self.assertIn("EXIT-TEST: confirmations ['Exit NV Control']", markers, detail)
         self.assertNotIn("Scan in progress", result.stdout, detail)

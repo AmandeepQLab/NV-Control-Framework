@@ -16,3 +16,6 @@ data/*
 !data/data_manager.py
 /*.csv
 PROJECT_STATUS_REPORT.md
+
+# Session logs (framework/logging_setup.py)
+logs/

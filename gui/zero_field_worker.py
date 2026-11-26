@@ -191,7 +191,7 @@ class ZeroFieldWorker(QObject):
                     _atomic_save_hdf5(cube, self.output_path)
                 else:
                     cube.save(self.output_path)
-                LOGGER.info("Average ImageCube saved: %s", self.output_path)
+                LOGGER.debug("Average ImageCube saved: %s", self.output_path)
             self.finished_signal.emit(
                 cube,
                 np.asarray(self._fields),
@@ -344,7 +344,7 @@ class ZeroFieldWorker(QObject):
             # the final path: that data is already durable on disk
             # incrementally, and this scan is the whole run anyway.
             _atomic_save_hdf5(image_cube, self.output_path)
-            LOGGER.info("Running average persisted: %s", self.output_path)
+            LOGGER.debug("Running average persisted: %s", self.output_path)
         self.scan_completed_signal.emit(image_cube, current, total)
 
     def _output_path_as_stream_target(self, scan_index):

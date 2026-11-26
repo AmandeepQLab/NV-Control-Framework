@@ -353,7 +353,8 @@ class StartupRfOffTests(unittest.TestCase):
         mw.connect()
         mw.rf_on()
         manager.hardware = {"microwave": mw}
-        with self.assertLogs("hardware.hardware_manager", level="INFO") as logs:
+        # DEBUG: the startup summary shows "RF off" on the console.
+        with self.assertLogs("hardware.hardware_manager", level="DEBUG") as logs:
             self.assertTrue(manager.switch_rf_off_at_startup())
         self.assertFalse(mw.is_rf_on())
         self.assertIn("switched off at startup", " | ".join(logs.output))

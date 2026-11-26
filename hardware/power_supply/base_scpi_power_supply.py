@@ -12,10 +12,14 @@ Author:
 =====================================================
 """
 
+import logging
 from hardware.interfaces import SerialDevice
 
 from .base_power_supply import BasePowerSupply
 
+
+
+LOGGER = logging.getLogger(__name__)
 
 class BaseSCPIPowerSupply(BasePowerSupply):
 
@@ -55,9 +59,7 @@ class BaseSCPIPowerSupply(BasePowerSupply):
 
         self.idn = self.identify()
 
-        print(
-            f"[{self.name}] Connected: {self.idn}"
-        )
+        LOGGER.debug("[%s] Connected: %s", self.name, self.idn)
 
     # =================================================
     # COMMUNICATION
@@ -133,4 +135,4 @@ class BaseSCPIPowerSupply(BasePowerSupply):
 
             self.connected = False
 
-            print(f"[{self.name}] Disconnected")
+            LOGGER.debug("[%s] Disconnected", self.name)

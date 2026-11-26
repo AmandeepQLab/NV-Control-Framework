@@ -1,9 +1,13 @@
+import logging
 import json
 import numpy as np
 from pathlib import Path
 from datetime import datetime
 
 
+
+
+LOGGER = logging.getLogger(__name__)
 
 class DataManager:
 
@@ -45,7 +49,7 @@ class DataManager:
         with open(folder / "config.json", "w") as f:
             json.dump(config, f, indent=4)
 
-        print(f"[DataManager] ODMR saved to: {folder}")
+        LOGGER.debug("ODMR saved to: %s", folder)
 
         return folder
 

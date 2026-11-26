@@ -119,7 +119,7 @@ class ProcessExitTests(unittest.TestCase):
                    if line.startswith("EXIT-TEST:")]
         detail = "\n".join(markers) + "\n" + result.stderr[-2000:]
         self.assertEqual(result.returncode, 0, detail)
-        self.assertIn("Hardware shutdown complete.", result.stdout, detail)
+        self.assertIn("Shutdown complete in", result.stdout, detail)
         self.assertEqual(len(markers), 1, detail)
         self.assertEqual(
             markers[0],

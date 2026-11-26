@@ -11,8 +11,11 @@ from experiments.odmr_experiment import (
     magnet_field_problem,
     vector_entry,
 )
+import logging
 import numpy as np # type: ignore
 import time
+
+from framework.logging_setup import format_duration
 
 from PyQt6.QtWidgets import QMainWindow, QMessageBox, QDialog # type: ignore
 from PyQt6.QtCore import QThread, pyqtSignal # type: ignore
@@ -40,6 +43,8 @@ from framework.analysis.odmr_statistics import (
 )
 
 from analysis.odmr_fit import fit_single_lorentzian, fit_double_lorentzian
+
+LOGGER = logging.getLogger(__name__)
 
 
 # =====================================================
@@ -786,10 +791,48 @@ class ODMRWindow(ConfirmCloseMixin, QMainWindow):
             if getattr(self, "last_scan", None) is not None:
                 self.last_scan["saved_to"] = str(output_folder)
 
+        # getattr: tests drive odmr_finished() on lightweight stand-ins.
+        log_scan_end = getattr(self, "_log_scan_end", None)
+        if log_scan_end is not None:
+            log_scan_end()
+
         if getattr(self, "_close_after_stop", False):
             # The user confirmed "Stop and Close" while the scan ran.
             self._close_after_stop = False
             close_without_confirmation(self)
+
+    def _log_scan_end(self):
+        """One console line when a scan ends (details are in the log)."""
+        worker = getattr(self, "odmr_worker", None)
+        if worker is None:
+            return
+        freqs = getattr(worker, "freqs_sorted", None)
+        points = 0 if freqs is None else len(freqs)
+        total = getattr(worker, "n_avg", None)
+        completed = getattr(worker, "completed_averages", None)
+        try:
+            sequences = worker.sequences_streamed()
+        except Exception:
+            sequences = None
+        start = getattr(self, "scan_start_time", None)
+        duration = format_duration(time.time() - start) if start else "?"
+        scan = getattr(self, "last_scan", None) or {}
+        error = getattr(self, "_last_error", None)
+        if error:
+            outcome, level = f"failed ({error})", logging.ERROR
+        elif completed is not None and total and completed < total:
+            outcome, level = f"stopped after {completed} of {total} averages", logging.INFO
+        else:
+            outcome, level = "finished", logging.INFO
+        saved = (f"saved to {scan['saved_to']}" if scan.get("saved_to")
+                 else "not saved")
+        parts = [f"{points} points × {total} average{'s' if total != 1 else ''}"
+                 if total else f"{points} points"]
+        if sequences is not None:
+            parts.append(f"{sequences} sequences streamed")
+        parts += [duration, saved]
+        LOGGER.log(level, "ODMR scan %s: %s", outcome, ", ".join(parts))
+        self._last_error = None
 
     def _record_last_scan(self, completed, total):
         config = self.current_config or {}
@@ -809,6 +852,9 @@ class ODMRWindow(ConfirmCloseMixin, QMainWindow):
     # =====================================================
 
     def show_error(self, message):
+
+        # For the scan's end line (logged when the worker finishes).
+        self._last_error = " ".join(str(message).split())
 
         QMessageBox.critical(
             self,

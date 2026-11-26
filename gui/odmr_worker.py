@@ -14,6 +14,25 @@ from framework.image_cube import ImageCube
 LOGGER = logging.getLogger(__name__)
 
 
+
+def field_text(record):
+    """Short field description for the scan's console line, or None."""
+    if not record:
+        return None
+    mode = record.get("magnet_field_mode")
+    vector = record.get("magnet_commanded_vector_gauss")
+    vector_text = (f"({', '.join(f'{v:.4g}' for v in vector)}) G"
+                   if vector is not None else "")
+    if mode == "field_zero":
+        return f"calibrated zero {vector_text}".strip()
+    if mode == "custom_vector":
+        return record.get("magnet_field_description") or f"custom {vector_text}".strip()
+    if not record.get("magnet_available"):
+        return "no magnet"
+    return ("left as is (coils on)" if record.get("magnet_enabled")
+            else "left as is (coils off)")
+
+
 class ODMRWorker(QObject):
 
     point_signal = pyqtSignal(object, object)
@@ -149,6 +168,7 @@ class ODMRWorker(QObject):
             self._camera_lease.__enter__()
             self.experiment.configure_acquisition()
             self.experiment.reset_baseline_warning_state()
+            LOGGER.info("%s", self.start_line())
 
             if self._timing:
                 self.experiment.reset_timing()
@@ -319,6 +339,7 @@ class ODMRWorker(QObject):
         self.i_on_data = self.i_on_results[valid].tolist()
 
         self.freq_index += 1
+        self._log_progress()
         sweep_completed = False
         if self.freq_index >= len(self.freqs):
             if len(set(self._repeat_counts_for_average)) != 1:
@@ -341,6 +362,34 @@ class ODMRWorker(QObject):
             )
         if self.average_index >= self.n_avg:
             self._finish()
+
+    # ---- console lines (details stay in the session log) -----------------
+
+    def start_line(self):
+        config = self.config
+        freqs = self.freqs_sorted
+        repeats = config.get("repeats", 1)
+        text = (f"ODMR scan started: {freqs[0] / 1e9:.6g}–{freqs[-1] / 1e9:.6g} GHz, "
+                f"{len(freqs)} points × {self.n_avg} average{'s' if self.n_avg != 1 else ''}"
+                f" × {repeats} repeat{'s' if repeats != 1 else ''}, "
+                f"MW {config.get('mw_power_dbm', -10):.1f} dBm")
+        field = field_text(getattr(self.experiment, "magnet_field_record", None))
+        return text + (f", field: {field}" if field else "")
+
+    def _log_progress(self):
+        """INFO line at 25 %, 50 % and 75 % of all points of all averages."""
+        total = len(self.freqs) * self.n_avg
+        if total <= 0:
+            return
+        done = self.average_index * len(self.freqs) + self.freq_index
+        quarter = (4 * done) // total
+        logged = getattr(self, "_progress_quarters_logged", 0)
+        if 0 < quarter < 4 and quarter > logged:
+            self._progress_quarters_logged = quarter
+            LOGGER.info("ODMR scan %d %% (%d of %d points)", 25 * quarter, done, total)
+
+    def sequences_streamed(self):
+        return getattr(self.experiment, "sequences_streamed", 0)
 
     def _make_statistics_cube(self):
         if self.pixel_data is None:

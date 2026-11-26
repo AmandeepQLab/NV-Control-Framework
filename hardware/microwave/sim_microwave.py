@@ -13,6 +13,11 @@ Author:
 """
 
 
+import logging
+
+LOGGER = logging.getLogger(__name__)
+
+
 class SimMicrowave:
 
     # =================================================
@@ -42,7 +47,7 @@ class SimMicrowave:
 
         self.connected = True
 
-        print(f"[SimMicrowave] Connected (simulated){f' at {self.address}' if self.address else ''}")
+        LOGGER.debug("Connected (simulated)%s", f" at {self.address}" if self.address else "")
 
     def close(self):
 

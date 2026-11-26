@@ -944,6 +944,8 @@ class ODMRExperiment(ScanExperiment):
             # sequence's stray repetition can otherwise fill an
             # already-armed buffer between frames).
             pulse.run(n_runs=1)
+            # Count only (for the scan's end line); no effect on timing.
+            self.sequences_streamed = getattr(self, "sequences_streamed", 0) + 1
             if timing:
                 fire_timing["pulse_run"] = (ft0, time.perf_counter() - ft0)
 

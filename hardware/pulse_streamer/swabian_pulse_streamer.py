@@ -1,4 +1,38 @@
+import contextlib
+import io
+import logging
+import re
+
 from pulsestreamer import PulseStreamer, OutputState
+
+LOGGER = logging.getLogger(__name__)
+
+
+PROBLEM_WORDS = ("error", "fail", "warning", "not compatible", "cannot",
+                 "can't", "unable", "exception")
+
+
+def problem_lines(text):
+    """Lines of captured client output that read like a warning or error."""
+    return [line for line in (text or "").splitlines()
+            if any(word in line.lower() for word in PROBLEM_WORDS)]
+
+
+def parse_client_notice(text):
+    """(firmware, client, note) from the client's connect output.
+
+    The pulsestreamer client prints its firmware/client versions and an
+    update recommendation when it connects; nothing is changed here, the
+    text is only summarised (full text goes to the session log)."""
+    firmware = re.search(r"firmware:\s*v([\w.]+)", text)
+    client = re.search(r"Client software:\s*v([\w.]+)", text)
+    note = None
+    if "recommend updating your client software" in text:
+        note = "newer client software available, see log"
+    elif "recommend updating the firmware" in text:
+        note = "firmware update available, see log"
+    return (firmware.group(1) if firmware else None,
+            client.group(1) if client else None, note)
 
 
 class SwabianPulseStreamer:
@@ -16,10 +50,38 @@ class SwabianPulseStreamer:
             channel: False
             for channel in self.channel_map.values()
         }
+        # From the client's connect output (parse_client_notice()).
+        self.firmware_version = None
+        self.client_version = None
+        self.version_note = None
+        # close(): problems in its steps (for the shutdown summary).
+        self.close_problems = []
 
     def connect(self):
-        self.ps = PulseStreamer(self.ip_address)
-        print(f"[Swabian] Connected to {self.ip_address}")
+        # The client prints a banner and a firmware/client version notice
+        # to stdout while connecting; capture it, keep the full text in the
+        # session log, and summarise it in the startup summary.
+        captured = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(captured):
+                self.ps = PulseStreamer(self.ip_address)
+        except Exception:
+            if captured.getvalue().strip():
+                LOGGER.warning("Pulse Streamer client output before the failure:\n%s",
+                               captured.getvalue().strip())
+            raise
+        text = captured.getvalue().strip()
+        if text:
+            LOGGER.debug("Pulse Streamer client output at connect:\n%s", text)
+        # Captured is not hidden: any line that reads like a warning or an
+        # error also goes to the console (the version notice does not).
+        problems = problem_lines(text)
+        if problems:
+            LOGGER.warning("Pulse Streamer client reported at connect:\n%s",
+                           "\n".join(problems))
+        self.firmware_version, self.client_version, self.version_note = (
+            parse_client_notice(text))
+        LOGGER.debug("Connected to %s", self.ip_address)
 
     def load_sequence(self, sequence):
         sequence.validate()
@@ -112,7 +174,8 @@ class SwabianPulseStreamer:
         else:
             self.ps.stream(seq, n_runs=n_runs, final=final)
 
-        print("[Swabian] Sequence streamed to hardware")
+        # Once per triggered frame: session log only.
+        LOGGER.debug("Sequence streamed to hardware")
 
     def reset_outputs(self, duration_ns=1000, preserve_persistent=True):
         """
@@ -198,17 +261,20 @@ class SwabianPulseStreamer:
         """
         if self.ps is None:
             return
+        self.close_problems = []
         try:
             # Shutdown wants everything de-energized -- including the
             # relay -- unlike the per-frame reset_outputs() default, which
             # preserves it. See reset_outputs()'s docstring.
             self.reset_outputs(preserve_persistent=False)
         except Exception as error:
-            print(f"[Swabian] close: resetting outputs failed: {error!r}")
+            LOGGER.error("close: resetting outputs failed: %r", error)
+            self.close_problems.append(f"outputs LOW failed: {error}")
         try:
             self.ps.constant(OutputState.ZERO())
         except Exception as error:
-            print(f"[Swabian] close: stopping the sequence failed: {error!r}")
+            LOGGER.error("close: stopping the sequence failed: %r", error)
+            self.close_problems.append(f"stop failed: {error}")
         self.ps = None
         self.sequence = None
-        print("[Swabian] Closed")
+        LOGGER.debug("Closed")
