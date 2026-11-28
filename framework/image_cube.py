@@ -629,8 +629,13 @@ class ImageCubeStreamWriter:
         self._handle.flush()
 
     def _write_metadata_json(self):
+        # Rewritten in place after the first write (as merge_hdf5_metadata()
+        # does): delete-and-recreate left every old copy as unreclaimed file
+        # space -- ~9 kB per plane, which dominated a small (ROI mean) file
+        # -- and briefly left the file with no metadata dataset at all.
         if _HDF5_METADATA_JSON_KEY in self._handle:
-            del self._handle[_HDF5_METADATA_JSON_KEY]
+            self._handle[_HDF5_METADATA_JSON_KEY][()] = json.dumps(self.metadata)
+            return
         self._handle.create_dataset(
             _HDF5_METADATA_JSON_KEY,
             data=json.dumps(self.metadata),

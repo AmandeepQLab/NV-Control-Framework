@@ -47,6 +47,7 @@ from experiments.zero_field_experiment import (
 from framework.analysis.zero_field import mean_fluorescence_vs_field
 from framework.fluorescence import mean_fluorescence
 from framework.paths import ensure_writable_directory
+from framework import saved_image_data
 from utils.camera_diagnostics import log_event
 from framework.logging_setup import format_duration
 
@@ -202,6 +203,9 @@ class ZeroFieldWindow(ConfirmCloseMixin, QMainWindow):
 
         self.widget = ZeroFieldWidget()
         self.setCentralWidget(self.widget)
+        # Size estimates ("Saved image data", queue summary) use the image
+        # size the main window's ROI and binning give.
+        self.widget.set_image_shape_provider(self.estimated_image_shape)
         self.widget.set_output_directory(self.output_directory)
         self.widget.run_stop_button.clicked.connect(self.toggle_scan)
         self.widget.save_button.clicked.connect(self.save_data)
@@ -276,6 +280,21 @@ class ZeroFieldWindow(ConfirmCloseMixin, QMainWindow):
                     path = Path(__file__).resolve().parents[1] / path
                 return path
         return _DEFAULT_OUTPUT_DIRECTORY
+
+    def estimated_image_shape(self):
+        """(height, width) of the frames a run would acquire now, or None.
+        Cached values only (acquisition state, camera attributes)."""
+        try:
+            state = self.acquisition_state_getter()
+        except Exception:
+            return None
+        if state is None:
+            return None
+        return saved_image_data.acquired_image_shape(
+            getattr(state, "acquisition_roi", None),
+            getattr(state, "binning", 1),
+            self.camera,
+        )
 
     def toggle_scan(self):
         if self.zero_field_running:
@@ -469,8 +488,10 @@ class ZeroFieldWindow(ConfirmCloseMixin, QMainWindow):
             total = len(self._queue_started) + sum(
                 e.status == queue_model.PENDING for e in self.queue_entries)
             queue = f" (queue run {len(self._queue_started)} of {total})"
-        return (f"Zero Field run started{queue}: {self._run_summary(config)}, "
-                f"{scans} scan{'s' if scans != 1 else ''}, {where}")
+        # _run_summary() already names the scans of a multi-scan run.
+        return (f"Zero Field run started{queue}: {self._run_summary(config)}"
+                f"{'' if scans > 1 else ', 1 scan'}"
+                f"{queue_model.saved_image_text(config)}, {where}")
 
     def _log_run_end(self, image_cube, stopped):
         t0 = getattr(self, "_run_t0", None)
@@ -1354,7 +1375,24 @@ class ZeroFieldWindow(ConfirmCloseMixin, QMainWindow):
         text = f"Queue: idle, {count} {'entry' if count == 1 else 'entries'}"
         if 0 < pending < count:
             text += f" ({pending} pending)"
+        size = self.queue_estimated_bytes()
+        if pending and size is not None:
+            text += f", {saved_image_data.format_bytes(size)} to write"
         return text
+
+    def queue_estimated_bytes(self):
+        """Estimated bytes the pending entries write, or None if unknown
+        (image size not known yet)."""
+        shape = self.estimated_image_shape()
+        total = 0
+        for entry in getattr(self, "queue_entries", []):
+            if entry.status != queue_model.PENDING:
+                continue
+            size = saved_image_data.estimate_run_bytes(entry.config, shape)
+            if size is None:
+                return None
+            total += size
+        return total
 
     # ---- dock height (open: remembered height; folded: header only) ----
 
@@ -1383,8 +1421,20 @@ class ZeroFieldWindow(ConfirmCloseMixin, QMainWindow):
                              Qt.Orientation.Vertical)
         self._track_queue_dock_height = self.isVisible()
 
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        # Back from the main window (ROI/binning may have changed there):
+        # refresh the size estimate.
+        if event.type() == QEvent.Type.ActivationChange and self.isActiveWindow():
+            self.widget.refresh_saved_image_info()
+            section = getattr(self, "queue_section", None)
+            if section is not None:
+                section.refresh_summary()
+
     def showEvent(self, event):
         super().showEvent(event)
+        # The main window's ROI/binning may have changed while hidden.
+        self.widget.refresh_saved_image_info()
         # The first layout pass may give the dock its size hint; apply the
         # remembered/default height once the window is really shown.
         self._apply_queue_dock_height(self.queue_section.is_expanded())

@@ -127,7 +127,9 @@ class QueueDockTests(unittest.TestCase):
         w.post_flip_settling_spin.setValue(0)
         for _ in range(2):
             self.assertTrue(window.add_to_queue())
-        self.assertEqual(window.queue_section.summary(), "Queue: idle, 2 entries")
+        # Plus the estimated size the pending entries will write.
+        self.assertRegex(window.queue_section.summary(),
+                         r"^Queue: idle, 2 entries, ≈ [\d.]+ [kMG]?B to write$")
         seen = []
         window.run_started.connect(
             lambda: seen.append(window.queue_section.summary()))

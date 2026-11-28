@@ -13,6 +13,7 @@ from framework.scan_experiment import ScanExperiment
 from framework.camera_ownership import exclusive_camera_access
 from framework.image_cube import ImageCube
 from framework.roi import validate_roi
+from framework import saved_image_data
 # Shared with ODMR; still importable from this module.
 from framework.field_direction import unit_direction  # noqa: F401
 
@@ -76,6 +77,8 @@ class ZeroFieldExperiment(ScanExperiment):
         reference_enabled=False,
         reference_field_gauss=-8.0,
         field_direction=None,
+        saved_image_mode="full",
+        bin_factor=None,
     ):
         config = {
             "settling_time_ms": settling_time_ms,
@@ -121,10 +124,28 @@ class ZeroFieldExperiment(ScanExperiment):
         post_flip_settling_ms = float(post_flip_settling_ms)
         if not np.isfinite(post_flip_settling_ms) or post_flip_settling_ms < 0:
             raise ValueError("post_flip_settling_ms must be non-negative and finite.")
+        # What is written to disk (framework/saved_image_data.py): full
+        # planes, binned planes, or only each plane's image mean. Applied to
+        # the stored planes only; acquisition, live display and the ratio
+        # (per pixel, on the full planes) are the same in every mode.
+        saved_image_mode, bin_factor = saved_image_data.validate(
+            saved_image_mode, bin_factor
+        )
 
         self.hardware_manager = hardware_manager
         self.camera = camera
         self.magnet = magnet
+        self.saved_image_mode = saved_image_mode
+        self.bin_factor = bin_factor
+        # (height, width) of the acquired frames, from the first point.
+        self._acquired_image_shape = None
+        # Per-frame image means of the newest acquire_frame() call, and per
+        # point of the current sweep (signal and reference halves). Always
+        # computed, so every mode does the same work; stored as datasets in
+        # ROI mean mode only.
+        self.latest_frame_means = None
+        self.frame_means = []
+        self.reference_frame_means = []
         self.field_start = field_start
         self.field_stop = field_stop
         self.field_points = field_points
@@ -541,6 +562,13 @@ class ZeroFieldExperiment(ScanExperiment):
     # ``data``; reversed with it and averaged per field point like it.
     _PER_POINT_EXTRA_KEYS = ("reference", "ratio")
 
+    # Extra datasets with one row per point, (points, scans, frames): the
+    # per-frame means of ROI mean mode. Reversed with ``data``; a multi-scan
+    # average keeps every completed scan along axis 1 instead of averaging.
+    _PER_POINT_SCAN_KEYS = (
+        saved_image_data.FRAME_MEANS, saved_image_data.REFERENCE_FRAME_MEANS,
+    )
+
     # Keys describing one sweep only; dropped from a multi-scan average,
     # which records them per scan instead (scan_point_times_s,
     # scan_reference_point_times_s, scan_directions).
@@ -582,7 +610,7 @@ class ZeroFieldExperiment(ScanExperiment):
             extra_datasets={
                 name: value[::-1]
                 for name, value in acquired_cube.extra_datasets.items()
-                if name in cls._PER_POINT_EXTRA_KEYS
+                if name in cls._PER_POINT_EXTRA_KEYS + cls._PER_POINT_SCAN_KEYS
             },
         )
 
@@ -633,6 +661,17 @@ class ZeroFieldExperiment(ScanExperiment):
                     averaged_cube.extra_datasets[name],
                     ordered_cube.extra_datasets[name],
                     scan_count,
+                )
+        # Per-frame means are kept per scan, not averaged: (points, scans,
+        # frames), scans in completion order.
+        for name in cls._PER_POINT_SCAN_KEYS:
+            if name in averaged_cube.extra_datasets and name in ordered_cube.extra_datasets:
+                averaged_cube.extra_datasets[name] = np.concatenate(
+                    (
+                        averaged_cube.extra_datasets[name],
+                        np.asarray(ordered_cube.extra_datasets[name], dtype=np.float64),
+                    ),
+                    axis=1,
                 )
 
     @staticmethod
@@ -799,7 +838,12 @@ class ZeroFieldExperiment(ScanExperiment):
                 self._record_timing(stage, avg_index, t0)
                 self._merge_camera_log(avg_index, t0 - self._timing_epoch)
             frames.append(frame)
-        return np.mean(np.stack(frames), axis=0)
+        stack = np.stack(frames)
+        # Image mean of every frame (the whole image = the acquisition ROI).
+        # Computed in every saved-image mode so all modes take the same time;
+        # only ROI mean mode stores it (frame_means).
+        self.latest_frame_means = stack.reshape(len(frames), -1).mean(axis=1)
+        return np.mean(stack, axis=0)
 
     def process_frame(self, frame):
         """Retain the frame for the live GUI; final analysis is external."""
@@ -1042,6 +1086,8 @@ class ZeroFieldExperiment(ScanExperiment):
         self.reference_relay_flip_axes = []
         self.reference_model_field_vector_mT = []
         self.reference_model_polarity = []
+        self.frame_means = []
+        self.reference_frame_means = []
         self._ratio_zero_reference_pixels = 0
         self.latest_ratio = None
         self._last_half_vector_mT = None
@@ -1109,27 +1155,40 @@ class ZeroFieldExperiment(ScanExperiment):
                         target, "" if half == "S" else "reference_"
                     )
 
-                averaged_image, flipped, snapshot, point_time = acquired["S"]
+                averaged_image, flipped, snapshot, point_time, frame_means = acquired["S"]
                 model_gauss, model_vector_mT, model_polarity = snapshot
+                if self._acquired_image_shape is None:
+                    self._acquired_image_shape = tuple(np.shape(averaged_image)[:2])
                 if self.reference_enabled:
-                    reference_image, reference_flipped, reference_snapshot, reference_time = (
-                        acquired["R"]
-                    )
+                    (reference_image, reference_flipped, reference_snapshot,
+                     reference_time, reference_frame_means) = acquired["R"]
                     # Computed before anything is stored, so a failure here
                     # can't leave the signal and reference planes misaligned.
+                    # Always per pixel on the full planes, in every mode.
                     ratio = self._ratio_plane(averaged_image, reference_image)
 
+                # The planes written to disk (and kept in the cube): the
+                # full image, or binned / reduced to its image mean. The live
+                # display below still gets the full image.
+                stored_image = self._stored_plane(averaged_image)
+                if self.reference_enabled:
+                    stored_reference = self._stored_plane(reference_image)
+                    stored_ratio = self._stored_plane(ratio)
+                keep_frame_means = self.saved_image_mode == saved_image_data.ROI_MEAN
+
                 # Store measurement exactly once for this field value.
-                self.image_cube.add(averaged_image)
+                self.image_cube.add(stored_image)
                 self.relay_flip_occurred.append(bool(flipped))
                 self.relay_flip_axes.append(flipped)
                 self.model_field_values_gauss.append(model_gauss)
                 self.model_field_vector_mT.append(model_vector_mT)
                 self.model_polarity.append(model_polarity)
                 self.point_time_s.append(point_time)
+                self.frame_means.append(frame_means)
                 if self.reference_enabled:
-                    self._reference_cube.add(reference_image)
-                    self._ratio_cube.add(ratio)
+                    self.reference_frame_means.append(reference_frame_means)
+                    self._reference_cube.add(stored_reference)
+                    self._ratio_cube.add(stored_ratio)
                     self.reference_order.append("RS" if reference_first else "SR")
                     self.reference_point_time_s.append(reference_time)
                     self.reference_relay_flip_occurred.append(bool(reference_flipped))
@@ -1142,12 +1201,25 @@ class ZeroFieldExperiment(ScanExperiment):
                         # write_plane) then never counts a point whose
                         # reference / ratio planes are missing.
                         self._stream_writer.write_extra_plane(
-                            "reference", point_index, reference_image
+                            "reference", point_index, stored_reference
                         )
-                        self._stream_writer.write_extra_plane("ratio", point_index, ratio)
+                        self._stream_writer.write_extra_plane(
+                            "ratio", point_index, stored_ratio
+                        )
+                if self._stream_writer is not None and keep_frame_means:
+                    # Also before the data plane, for the same reason.
+                    self._stream_writer.write_extra_plane(
+                        saved_image_data.FRAME_MEANS, point_index,
+                        self._frame_means_row(frame_means),
+                    )
+                    if self.reference_enabled:
+                        self._stream_writer.write_extra_plane(
+                            saved_image_data.REFERENCE_FRAME_MEANS, point_index,
+                            self._frame_means_row(reference_frame_means),
+                        )
                 if self._stream_writer is not None:
                     t0 = time.perf_counter() if timing else None
-                    self._stream_writer.write_plane(point_index, averaged_image)
+                    self._stream_writer.write_plane(point_index, stored_image)
                     if timing:
                         self._record_timing("write_plane", None, t0)
 
@@ -1208,20 +1280,31 @@ class ZeroFieldExperiment(ScanExperiment):
                 self.reference_order, self.reference_point_time_s,
                 self.reference_relay_flip_occurred, self.reference_relay_flip_axes,
                 self.reference_model_field_vector_mT, self.reference_model_polarity,
+                self.frame_means, self.reference_frame_means,
             ):
                 del per_point[frame_count:]
-            if self.reference_enabled:
+            keep_frame_means = self.saved_image_mode == saved_image_data.ROI_MEAN
+            if self.reference_enabled or keep_frame_means:
                 # Same plane count and order as data; none if nothing was
                 # acquired, matching data=None.
                 extras = {}
-                if frame_count:
+                if frame_count and self.reference_enabled:
                     for name, cube in (
                         ("reference", self._reference_cube),
                         ("ratio", self._ratio_cube),
                     ):
                         cube.truncate(frame_count)
                         extras[name] = cube.data
+                if frame_count and keep_frame_means:
+                    extras[saved_image_data.FRAME_MEANS] = np.stack(
+                        [self._frame_means_row(m) for m in self.frame_means]
+                    )
+                    if self.reference_enabled:
+                        extras[saved_image_data.REFERENCE_FRAME_MEANS] = np.stack(
+                            [self._frame_means_row(m) for m in self.reference_frame_means]
+                        )
                 self.image_cube.extra_datasets = extras
+            if self.reference_enabled:
                 self._reference_cube = None
                 self._ratio_cube = None
                 if self._ratio_zero_reference_pixels:
@@ -1231,6 +1314,13 @@ class ZeroFieldExperiment(ScanExperiment):
                         scan_index, self._ratio_zero_reference_pixels,
                     )
             flip_metadata = self._per_point_metadata()
+            if self._acquired_image_shape is not None:
+                # Image shapes before / after binning (and the ROI mean's
+                # region), known once the first frame arrived.
+                flip_metadata.update(saved_image_data.plane_metadata(
+                    self.saved_image_mode, self.bin_factor,
+                    self._acquired_image_shape, self.acquisition_roi,
+                ))
             self.image_cube.metadata = {**self.image_cube.metadata, **flip_metadata}
             if self._stream_writer is not None:
                 writer = self._stream_writer
@@ -1257,7 +1347,7 @@ class ZeroFieldExperiment(ScanExperiment):
         One "half" of a point: the signal half (the only one with the
         reference off, behaving exactly as a point always has) or the
         reference half. Returns (image, flipped_axes, model_snapshot,
-        acquisition_midpoint_s).
+        acquisition_midpoint_s, per_frame_means).
 
         Every command gets flip detection and post-flip settling. With the
         reference on, a command identical to the previous half's (the R,R
@@ -1302,11 +1392,27 @@ class ZeroFieldExperiment(ScanExperiment):
         # Acquire averaged fluorescence image. Its time is the midpoint of
         # the acquisition, relative to the sweep start.
         acquire_t0 = time.perf_counter()
+        self.latest_frame_means = None
         image = self.acquire_frame()
         midpoint = 0.5 * (acquire_t0 + time.perf_counter()) - self._sweep_t0
         if timing and stage_prefix:
             self._record_timing(f"{stage_prefix}acquire", None, acquire_t0)
-        return image, flipped, snapshot, midpoint
+        frame_means = self.latest_frame_means
+        if frame_means is None:
+            # acquire_frame() replaced (test doubles): per-frame values
+            # unknown; keep the row shape.
+            frame_means = np.full(self.averages, np.nan)
+        return image, flipped, snapshot, midpoint, np.asarray(frame_means, dtype=np.float64)
+
+    def _stored_plane(self, plane):
+        """The plane to write for *plane* in this run's saved-image mode
+        (the plane itself in full mode)."""
+        return saved_image_data.reduce_plane(plane, self.saved_image_mode, self.bin_factor)
+
+    @staticmethod
+    def _frame_means_row(frame_means):
+        """One point's per-frame means as a (1, frames) row: one scan."""
+        return np.asarray(frame_means, dtype=np.float64).reshape(1, -1)
 
     def _ratio_plane(self, signal, reference):
         """Per-pixel signal / reference as float64; NaN where reference is 0."""
@@ -1340,7 +1446,7 @@ class ZeroFieldExperiment(ScanExperiment):
             extra_datasets={
                 name: np.array(value, dtype=np.float64, copy=True)
                 for name, value in acquired_cube.extra_datasets.items()
-                if name in self._PER_POINT_EXTRA_KEYS
+                if name in self._PER_POINT_EXTRA_KEYS + self._PER_POINT_SCAN_KEYS
             },
         )
 
@@ -1527,6 +1633,10 @@ class ZeroFieldExperiment(ScanExperiment):
                 "zero_other_axes": self.zero_other_axes,
                 "alternate_direction": self._alternating,
                 "reference_enabled": self.reference_enabled,
+                # What the saved planes are (see framework/saved_image_data);
+                # image shapes are added once the first frame is known.
+                "saved_image_mode": self.saved_image_mode,
+                "bin_factor": self.bin_factor,
                 "initial_magnet_vector_mT": (
                     dict(self._initial_magnet_vector_mT)
                     if self._initial_magnet_vector_mT is not None
@@ -1543,6 +1653,10 @@ class ZeroFieldExperiment(ScanExperiment):
             metadata["reference_field_gauss"] = self.reference_field_gauss
             definitions = dict(metadata["field_value_definitions"])
             definitions.update(self._REFERENCE_DEFINITIONS)
+            metadata["field_value_definitions"] = definitions
+        if self.saved_image_mode in saved_image_data.DEFINITIONS:
+            definitions = dict(metadata["field_value_definitions"])
+            definitions.update(saved_image_data.DEFINITIONS[self.saved_image_mode])
             metadata["field_value_definitions"] = definitions
         if self.vector_mode:
             # Only for a vector sweep, so single-axis metadata is unchanged.
@@ -1625,6 +1739,12 @@ class ZeroFieldExperiment(ScanExperiment):
             if extra is not None and np.shape(extra) != data.shape:
                 raise ValueError(
                     f"Zero Field {name} planes do not match the data planes."
+                )
+        for name in self._PER_POINT_SCAN_KEYS:
+            extra = image_cube.extra_datasets.get(name)
+            if extra is not None and np.shape(extra)[0] != frame_count:
+                raise ValueError(
+                    f"Zero Field {name} rows do not match the data planes."
                 )
 
     def _camera_setting(self, attribute):

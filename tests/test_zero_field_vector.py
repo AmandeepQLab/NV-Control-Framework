@@ -57,6 +57,8 @@ SINGLE_AXIS_DEFAULTS = {
     "averaging_enabled": False, "num_scans": 1, "save_raw_scans": False,
     "alternate_direction": False, "reference_enabled": False,
     "reference_field_gauss": -8.0, "save_data": True,
+    # Added with the "Saved image data" setting (full images default).
+    "saved_image_mode": "full", "bin_factor": 2,
 }
 
 

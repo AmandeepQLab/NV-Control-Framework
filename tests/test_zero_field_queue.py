@@ -539,7 +539,8 @@ class ControlPanelLayoutTests(QueueWindowTestCase):
         ]
         self.assertEqual(
             groups,
-            ["Output", "Field sweep", "Settling", "Multi-scan averaging",
+            ["Output", "Saved image data", "Field sweep", "Settling",
+             "Multi-scan averaging",
              "Reference normalization", "Stability check", "Image display"],
         )
         for control in (
@@ -694,6 +695,8 @@ class ControlPanelLayoutTests(QueueWindowTestCase):
             "averaging_enabled": False, "num_scans": 1, "save_raw_scans": False,
             "alternate_direction": False, "reference_enabled": False,
             "reference_field_gauss": -8.0, "save_data": True,
+            # Added with the "Saved image data" setting (full images default).
+            "saved_image_mode": "full", "bin_factor": 2,
         })
 
 
@@ -725,8 +728,10 @@ class QueueModelTests(unittest.TestCase):
         )
 
     def test_validate_config(self):
+        # A config without the saved-image keys (older queue files) gets
+        # full images.
         self.assertEqual(queue_model.validate_config(self._config(field_start=-2)),
-                         self._config())
+                         {**self._config(), "saved_image_mode": "full", "bin_factor": 2})
         for bad in ({"field_points": 0}, {"field_axis": "W"}, {"averages": 1.5},
                     {"save_data": 1}, {"field_start": True}):
             with self.subTest(bad=bad):

@@ -1,7 +1,11 @@
 import sys, numpy as np
 from framework.image_cube import ImageCube
+from framework import saved_image_data
 
 c = ImageCube.load(sys.argv[1])
+if not saved_image_data.has_images(c.metadata):
+    sys.exit(f"{sys.argv[1]}: {saved_image_data.NO_IMAGES_MESSAGE} "
+             "This script needs images.")
 d = np.asarray(c.data, dtype=np.float64)
 f = np.asarray(c.scan_axis_values, dtype=float)
 

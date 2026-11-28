@@ -41,6 +41,7 @@ _REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from framework import saved_image_data
 from framework.image_cube import ImageCube
 
 _NPZ_DATA_MEMBER_NAME = "data"
@@ -102,6 +103,19 @@ def _reject_incomplete_hdf5(path, metadata, allow_partial_scans):
             "past its planes_written count are HDF5 fill-value "
             "placeholders, not real data. Pass allow_partial_scans=True to "
             "use it anyway."
+        )
+
+
+def _reject_roi_mean(path, metadata):
+    """Refuse a file saved with saved_image_mode 'roi_mean': it holds one
+    value per point (shape (points, 1, 1)), no images, so there is nothing
+    to average plane by plane, crop to an ROI or show. Its per-point values
+    can be read directly (data / reference / ratio, frame_means)."""
+    if not saved_image_data.has_images(metadata):
+        raise ValueError(
+            f"{path}: {saved_image_data.NO_IMAGES_MESSAGE} Its per-point values "
+            "are in data / reference / ratio (shape (points, 1, 1)) and the "
+            "per-frame means in frame_means; this tool needs images."
         )
 
 
@@ -190,7 +204,9 @@ class _Hdf5PlaneSource:
             self.dtype = handle["data"].dtype
             metadata = json.loads(_decode(handle["metadata_json"][()]))
         _reject_incomplete_hdf5(self.path, metadata, allow_partial_scans)
+        _reject_roi_mean(self.path, metadata)
         _reject_reverse_sweep(self.path, metadata)
+        self.metadata = metadata
 
     def read_plane(self, index):
         return np.asarray(ImageCube.load_plane(self.path, index))
@@ -201,10 +217,10 @@ class _Hdf5PlaneSource:
 
 def _open_plane_source(path, allow_partial_scans=False):
     path = Path(path)
-    return (
-        _Hdf5PlaneSource(path, allow_partial_scans=allow_partial_scans)
-        if _is_hdf5_path(path) else _NpzPlaneSource(path)
-    )
+    if _is_hdf5_path(path):
+        return _Hdf5PlaneSource(path, allow_partial_scans=allow_partial_scans)
+    _reject_roi_mean(path, _read_npz_static_members(path)["metadata"])
+    return _NpzPlaneSource(path)
 
 
 def _open_sources(scan_paths, allow_partial_scans=False):
@@ -270,6 +286,7 @@ def _read_hdf5_static_members(path, allow_partial_scans=False):
     with h5py.File(path, "r") as handle:
         metadata = json.loads(_decode(handle["metadata_json"][()]))
         _reject_incomplete_hdf5(path, metadata, allow_partial_scans)
+        _reject_roi_mean(path, metadata)
         axes = json.loads(_decode(handle["axes_json"][()]))
         experiment_type = (
             None if handle.attrs.get("experiment_type_is_none", False)
@@ -299,10 +316,11 @@ def _read_hdf5_static_members(path, allow_partial_scans=False):
 
 def _read_static_members(path, allow_partial_scans=False):
     path = Path(path)
-    return (
-        _read_hdf5_static_members(path, allow_partial_scans=allow_partial_scans)
-        if _is_hdf5_path(path) else _read_npz_static_members(path)
-    )
+    if _is_hdf5_path(path):
+        return _read_hdf5_static_members(path, allow_partial_scans=allow_partial_scans)
+    static = _read_npz_static_members(path)
+    _reject_roi_mean(path, static["metadata"])
+    return static
 
 
 def _write_npz_static_members(archive, static, metadata):
@@ -359,6 +377,10 @@ def average_scans(scan_paths, output_path, report_path, *, roi=None, allow_parti
                 "raw_scan_filenames": [path.name for path in scan_paths],
             }
         )
+        if roi is None and saved_image_data.file_mode(metadata) == saved_image_data.BINNED:
+            # The acquisition ROI is in sensor pixels and doesn't apply to
+            # binned planes: report over the whole saved plane.
+            roi = (0, 0, shape[2], shape[1])
         if roi is None:
             roi = metadata.get("acquisition_roi")
         if roi is None:

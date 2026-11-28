@@ -141,6 +141,7 @@ ALLOWED_FILES = frozenset(
         "test_close_confirmation.py",
         "test_microwave_state.py",
         "test_logging_setup.py",
+        "test_zero_field_saved_images.py",
     }
 )
 

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from experiments.zero_field_experiment import VECTOR_AXIS, unit_direction
+from framework import saved_image_data
 from framework import stability as stability_model
 from framework.stability import StabilitySettings
 
@@ -53,6 +54,15 @@ CONFIG_TYPES = {
     "reference_enabled": bool,
     "reference_field_gauss": float,
     "save_data": bool,
+    "saved_image_mode": str,
+    "bin_factor": int,
+}
+
+# Keys a queue file may lack: files written before they existed load with
+# these values (full images), so the queue format version stays 1.
+OPTIONAL_CONFIG_DEFAULTS = {
+    "saved_image_mode": saved_image_data.DEFAULT_MODE,
+    "bin_factor": saved_image_data.DEFAULT_BIN_FACTOR,
 }
 
 LOG_COLUMNS = (
@@ -157,8 +167,21 @@ def summarize(config):
         f"{config['field_points']} pts, {config['averages']} rep, "
         f"{scans} scan{'s' if scans != 1 else ''}, "
         f"settle {config['settling_time_ms']} ms, {reference}, {alternate}"
+        + saved_image_text(config)
         + ("" if config["save_data"] else ", not saved")
     )
+
+
+def saved_image_text(config):
+    """Summary suffix: ', images binned 4×4', ', ROI mean only', or
+    nothing for full images (so existing summaries are unchanged)."""
+    mode = config.get("saved_image_mode", saved_image_data.FULL)
+    if mode == saved_image_data.BINNED:
+        factor = config.get("bin_factor")
+        return f", images binned {factor}×{factor}"
+    if mode == saved_image_data.ROI_MEAN:
+        return ", ROI mean only"
+    return ""
 
 
 def validate_config(config):
@@ -172,6 +195,9 @@ def validate_config(config):
         raise ValueError("entry config is not an object")
     clean = {}
     for key, kind in CONFIG_TYPES.items():
+        if key not in config and key in OPTIONAL_CONFIG_DEFAULTS:
+            clean[key] = OPTIONAL_CONFIG_DEFAULTS[key]
+            continue
         if key not in config:
             raise ValueError(f"missing setting '{key}'")
         value = config[key]
@@ -203,6 +229,16 @@ def validate_config(config):
     for key in ("field_points", "averages", "num_scans"):
         if clean[key] < 1:
             raise ValueError(f"setting '{key}' must be at least 1")
+    if clean["saved_image_mode"] not in saved_image_data.MODES:
+        raise ValueError(
+            f"saved_image_mode must be one of {saved_image_data.MODES}, "
+            f"not {clean['saved_image_mode']!r}"
+        )
+    if clean["bin_factor"] not in saved_image_data.BIN_FACTORS:
+        raise ValueError(
+            f"bin_factor must be one of {saved_image_data.BIN_FACTORS}, "
+            f"not {clean['bin_factor']!r}"
+        )
     return clean
 
 

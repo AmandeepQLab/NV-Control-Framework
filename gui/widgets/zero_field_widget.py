@@ -13,12 +13,14 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QProgressBar,
     QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 from PyQt6.QtCore import Qt
 
 from experiments.zero_field_experiment import VECTOR_AXIS, unit_direction
+from framework import saved_image_data
 from gui.image_inspection import line_profile, pixel_value
 from gui.widgets import run_button
 from gui.widgets.run_button import style_run_button
@@ -124,6 +126,55 @@ class ZeroFieldWidget(QWidget):
             "\"Save data\" off).")
         save_row.addWidget(self.save_button)
         output_form.addRow(save_row)
+
+        # ---- Saved image data (what goes to disk) -------------------------
+        # Part of the output settings: decides only what each run writes,
+        # never how it is acquired (see framework/saved_image_data.py).
+        self.saved_image_section = CollapsibleSection(
+            "Saved image data", settings_key="zfe/saved_images",
+            tooltip="Show or hide what each run writes to disk (full images, "
+                    "binned images or only the mean) and the estimated file size.")
+        control_layout.addWidget(self.saved_image_section)
+        saved_form = self.saved_image_section.body_layout()
+        self.saved_image_mode_combo = QComboBox()
+        for mode in saved_image_data.MODES:
+            self.saved_image_mode_combo.addItem(saved_image_data.MODE_LABELS[mode], mode)
+        self.saved_image_mode_combo.setToolTip(
+            "What each run writes to disk; acquisition, timing, the live image "
+            "and plot are the same in every mode.\n\n"
+            "Full images (default): every pixel of every point, as before. Use "
+            "it for wide-field imaging.\n"
+            "Binned images: the saved images averaged over N × N pixel blocks "
+            "(mean, so counts/pixel are unchanged); N × N times smaller. Use it "
+            "for coarse maps.\n"
+            "ROI mean only: no images; per point the mean over the image (the "
+            "acquisition ROI, as the live \"Mean Fluorescence\"), plus the mean "
+            "of every single frame for noise analysis. Tiny files. Use it for "
+            "spatially averaged runs such as field sweeps.")
+        saved_form.addRow(self._tipped("Images:", self.saved_image_mode_combo),
+                          self.saved_image_mode_combo)
+        self.bin_factor_combo = QComboBox()
+        for factor in saved_image_data.BIN_FACTORS:
+            self.bin_factor_combo.addItem(f"{factor} × {factor}", factor)
+        self.bin_factor_combo.setToolTip(
+            "Block size for \"Binned images\", in camera pixels (of the "
+            "acquired image, after the camera's own binning). Rows/columns "
+            "that do not fill a whole block are not saved. Used only in that "
+            "mode.")
+        saved_form.addRow(self._tipped("Bin factor:", self.bin_factor_combo),
+                          self.bin_factor_combo)
+        self.saved_image_estimate_label = QLabel()
+        self.saved_image_estimate_label.setWordWrap(True)
+        self.saved_image_estimate_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        style.muted(self.saved_image_estimate_label)
+        self.saved_image_estimate_label.setToolTip(
+            "Approximate size of all files one run writes (the average and "
+            "any individual scans), from points, frames per point, scans, "
+            "reference and the image size set in the main window. gzip makes "
+            "the real size vary a little.")
+        saved_form.addRow(self.saved_image_estimate_label)
+        self._image_shape_provider = None
 
         # ---- Field sweep (always open) ------------------------------------
         self.field_group, field_form = style.card("Field sweep")
@@ -326,6 +377,24 @@ class ZeroFieldWidget(QWidget):
         self.averaging_section.set_summary_provider(self._averaging_summary)
         self.save_data_check.toggled.connect(self.averaging_section.refresh_summary)
 
+        # Saved image data: the bin factor applies only to binned images;
+        # the size estimate follows every setting that changes it.
+        self.saved_image_section.set_summary_provider(self._saved_image_summary)
+        for signal in (
+            self.saved_image_mode_combo.currentIndexChanged,
+            self.bin_factor_combo.currentIndexChanged,
+            self.field_points_spin.valueChanged,
+            self.averages_spin.valueChanged,
+            self.num_scans_spin.valueChanged,
+            self.averaging_enabled_check.toggled,
+            self.save_raw_scans_check.toggled,
+            self.alternate_direction_check.toggled,
+            self.reference_enabled_check.toggled,
+            self.save_data_check.toggled,
+        ):
+            signal.connect(self.refresh_saved_image_info)
+        self.refresh_saved_image_info()
+
         # Optional count stability check before a run (gui/stability_gate.py).
         # Its settings are not part of get_config(): they decide when a run
         # starts, not how it scans, and a queue entry snapshots them apart.
@@ -428,6 +497,84 @@ class ZeroFieldWidget(QWidget):
         self.line_profile_check.toggled.connect(self.set_line_profile_enabled)
         self.image_view.getView().scene().sigMouseMoved.connect(self.update_pixel_inspector)
 
+    # ---- saved image data ------------------------------------------------
+
+    def saved_image_mode(self):
+        return self.saved_image_mode_combo.currentData()
+
+    def bin_factor(self):
+        return self.bin_factor_combo.currentData()
+
+    def set_image_shape_provider(self, provider):
+        """provider() -> (height, width) of the frames a run would acquire,
+        or None; used for the size estimate only (the window supplies it
+        from the main window's ROI and binning)."""
+        self._image_shape_provider = provider
+        self.refresh_saved_image_info()
+
+    def image_shape(self):
+        if self._image_shape_provider is None:
+            return None
+        try:
+            return self._image_shape_provider()
+        except Exception:
+            return None
+
+    def estimated_run_bytes(self, config=None):
+        """Estimated bytes one run writes with *config* (default: the form)."""
+        return saved_image_data.estimate_run_bytes(
+            self.get_config() if config is None else config, self.image_shape())
+
+    def _saved_image_mode_text(self):
+        mode = self.saved_image_mode()
+        if mode == saved_image_data.BINNED:
+            factor = self.bin_factor()
+            return f"Binned {factor} × {factor}"
+        return saved_image_data.MODE_LABELS[mode]
+
+    def _saved_image_summary(self):
+        text = self._saved_image_mode_text()
+        if not self.save_data_check.isChecked():
+            return f"{text} (saving off)"
+        size = self.estimated_run_bytes()
+        if size is None:
+            return f"{text}, size unknown until the image size is known"
+        return f"{text}, {saved_image_data.format_bytes(size)} per run"
+
+    def refresh_saved_image_info(self, *_args):
+        mode = self.saved_image_mode()
+        self.bin_factor_combo.setEnabled(mode == saved_image_data.BINNED)
+        shape = self.image_shape()
+        lines = []
+        if not self.save_data_check.isChecked():
+            lines.append("Saving is off: nothing is written unless you press "
+                         "\"Save Data\" (which then saves in this mode).")
+        else:
+            lines.append("Estimated per run: " + saved_image_data.format_bytes(
+                self.estimated_run_bytes()))
+        if shape is None:
+            lines.append("Image size not known yet (ROI and binning are set "
+                         "in the main window).")
+        else:
+            height, width = shape
+            if mode == saved_image_data.FULL:
+                lines.append(f"Images saved as acquired, {height} × {width} px.")
+            elif mode == saved_image_data.BINNED:
+                factor = self.bin_factor()
+                saved_h, saved_w = saved_image_data.binned_shape(shape, factor)
+                lines.append(f"{height} × {width} px images saved as "
+                             f"{saved_h} × {saved_w} px.")
+                rows, columns = saved_image_data.cropped_pixels(shape, factor)
+                if rows or columns:
+                    lines.append(f"⚠ Not divisible by {factor}: the last {rows} "
+                                 f"row(s) and {columns} column(s) are not saved.")
+            else:
+                lines.append(f"No images: one value per point, the mean over "
+                             f"the {height} × {width} px image, plus every "
+                             f"frame's mean.")
+        self.saved_image_estimate_label.setText("\n".join(lines))
+        self.saved_image_section.refresh_summary()
+
     def _averaging_summary(self):
         if not self.averaging_enabled_check.isChecked():
             return "Off"
@@ -528,6 +675,10 @@ class ZeroFieldWidget(QWidget):
             ),
             "reference_field_gauss": self.reference_field_spin.value(),
             "save_data": self.save_data_check.isChecked(),
+            # What is written; the factor is always reported (like the
+            # reference field) and used only with "binned".
+            "saved_image_mode": self.saved_image_mode(),
+            "bin_factor": self.bin_factor(),
         }
 
     def set_config(self, config):
@@ -555,6 +706,11 @@ class ZeroFieldWidget(QWidget):
         self.alternate_direction_check.setChecked(config["alternate_direction"])
         self.reference_enabled_check.setChecked(config["reference_enabled"])
         self.reference_field_spin.setValue(config["reference_field_gauss"])
+        # Configs from before the setting existed mean full images.
+        self.saved_image_mode_combo.setCurrentIndex(self.saved_image_mode_combo.findData(
+            config.get("saved_image_mode", saved_image_data.DEFAULT_MODE)))
+        self.bin_factor_combo.setCurrentIndex(self.bin_factor_combo.findData(
+            config.get("bin_factor", saved_image_data.DEFAULT_BIN_FACTOR)))
 
     # Live-curve labels: raw counts, or signal/reference with the
     # reference on (see set_signal_mode()).
